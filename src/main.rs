@@ -5,6 +5,7 @@ mod app;
 mod cli;
 mod renderer;
 mod state;
+mod syntax;
 
 use std::process::ExitCode;
 
@@ -14,7 +15,8 @@ use clap::Parser;
 use crate::analyzer::SourceFile;
 use crate::app::App;
 use crate::cli::{Cli, Mode, RealFs};
-use crate::state::AppState;
+use crate::state::{AppState, HighlightedSource};
+use crate::syntax::Highlighter;
 
 fn main() -> ExitCode {
     // RUST_LOG=info ygg ... surfaces wgpu/winit/egui diagnostics.
@@ -37,7 +39,11 @@ fn run() -> Result<()> {
         Mode::File { path } => {
             let source = SourceFile::read(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let state = AppState::new(source);
+            // M2: Python-only. Later milestones dispatch on file extension.
+            let mut highlighter = Highlighter::new_python().context("load Python grammar")?;
+            let kinds = highlighter.highlight(&source.contents);
+            let highlighted = HighlightedSource::new(source, kinds);
+            let state = AppState::new(highlighted);
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }

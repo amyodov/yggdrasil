@@ -8,7 +8,7 @@ use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, LINE_HEIGHT};
 use crate::state::{AppState, WindowSize, LINE_SCROLL_PIXELS};
 
 /// Initial window size request. Real systems may snap to DPI/display bounds.
@@ -53,7 +53,7 @@ impl ApplicationHandler for App {
         let window_attrs = Window::default_attributes()
             .with_title(format!(
                 "Ygg — {}",
-                self.state.source.path.display()
+                self.state.highlighted.source.path.display()
             ))
             .with_inner_size(winit::dpi::LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
 
@@ -70,7 +70,7 @@ impl ApplicationHandler for App {
         self.state.window_size = WindowSize { width: size.width.max(1), height: size.height.max(1) };
         self.state.scale_factor = window.scale_factor() as f32;
 
-        let renderer = match pollster::block_on(Renderer::new(window.clone(), &self.state.source.contents)) {
+        let renderer = match pollster::block_on(Renderer::new(window.clone(), &self.state.highlighted)) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e:#}");
@@ -120,7 +120,7 @@ impl ApplicationHandler for App {
                 };
                 // Upward wheel scrolls text upward (scroll_y increases).
                 self.state.scroll_y -= dy;
-                self.state.clamp_scroll();
+                self.state.clamp_scroll(LINE_HEIGHT);
                 renderer.window().request_redraw();
             }
 

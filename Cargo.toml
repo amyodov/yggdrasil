@@ -25,6 +25,10 @@ egui-wgpu = { version = "0.29", features = ["winit"] }
 egui-winit = { version = "0.29", default-features = false, features = ["clipboard", "wayland", "x11"] }
 glyphon = "0.6"
 
+# Parsing / syntax
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
+
 # Logging — useful for surfacing wgpu/winit issues during early dev
 env_logger = "0.11"
 log = "0.4"
