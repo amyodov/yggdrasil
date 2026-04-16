@@ -8,8 +8,8 @@ use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::renderer::{Renderer, LINE_HEIGHT};
-use crate::state::{AppState, WindowSize, LINE_SCROLL_PIXELS};
+use crate::renderer::Renderer;
+use crate::state::{AppState, WindowSize, LINES_PER_WHEEL_NOTCH};
 
 /// Initial window size request. Real systems may snap to DPI/display bounds.
 const INITIAL_WIDTH: u32 = 1280;
@@ -70,7 +70,12 @@ impl ApplicationHandler for App {
         self.state.window_size = WindowSize { width: size.width.max(1), height: size.height.max(1) };
         self.state.scale_factor = window.scale_factor() as f32;
 
-        let renderer = match pollster::block_on(Renderer::new(window.clone(), &self.state.highlighted)) {
+        let renderer = match pollster::block_on(Renderer::new(
+            window.clone(),
+            &self.state.highlighted,
+            self.state.effective_font_size(),
+            self.state.effective_line_height(),
+        )) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e:#}");
@@ -107,6 +112,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Text metrics are derived from scale_factor on every frame
+                // inside the renderer, so updating state is sufficient — no
+                // explicit buffer rebuild needed here.
                 self.state.scale_factor = scale_factor as f32;
                 renderer.window().request_redraw();
             }
@@ -114,13 +122,17 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Right-region only is the intent, but M1 doesn't differentiate —
                 // egui already absorbs wheel when the cursor is over it.
+                let lh = self.state.effective_line_height();
                 let dy = match delta {
-                    MouseScrollDelta::LineDelta(_x, y) => y * LINE_SCROLL_PIXELS,
+                    // Line-delta wheels jump `LINES_PER_WHEEL_NOTCH` per notch;
+                    // scale by line height so the feel is constant across DPI.
+                    MouseScrollDelta::LineDelta(_x, y) => y * LINES_PER_WHEEL_NOTCH * lh,
+                    // Pixel-delta trackpads report in physical pixels already.
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
                 // Upward wheel scrolls text upward (scroll_y increases).
                 self.state.scroll_y -= dy;
-                self.state.clamp_scroll(LINE_HEIGHT);
+                self.state.clamp_scroll(lh);
                 renderer.window().request_redraw();
             }
 

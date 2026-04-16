@@ -25,9 +25,15 @@ pub struct WindowSize {
 /// M1 shows a placeholder; M4 fills it in with a real tree.
 pub const LEFT_PANE_FRACTION: f32 = 0.25;
 
-/// Scroll speed multiplier applied to line-based mouse wheel deltas.
-/// Pixel-delta trackpads bypass this.
-pub const LINE_SCROLL_PIXELS: f32 = 36.0;
+/// How many lines a single notch of a line-delta mouse wheel scrolls.
+/// Trackpads provide pixel-delta and skip this.
+pub const LINES_PER_WHEEL_NOTCH: f32 = 3.0;
+
+/// Base text metrics in *logical points*. The renderer multiplies by
+/// `AppState::scale_factor` to get physical pixels at display time.
+/// 14/20 reads comfortably at 1x and 2x.
+pub const BASE_FONT_SIZE: f32 = 14.0;
+pub const BASE_LINE_HEIGHT: f32 = 20.0;
 
 /// A file + its pre-computed syntax kinds + line offsets, the triple the
 /// renderer consumes to build virtualized glyphon buffers.
@@ -103,6 +109,16 @@ impl AppState {
     /// Left edge of the code pane in physical pixels.
     pub fn code_pane_left(&self) -> u32 {
         (self.window_size.width as f32 * LEFT_PANE_FRACTION).round() as u32
+    }
+
+    /// Font size in physical pixels, scaled for the current display DPI.
+    pub fn effective_font_size(&self) -> f32 {
+        BASE_FONT_SIZE * self.scale_factor
+    }
+
+    /// Line height in physical pixels, scaled for the current display DPI.
+    pub fn effective_line_height(&self) -> f32 {
+        BASE_LINE_HEIGHT * self.scale_factor
     }
 
     /// Clamp scroll so neither end of the file can leave the viewport in

@@ -35,30 +35,26 @@ const BG: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Monospace rendering metrics. 14/20 reads well at 1x and 2x.
-pub const FONT_SIZE: f32 = 14.0;
-pub const LINE_HEIGHT: f32 = 20.0;
-
 /// Number of lines to overshape past the viewport in each direction. Keeps
 /// near-edge scrolling from stuttering while glyphon catches up.
 const SCROLL_OVERSCAN: usize = 8;
 
-/// Horizontal padding inside the code pane so text doesn't touch the edges.
-const CODE_PAD_LEFT: f32 = 12.0;
-const CODE_PAD_RIGHT: f32 = 12.0;
+/// Horizontal padding inside the code pane — in *logical* points, scaled at
+/// use-site by `scale_factor`.
+const CODE_PAD_LEFT_PT: f32 = 12.0;
+const CODE_PAD_RIGHT_PT: f32 = 12.0;
 
-/// Gutter = right-aligned line numbers in their own column. Width scales with
-/// max-digits so it never clips. Includes a trailing gap before the code.
-const GUTTER_DIGIT_PAD: usize = 1;   // leading spaces inside the gutter
-const GUTTER_TRAILING_GAP: f32 = 10.0; // pixels between gutter and code
+/// Gutter column layout (in text columns + logical points).
+const GUTTER_DIGIT_PAD: usize = 1;     // leading spaces inside the gutter
+const GUTTER_TRAILING_GAP_PT: f32 = 10.0; // logical pts between gutter and code
 
 /// Gutter color (subtle slate; same family as Comment but a bit dimmer).
 const GUTTER_COLOR: (u8, u8, u8) = (80, 95, 120);
 
-/// Empirical monospace glyph advance at FONT_SIZE=14. Used to size the gutter
-/// column. Correct for most monospace fonts cosmic-text will pick on macOS;
-/// being off by ±1px is harmless because the gutter has padding on both sides.
-const MONO_GLYPH_WIDTH: f32 = FONT_SIZE * 0.6;
+/// Ratio of monospace-glyph advance width to font size for the fonts
+/// cosmic-text picks on macOS (Menlo/Monaco family). Off by ±5% for exotic
+/// fonts, which is harmless because the gutter has inner padding.
+const MONO_GLYPH_ADVANCE_RATIO: f32 = 0.6;
 
 pub struct Renderer {
     // winit/wgpu core
@@ -80,8 +76,15 @@ pub struct Renderer {
     code_buffer: Buffer,
     /// Line-number gutter. Set once; scrolls in lockstep with the code buffer.
     gutter_buffer: Buffer,
-    /// Width of the gutter in pixels (depends on max digits in the file).
+    /// Width of the gutter in physical pixels. Recomputed when DPI changes.
     gutter_width: f32,
+    /// Digits in the file's max line number. Cached because it drives gutter
+    /// width on every DPI recompute.
+    gutter_digits: usize,
+    /// Last applied text metrics (physical pixels). A DPI change triggers a
+    /// `Buffer::set_metrics` on both buffers so the text scales with the display.
+    applied_font_size: f32,
+    applied_line_height: f32,
 
     // egui (HUD overlays)
     egui_ctx: egui::Context,
@@ -91,7 +94,14 @@ pub struct Renderer {
 
 impl Renderer {
     /// Initialize all GPU + text resources for the given window and file.
-    pub async fn new(window: Arc<Window>, highlighted: &HighlightedSource) -> Result<Self> {
+    /// `font_size` and `line_height` are expected to already be scaled to
+    /// physical pixels by the caller (`state.effective_*()`).
+    pub async fn new(
+        window: Arc<Window>,
+        highlighted: &HighlightedSource,
+        font_size: f32,
+        line_height: f32,
+    ) -> Result<Self> {
         let instance = Instance::new(InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -160,10 +170,17 @@ impl Renderer {
         );
 
         // Code buffer with rich text.
-        let code_buffer = build_code_buffer(&mut font_system, highlighted);
+        let code_buffer = build_code_buffer(&mut font_system, highlighted, font_size, line_height);
 
         // Gutter buffer + width.
-        let (gutter_buffer, gutter_width) = build_gutter_buffer(&mut font_system, highlighted);
+        let gutter_digits = digit_count(highlighted.line_count().max(1));
+        let (gutter_buffer, gutter_width) = build_gutter_buffer(
+            &mut font_system,
+            highlighted,
+            font_size,
+            line_height,
+            gutter_digits,
+        );
 
         // --- egui ---
         let egui_ctx = egui::Context::default();
@@ -191,6 +208,9 @@ impl Renderer {
             code_buffer,
             gutter_buffer,
             gutter_width,
+            gutter_digits,
+            applied_font_size: font_size,
+            applied_line_height: line_height,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -218,6 +238,24 @@ impl Renderer {
 
     /// Draw one frame.
     pub fn render(&mut self, state: &AppState) -> Result<(), wgpu::SurfaceError> {
+        // Re-apply text metrics if DPI changed since the last frame. One cheap
+        // equality check per frame; only triggers work on an actual monitor
+        // change (e.g. dragging the window across displays).
+        let font_size = state.effective_font_size();
+        let line_height = state.effective_line_height();
+        if font_size != self.applied_font_size || line_height != self.applied_line_height {
+            let metrics = Metrics::new(font_size, line_height);
+            self.code_buffer.set_metrics(&mut self.font_system, metrics);
+            self.gutter_buffer.set_metrics(&mut self.font_system, metrics);
+            // Gutter width scales with font size. Glyph advance uses our
+            // empirical monospace ratio; exact fit isn't required because of
+            // the inner padding column.
+            let col = self.gutter_digits + GUTTER_DIGIT_PAD;
+            self.gutter_width = col as f32 * font_size * MONO_GLYPH_ADVANCE_RATIO;
+            self.applied_font_size = font_size;
+            self.applied_line_height = line_height;
+        }
+
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
 
@@ -239,7 +277,7 @@ impl Renderer {
         let visible = visible_line_range(
             state.scroll_y,
             state.window_size.height,
-            LINE_HEIGHT,
+            line_height,
             state.highlighted.line_count(),
             SCROLL_OVERSCAN,
         );
@@ -250,10 +288,14 @@ impl Renderer {
         prime_scroll(&mut self.code_buffer, &mut self.font_system, scroll_target);
         prime_scroll(&mut self.gutter_buffer, &mut self.font_system, scroll_target);
 
-        let gutter_left = state.code_pane_left() as f32 + CODE_PAD_LEFT;
-        let code_text_left = gutter_left + self.gutter_width + GUTTER_TRAILING_GAP;
-        let code_text_right = (state.code_pane_left() + state.code_pane_width()) as f32
-            - CODE_PAD_RIGHT;
+        // Pad/gap values are logical points; scale up for the current DPI.
+        let pad_left = CODE_PAD_LEFT_PT * state.scale_factor;
+        let pad_right = CODE_PAD_RIGHT_PT * state.scale_factor;
+        let gap = GUTTER_TRAILING_GAP_PT * state.scale_factor;
+
+        let gutter_left = state.code_pane_left() as f32 + pad_left;
+        let code_text_left = gutter_left + self.gutter_width + gap;
+        let code_text_right = (state.code_pane_left() + state.code_pane_width()) as f32 - pad_right;
         let viewport_h = state.window_size.height as f32;
 
         // Both buffers share the same vertical origin: buffer line 0 sits at
@@ -433,8 +475,13 @@ fn attrs_by_kind() -> [Attrs<'static>; N_KINDS] {
 /// spans into glyphon's `set_rich_text` — at most one span per contiguous run
 /// of identical token kinds, so 80-char-line Python files produce ~20 spans
 /// per line, not one per byte.
-fn build_code_buffer(font_system: &mut FontSystem, hl: &HighlightedSource) -> Buffer {
-    let mut buffer = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+fn build_code_buffer(
+    font_system: &mut FontSystem,
+    hl: &HighlightedSource,
+    font_size: f32,
+    line_height: f32,
+) -> Buffer {
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     // Very wide width effectively disables wrapping; M2 spec inherits M1's
     // "horizontal overflow: ignore, let it clip" posture.
     buffer.set_size(font_system, Some(100_000.0), None);
@@ -456,18 +503,20 @@ fn build_code_buffer(font_system: &mut FontSystem, hl: &HighlightedSource) -> Bu
 /// Build the gutter (line numbers) buffer. All line numbers are materialized
 /// once; glyphon lazily shapes only visible ones via `shape_until_scroll`.
 /// Returns the buffer and its required pixel width.
-fn build_gutter_buffer(font_system: &mut FontSystem, hl: &HighlightedSource) -> (Buffer, f32) {
+fn build_gutter_buffer(
+    font_system: &mut FontSystem,
+    hl: &HighlightedSource,
+    font_size: f32,
+    line_height: f32,
+    digits: usize,
+) -> (Buffer, f32) {
     let line_count = hl.line_count().max(1);
-    let digits = digit_count(line_count);
     let col = digits + GUTTER_DIGIT_PAD;
-    let width_px = (col as f32) * MONO_GLYPH_WIDTH;
+    let width_px = (col as f32) * font_size * MONO_GLYPH_ADVANCE_RATIO;
 
-    // Pre-size: ~7 chars * line_count + newlines.
     let mut text = String::with_capacity((col + 1) * line_count);
     for n in 1..=line_count {
         // Right-align within the column.
-        // `{:>width$}` doesn't let us set width from a variable in a const
-        // context, but format! does at runtime.
         let s = format!("{:>width$}", n, width = col);
         text.push_str(&s);
         if n != line_count {
@@ -475,8 +524,8 @@ fn build_gutter_buffer(font_system: &mut FontSystem, hl: &HighlightedSource) -> 
         }
     }
 
-    let mut buffer = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-    buffer.set_size(font_system, Some(width_px + 4.0), None);
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(font_system, Some(width_px + font_size), None);
     let attrs = Attrs::new()
         .family(Family::Monospace)
         .color(GlyphonColor::rgb(GUTTER_COLOR.0, GUTTER_COLOR.1, GUTTER_COLOR.2));
