@@ -1,0 +1,7 @@
+/target
+
+# Claude Code per-user settings (not for version control)
+.claude/settings.local.json
+
+# macOS
+.DS_Store

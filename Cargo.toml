@@ -1,0 +1,35 @@
+[package]
+name = "ygg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A spatial code viewer for the age of AI-generated code"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ygg"
+path = "src/main.rs"
+
+[dependencies]
+# CLI / errors
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+
+# Windowing + GPU + UI
+winit = "0.30"
+wgpu = "22"
+egui = "0.29"
+egui-wgpu = { version = "0.29", features = ["winit"] }
+# default features include `links` → webbrowser → url → idna → icu (needs Rust 1.86+)
+egui-winit = { version = "0.29", default-features = false, features = ["clipboard", "wayland", "x11"] }
+glyphon = "0.6"
+
+# Logging — useful for surfacing wgpu/winit issues during early dev
+env_logger = "0.11"
+log = "0.4"
+pollster = "0.3"
+
+[dev-dependencies]
+rstest = "0.22"
+tempfile = "3"
