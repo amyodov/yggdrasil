@@ -9,9 +9,10 @@
 //! milestones extend `AppState` rather than introducing event-driven animation
 //! state elsewhere.
 
-use std::ops::Range;
+use std::collections::HashMap;
 
 use crate::analyzer::SourceFile;
+use crate::cards::{Card, CardId};
 use crate::syntax::TokenKind;
 
 /// Window size in physical pixels.
@@ -48,8 +49,9 @@ pub struct HighlightedSource {
 }
 
 impl HighlightedSource {
-    pub fn new(source: SourceFile, kinds: Vec<TokenKind>) -> Self {
-        let line_offsets = compute_line_offsets(&source.contents);
+    /// Build from already-computed pieces. Caller parses once for both kinds
+    /// and card extraction, so we don't re-walk the contents here.
+    pub fn from_parts(source: SourceFile, kinds: Vec<TokenKind>, line_offsets: Vec<usize>) -> Self {
         Self { source, kinds, line_offsets }
     }
 
@@ -63,7 +65,7 @@ impl HighlightedSource {
 
 /// Compute byte offsets of the start of each line, plus a sentinel offset at
 /// `contents.len()` so `offsets[i+1] - offsets[i]` gives line i's byte length.
-fn compute_line_offsets(contents: &str) -> Vec<usize> {
+pub fn compute_line_offsets(contents: &str) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(contents.len() / 40 + 2);
     offsets.push(0);
     for (i, b) in contents.bytes().enumerate() {
@@ -78,26 +80,84 @@ fn compute_line_offsets(contents: &str) -> Vec<usize> {
     offsets
 }
 
+/// Duration of the fold/unfold animation. Constants like this live in state
+/// because the per-frame `tick` method uses them; renderer-only constants
+/// live in renderer.rs.
+pub const FOLD_DURATION_SECS: f32 = 0.2;
+
 #[derive(Debug)]
 pub struct AppState {
     /// The file currently shown on the right pane, with its highlight data.
     pub highlighted: HighlightedSource,
-    /// Vertical scroll offset in logical pixels. 0 = top of file, grows downward.
+    /// Cards (classes / functions / methods) in source order.
+    pub cards: Vec<Card>,
+    /// Per-card fold animation progress. 1.0 = fully unfolded (default);
+    /// 0.0 = fully folded. Missing entry = 1.0.
+    pub fold_progress: HashMap<CardId, f32>,
+    /// Per-card fold target. The per-frame tick advances `fold_progress`
+    /// toward `fold_target`. Missing entry = 1.0 (unfolded).
+    pub fold_target: HashMap<CardId, f32>,
+    /// Vertical scroll offset in physical pixels.
     pub scroll_y: f32,
     /// Latest known window size. Kept here so layout math is a pure function of state.
     pub window_size: WindowSize,
     /// Device scale factor (points → physical pixels). Updated on ScaleFactorChanged.
     pub scale_factor: f32,
+    /// Last known cursor position in physical pixels. None if outside window.
+    pub cursor_pos: Option<(f32, f32)>,
 }
 
 impl AppState {
-    pub fn new(highlighted: HighlightedSource) -> Self {
+    pub fn new(highlighted: HighlightedSource, cards: Vec<Card>) -> Self {
         Self {
             highlighted,
+            cards,
+            fold_progress: HashMap::new(),
+            fold_target: HashMap::new(),
             scroll_y: 0.0,
             window_size: WindowSize { width: 1280, height: 800 },
             scale_factor: 1.0,
+            cursor_pos: None,
         }
+    }
+
+    /// Advance fold animations by `dt` seconds. Returns true if any card is
+    /// still animating — the event loop uses this to decide Poll vs Wait.
+    pub fn tick_animations(&mut self, dt: f32) -> bool {
+        let step = (dt / FOLD_DURATION_SECS).clamp(0.0, 1.0);
+        let mut any_animating = false;
+        // Union of both maps' keys: a target without a progress entry is
+        // treated as starting from 1.0 (the default unfolded state).
+        let keys: Vec<CardId> = self
+            .fold_target
+            .keys()
+            .chain(self.fold_progress.keys())
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for id in keys {
+            let target = self.fold_target.get(&id).copied().unwrap_or(1.0);
+            let current = self.fold_progress.get(&id).copied().unwrap_or(1.0);
+            if (current - target).abs() < 1e-4 {
+                self.fold_progress.insert(id, target);
+                continue;
+            }
+            let delta = target - current;
+            let next = current + delta.signum() * step.min(delta.abs());
+            self.fold_progress.insert(id, next);
+            any_animating = true;
+        }
+        any_animating
+    }
+
+    /// Toggle the fold target for `card_id`. If currently targeting unfolded,
+    /// flip to folded and vice-versa. The animation advances over subsequent
+    /// frames via `tick_animations`.
+    pub fn toggle_fold(&mut self, card_id: CardId) {
+        let current_target = self.fold_target.get(&card_id).copied().unwrap_or(1.0);
+        let new_target = if current_target > 0.5 { 0.0 } else { 1.0 };
+        self.fold_target.insert(card_id, new_target);
     }
 
     /// Width of the code pane in physical pixels.
@@ -139,75 +199,15 @@ impl AppState {
     }
 }
 
-/// Given a scroll offset (in pixels from the top of the file), a viewport
-/// height (pixels), the line height, and the file's total line count, compute
-/// the half-open range `[first, last)` of line indices that intersect the
-/// viewport — inflated by `overscan` lines on each side so glyphon can
-/// satisfy near-edge requests without stutter.
-///
-/// Clamps into `[0, total_lines]` and returns an empty range when the file is
-/// empty. Negative scroll values (which shouldn't happen but mustn't crash)
-/// are treated as zero.
-pub fn visible_line_range(
-    scroll_y: f32,
-    viewport_height: u32,
-    line_height: f32,
-    total_lines: usize,
-    overscan: usize,
-) -> Range<usize> {
-    if total_lines == 0 || line_height <= 0.0 {
-        return 0..0;
-    }
-    let scroll = scroll_y.max(0.0);
-    let first_visible = (scroll / line_height).floor() as isize;
-    let last_visible = ((scroll + viewport_height as f32) / line_height).ceil() as isize;
-
-    let first = (first_visible - overscan as isize).max(0) as usize;
-    let last = (last_visible as usize).saturating_add(overscan).min(total_lines);
-
-    first.min(total_lines)..last.max(first.min(total_lines))
-}
+// M2's `visible_line_range` lived here — M3 drives virtualization through
+// card layout + culling instead (each card has its own glyphon buffer, and
+// glyphon's shape_until_scroll handles per-card laziness). If we re-need a
+// pure "first/last visible line" helper for a future non-card view, restore
+// from git history and its rstest cases.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::rstest;
-
-    // `visible_line_range` — parameterized over every case that matters:
-    // top of file, mid file, past-end-of-file scroll, empty file, overscan
-    // clamping. Line height varies so we catch bad rounding assumptions.
-    #[rstest]
-    // At the top of a big file with no overscan: exactly the viewport.
-    #[case::top_no_overscan(0.0,    400, 20.0, 1000, 0,  0..20)]
-    // Overscan grows both sides, clamped at 0 on the top.
-    #[case::top_with_overscan(0.0,  400, 20.0, 1000, 3,  0..23)]
-    // Midway: 100 pixels of scroll @ 20/line = line 5; viewport covers 20 lines.
-    #[case::middle(100.0,            400, 20.0, 1000, 0,  5..25)]
-    // Fractional scroll: at 10px down, the viewport top shows the last 10px
-    // of line 0 and the bottom shows the first 10px of line 20 — 21 lines
-    // partially visible.
-    #[case::fractional_scroll(10.0,  400, 20.0, 1000, 0,  0..21)]
-    // Scroll past the end clamps `last` to total_lines.
-    #[case::past_end(30_000.0,       400, 20.0, 1000, 0,  1000..1000)]
-    // Empty file returns 0..0 whatever the scroll.
-    #[case::empty(500.0,             400, 20.0, 0,    5,  0..0)]
-    // Tall viewport, short file: range clamped to file length.
-    #[case::short_file(0.0,          1000, 20.0, 5,   2,  0..5)]
-    // Non-integer line height; fractional arithmetic is still fine.
-    #[case::fractional_line_height(0.0, 100, 14.5, 1000, 0, 0..7)]
-    fn visible_line_range_cases(
-        #[case] scroll_y: f32,
-        #[case] viewport: u32,
-        #[case] line_h: f32,
-        #[case] total: usize,
-        #[case] overscan: usize,
-        #[case] expected: Range<usize>,
-    ) {
-        assert_eq!(
-            visible_line_range(scroll_y, viewport, line_h, total, overscan),
-            expected,
-        );
-    }
 
     #[test]
     fn line_offsets_handles_trailing_newline() {

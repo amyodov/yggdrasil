@@ -29,6 +29,9 @@ glyphon = "0.6"
 tree-sitter = "0.25"
 tree-sitter-python = "0.23"
 
+# GPU buffer plumbing (Pod/Zeroable for instance data)
+bytemuck = { version = "1", features = ["derive"] }
+
 # Logging — useful for surfacing wgpu/winit issues during early dev
 env_logger = "0.11"
 log = "0.4"

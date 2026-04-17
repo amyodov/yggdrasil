@@ -34,21 +34,47 @@ There is one global state: `timeline_position: f32`, plus camera transform, plus
 
 ## Visual language
 
-### The world: luminous void
-Background is near-black, slightly textured so it's not dead. Objects don't cast shadows — they **emit light**. Glow, not drop-shadow. Depth comes from brightness, sharpness, and scale, not from shadow geometry.
+### The world: three zones, three visual rules
 
-This is deliberate: Material Design / macOS paper-on-desk metaphors don't fit the "holographic FUI console" feel. Think Tron, Mass Effect codex, Bourne Ultimatum surveillance screens — not Google Docs.
+The Ygg canvas has three distinct zones. Each has its own grammar. Mixing grammars is where "glow on glow" confusion comes from — don't.
+
+**Zone 1 — The void.** The dark space outside any plate. Breathing near-black sky, slightly textured so it's not dead. *Rule*: objects in the void emit light — halos, bloom, outer glow. No shadows. Depth from brightness, sharpness, scale, blur. Think Tron, Mass Effect codex, Bourne Ultimatum surveillance screens.
+
+**Zone 2 — The plate (scroll).** A floating luminous surface in the void, holding code content. *Rule*: the plate is a lit material — holographic parchment. It has two faces:
+- **Outer edge** (facing the void): emits light outward as a soft bloom halo. This is the plate's presence in the void.
+- **Top surface** (facing the viewer): a lit plane under implicit light from above. Objects laid on this surface are lit by it.
+
+**Zone 3 — On the plate.** Cards, text, icons, handles — content placed on a lit surface. *Rule*: 2.5D physical objects with small drop shadows. Near-opaque tinted fills, subtle top-edge rim light from the implicit above-source. **No outer glow** — the plate lights them; they don't light themselves. Think objects on a glowing holographic table in sci-fi (Avengers, Minority Report): the *table* glows, the *objects on it* are physical and cast tiny shadows.
+
+**Semantic lights: the exception.** Certain elements on the plate *are* allowed to emit — they're not decorative glow, they carry meaning. Specifically:
+- Class armature / spine (genuinely luminous — it's a light-emitting rail built into the plate).
+- Fold-state transitions (brief light pulses).
+- Diff-change flashes (red/green/blue per operation type).
+- Rolling edge during a fold animation.
+
+These are functional lights, not ambient decoration. Keep the set small; new semantic lights require a real reason.
+
+This grammar supersedes the older "everything emits light, no shadows anywhere" doctrine — that rule applied to *things in the void* and was misread as applying on the plate too. The unified rule now: **glow belongs to things floating in void or to semantic lights; shadows belong on lit surfaces.**
+
+### Why not Material / paper-on-desk
+Material Design / macOS paper-on-desk metaphors don't fit this canvas — they assume a page under ambient room light, no inherent luminosity. Ygg's plate *is* the light source. Shadows on the plate exist because the plate lights objects from below/around, not because there's a desk behind it.
 
 ### Cards
-Methods and classes are rendered as floating luminous panels ("cards"). Each card has:
+Methods and classes are rendered as **2.5D physical objects on the plate** ("cards") — not themselves luminous. Each card has:
 - A structured header: keyword badge (`def`/`class`/`fn`/`pub`), name, signature with typed params as mini-columns, return type badge on the right. Keyword-only separators (`*`, `/`) visible as divider columns.
 - A docstring sub-header in a distinct style, separated by a hairline.
 - The body: code with syntax highlighting, grid-aligned monospace.
 - A fold handle that reads as *honest UI affordance* — not a forgotten convention, but an inviting visual element.
 
-Cards have a subtle colored accent strip on the left encoding visibility/semantics:
-- Public methods: bright accent, full opacity, prominent glow, elevated.
-- Private methods: muted accent, ~75% opacity, reduced glow, sitting lower.
+Visual treatment (per Zone-3 rule):
+- **Near-opaque tinted fill** — a "paper" or "plastic" material colored by semantics.
+- **Tiny drop shadow** beneath the card (~2–3pt offset, low-alpha, softly blurred) — card sits *on* the plate.
+- **Subtle top-edge rim light** — 1px bright line inside the top edge, cue for "lit from above."
+- **No outer glow on the card itself.** Outer glow belongs to the plate (Zone 2) and to semantic lights.
+
+Cards have a colored accent strip on the left encoding visibility/semantics:
+- Public methods: bright accent, full opacity, elevated (a hair taller shadow).
+- Private methods: muted accent, ~75% opacity, sitting lower (shorter shadow), slightly inset.
 - Classmethod / staticmethod / associated functions: attached *directly* to the class armature, not the instance.
 - Instance methods: connected via a lighter branch from a `self` node, not from the class armature directly.
 
@@ -77,18 +103,21 @@ All diff visuals are parameterized by `progress: 0.0..1.0` and direction-indepen
 - **Rename** (file or symbol): letters morph between old and new name; the node in the file tree smoothly relocates/rewrites. If combined with move or modify, compose as above.
 - **Copy/fork** (file copied with `git diff -C` detection): not "appeared from nothing" but a cell-division animation from the ancestor node. Optional dotted ancestry link persists.
 
-### Panes as light, not boxes
-UI panes (file tree on left, code pane on right) are not walled-off boxes with borders. They are regions that *glow gently* when focused. Hover or mouse-into-region → a soft luminous cloud appears around the region's contents, signaling "scroll here, interactions target this region now." No visible pane borders, no splitters — just ambient regions over a unified background.
+### Panes as plates, not boxes
+UI panes (file tree on left, code plate on right) are not walled-off boxes with borders — they're **plates** (Zone 2): luminous surfaces floating in the void. The plate's outer bloom into the void doubles as the "pane is here" cue; no borders or splitters needed. Hover or focus-into-a-plate → the plate's bloom brightens slightly ("scroll here, interactions target this region"). All over a unified void.
 
-The background itself has a subtle, slow ambient animation (think "breathing sky" or "slow-drifting clouds at very low contrast") to feel alive without distracting.
+The void has a subtle, slow ambient animation (breathing sky + faint drifting clouds at very low contrast) to feel alive without distracting.
 
 ### Overlays, not sidebars
 Inspired by game engine editors (Unity, Blender) more than by code editors. Timeline scrubber, navigation controls, legends float as semi-transparent HUD overlays *over* the main canvas, not as fixed bottom/side panels eating into it. Draggable, dismissable.
 
-### 3D vs 2.5D — current plan: 3D-feeling
-Base state: cards are always parallel to the screen (orthographic projection). Text is always frontal. Depth cues come from glow, opacity, scale, blur — creating a 3D *feel* without actually rotating anything. Camera movements (zoom from repo to method to line) *feel* like flying through space, but everything rendered is 2D surfaces in a pseudo-3D arrangement.
+### 3D vs 2.5D — hybrid by zone
+Each zone has its own rule:
 
-**Alternative to explore later: 2.5D with shadows.** The Windows 95–98 / flat-with-shadows metaphor. Physical-paper feel instead of holographic. A secondary visual theme worth prototyping at some point — but not now. The current prototype targets the luminous/void aesthetic.
+- **Zone 1 (void)**: objects float in pseudo-3D space, orthographic + frontal projection by default. Depth cues in the void come from glow, opacity, scale, blur — not geometry. Camera movements (zoom, fly-through) feel 3D without actually rotating individual plates. Plates *can* rotate here (future: repo-browse history pages, branch-graph tilts) because they're 3D quads in the pipeline from M3.1 onward.
+- **Zone 3 (on the plate)**: 2.5D — flat-with-shadows. Physical objects lying on the plate's top surface. Shadows cue depth. No rotation of items within a plate; they stay parallel to the plate's own surface.
+
+This hybrid is intentional: the void gets holographic FUI flow; the plate surface gets paper-on-a-lit-desk legibility. The two aesthetics sit on different sides of the plate's edge and don't fight each other.
 
 ### Git branch graphs (future)
 Branches that diverge and converge are inherently a graph structure. A future exploration is tilting the branch graph slightly toward 3D to make merge topology legible. Not in prototype scope — noted for later.

@@ -1,41 +1,37 @@
-//! winit `ApplicationHandler` implementation — the event→state→render bridge.
+//! winit `ApplicationHandler` implementation — event→state→render bridge.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
-use winit::event::{MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
-use crate::renderer::Renderer;
+use crate::cards::{layout_cards, CardId};
+use crate::renderer::{fold_handle_rect_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
 use crate::state::{AppState, WindowSize, LINES_PER_WHEEL_NOTCH};
 
-/// Initial window size request. Real systems may snap to DPI/display bounds.
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
 
-/// The winit-facing application.
-///
-/// Winit 0.30 requires the window to be created in `resumed`, not up-front
-/// (Android parity) — so all GPU state is `Option` until that happens.
 pub struct App {
     state: AppState,
-    /// `None` until the event loop calls `resumed` and we can create a window.
     renderer: Option<Renderer>,
+    /// Wall-clock instant at the previous frame. `None` before first frame.
+    last_frame: Option<Instant>,
 }
 
 impl App {
     pub fn new(state: AppState) -> Self {
-        Self { state, renderer: None }
+        Self { state, renderer: None, last_frame: None }
     }
 
     pub fn run(self) -> Result<()> {
         let event_loop = winit::event_loop::EventLoop::new()?;
-        // Poll produces redraw-on-demand behavior combined with request_redraw
-        // from `about_to_wait`. Animation milestones may switch to a continuous
-        // drive; for M1 on-demand is enough.
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        // Start in Wait; we switch to Poll while any fold is animating.
+        event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = self;
         event_loop.run_app(&mut app)?;
         Ok(())
@@ -45,8 +41,6 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_some() {
-            // On desktop `resumed` fires exactly once, but the handler must be
-            // idempotent for mobile-parity — on second entry we reuse.
             return;
         }
 
@@ -67,12 +61,14 @@ impl ApplicationHandler for App {
         };
 
         let size = window.inner_size();
-        self.state.window_size = WindowSize { width: size.width.max(1), height: size.height.max(1) };
+        self.state.window_size =
+            WindowSize { width: size.width.max(1), height: size.height.max(1) };
         self.state.scale_factor = window.scale_factor() as f32;
 
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             &self.state.highlighted,
+            &self.state.cards,
             self.state.effective_font_size(),
             self.state.effective_line_height(),
         )) {
@@ -84,6 +80,7 @@ impl ApplicationHandler for App {
             }
         };
         self.renderer = Some(renderer);
+        self.last_frame = Some(Instant::now());
     }
 
     fn window_event(
@@ -94,10 +91,8 @@ impl ApplicationHandler for App {
     ) {
         let Some(renderer) = self.renderer.as_mut() else { return };
 
-        // egui peeks every window event first; if it consumed it we still
-        // let our own handlers run for everything except pointer input in
-        // the egui region. For M1 (static HUD) the simpler rule "let both
-        // see it" is fine.
+        // egui sees every event first; we don't block our handlers on its
+        // `consumed` flag in M3 (file-tree panel is a placeholder).
         let window = renderer.window().clone();
         let _ = renderer.egui_state_mut().on_window_event(&window, &event);
 
@@ -112,35 +107,61 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // Text metrics are derived from scale_factor on every frame
-                // inside the renderer, so updating state is sufficient — no
-                // explicit buffer rebuild needed here.
                 self.state.scale_factor = scale_factor as f32;
                 renderer.window().request_redraw();
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                // Cursor positions come in physical pixels on winit 0.30.
+                self.state.cursor_pos = Some((position.x as f32, position.y as f32));
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                self.state.cursor_pos = None;
+            }
+
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                let metrics = renderer.layout_metrics(&self.state);
+                if let Some(card_id) = hit_test_fold_handle(&self.state, metrics) {
+                    self.state.toggle_fold(card_id);
+                    // Kick the animation loop.
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                    renderer.window().request_redraw();
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
-                // Right-region only is the intent, but M1 doesn't differentiate —
-                // egui already absorbs wheel when the cursor is over it.
                 let lh = self.state.effective_line_height();
                 let dy = match delta {
-                    // Line-delta wheels jump `LINES_PER_WHEEL_NOTCH` per notch;
-                    // scale by line height so the feel is constant across DPI.
                     MouseScrollDelta::LineDelta(_x, y) => y * LINES_PER_WHEEL_NOTCH * lh,
-                    // Pixel-delta trackpads report in physical pixels already.
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
-                // Upward wheel scrolls text upward (scroll_y increases).
                 self.state.scroll_y -= dy;
                 self.state.clamp_scroll(lh);
                 renderer.window().request_redraw();
             }
 
             WindowEvent::RedrawRequested => {
+                // Advance fold animations using the time since the last frame.
+                let now = Instant::now();
+                let dt = match self.last_frame {
+                    Some(prev) => (now - prev).as_secs_f32().min(0.1), // clamp to 100ms to avoid big jumps
+                    None => 0.0,
+                };
+                self.last_frame = Some(now);
+
+                let animating = self.state.tick_animations(dt);
+                // Poll continuously while animating, Wait when idle. Redraws
+                // during Poll are self-perpetuating via request_redraw below.
+                if animating {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
+
                 match renderer.render(&self.state) {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        // Force a reconfigure on the next frame by replaying current size.
                         renderer.resize(self.state.window_size);
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
@@ -149,15 +170,41 @@ impl ApplicationHandler for App {
                     }
                     Err(e) => log::warn!("surface error: {e:?}"),
                 }
+
+                if animating {
+                    renderer.window().request_redraw();
+                }
             }
 
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Wait mode: no continuous redraws. Explicit request_redraw from input
-        // handlers drives repaint. M4+ with ambient background animation will
-        // switch to Poll.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+}
+
+/// Is the cursor (from `state.cursor_pos`) over a fold handle? Free function
+/// so it doesn't alias with the `&mut renderer` borrow in the event loop.
+///
+/// Coordinate systems (M3.1): `fold_handle_rect_scene` returns **plate-local**
+/// coordinates (x, y relative to the plate's top-left). The cursor comes in
+/// **window-space**. We convert cursor → plate-local using `plate_rect`, then
+/// compare.
+fn hit_test_fold_handle(state: &AppState, metrics: crate::cards::LayoutMetrics) -> Option<CardId> {
+    let (cx, cy) = state.cursor_pos?;
+    let (plate_pos, _) = plate_rect(state);
+    let local_cx = cx - plate_pos[0];
+    let local_cy = cy - plate_pos[1];
+    let scene_top_local = SCENE_TOP_PAD_PT * state.scale_factor;
+    let layout = layout_cards(&state.cards, &state.fold_progress, metrics);
+    for card in &state.cards {
+        let Some(rect) = layout.rects.get(&card.id) else { continue };
+        let (hx, hy, hw, hh) = fold_handle_rect_scene(card, rect, state);
+        // `hy` is plate-local, pre-scroll. Apply scroll + scene-top offset.
+        let local_hy = hy - state.scroll_y + scene_top_local;
+        if local_cx >= hx && local_cx <= hx + hw && local_cy >= local_hy && local_cy <= local_hy + hh {
+            return Some(card.id);
+        }
     }
+    None
 }

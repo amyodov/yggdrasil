@@ -11,6 +11,7 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 - **Tests: maximize coverage per line of test code.** Use `rstest` parameterized tests. One test per logical unit with cases covering all branches. Don't test rendering output.
 - **Verify by eye.** After each milestone, visually confirm the result looks right. Screenshots in commit messages welcome.
 - **Don't skip ahead on visual polish.** Milestones 1–7 aim at *correct behavior*; M8 is the polish pass. Tempting FUI flourishes before then are a distraction.
+- **Architectural foresight is first-class.** Sub-milestones explicitly marked *(architectural)* exist so that later milestones don't force rewrites of earlier work. When implementing one of those, design for the downstream features listed in its description — not just the immediate user-visible goal. Examples: the offscreen RT primitive (M3.1) must land before any plate visuals; the `HeaderModel` ADT (M3.5a) must be language-agnostic from day one, not Python-first-and-refactor-later.
 
 ---
 
@@ -69,6 +70,175 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 
 **Tests**: AST → card structure mapping (parameterized: simple function, class with methods, class with classmethod/staticmethod, nested class, decorator stacks), fold state transitions.
 
+### M3 sub-milestones — visual and architectural refinement
+
+M3's first pass shipped cards as lit rectangles with binary fold. Review surfaced that they read as "glowing overlays," not physical plates; that fold targets the wrong line (decorator, not signature); that nested folds don't propagate; that the background animation is invisible; and that the code pane is a border-of-nothing rather than a tangible surface. These sub-milestones refine and extend M3 before M4. They ship in the order listed below — later ones build on earlier foundations.
+
+#### M3.1 — Plate-rendering primitive and offscreen RT architecture *(architectural)*
+
+**Goal**: establish the rendering foundation every subsequent plate (code pane, cards, future tree nodes, future history pages) builds on.
+
+**What ships**:
+- Each plate is modeled as a **3D-space quad with its own model matrix**. Camera is orthographic + frontal by default, so plates look 2D today; rotation-ready for free tomorrow.
+- **Plate contents render to an offscreen texture (RT)**, then composited onto the plate quad. Scroll = UV offset into the RT. Future curl / rotation / zoom-out-fly-through all sample the same cached raster.
+- Glyphon renders into the plate RT (not directly to the swap chain). **Grayscale AA throughout** (not subpixel) so text survives non-integer transforms.
+- RT pooling: one RT per visible plate, recycled when a plate leaves visibility. Size-bounded (e.g. plate-height × 3 at normal zoom; extend as scroll progresses). Manual mipmap chain on each RT so angled rendering doesn't shimmer.
+- Per-plate dirty flag: only re-render the RT when its contents actually change. Frame-to-frame, compositing the cached texture is cheap.
+
+**Why this is the keystone**: M3.3 (physical plates), M3.6 (code-pane plate), M3.7 (scroll-winding), and any future 3D features (M8 zoom, post-prototype branch graphs, "pages of the history book" rotation) all depend on this primitive. Shipping visuals first and retrofitting RT later is a rewrite; shipping RT first is a one-time cost.
+
+**Out of scope**: actual rotation, actual curl, actual 3D effects — those come in later milestones. M3.1 just establishes the pipeline; default rendering still looks 2D.
+
+**Tests**: RT allocation/pooling/recycling, model-matrix → NDC projection (parameterized with identity / translated / rotated / scaled), dirty-flag invalidation logic.
+
+#### M3.2 — Icon system with Lucide + SDF atlas *(architectural)*
+
+**Goal**: a first-class icon primitive so every subsequent UI affordance (fold handles, bulk controls, timeline transport, hover cues) uses one rendering path.
+
+**What ships**:
+- Lucide icons as the chosen set. MIT-licensed, linear/precise glyphs matching the FUI aesthetic (FontAwesome's chunky typographic style doesn't fit).
+- Build-time or init-time step: rasterize the icons we use into a **signed-distance-field (SDF) atlas texture**. Pick a starter subset (fold down, fold up, play, pause, skip-prev, skip-next, step-prev, step-next).
+- Runtime rendering: a quad sampled from the atlas through the shapes pipeline with an arbitrary tint color. Works at any scale; DPI-agnostic by construction.
+- Integration: fold handles on cards stop being bare geometric shapes and use icons from day one of M3.4.
+
+**Why this early**: every downstream UI element that isn't a plate is an icon on a plate. Fold handles (M3.4), bulk fold controls (post-prototype), timeline transport (M5/M7). One pipeline, not eight.
+
+**Out of scope**: custom (non-Lucide) icons, animated icons, icon color theming beyond tint.
+
+**Tests**: SDF sampling produces correct silhouettes at varying scales (golden-image or SDF-distance-at-known-points), atlas packing correctness, icon lookup by name.
+
+#### M3.3 — Three-zone physicality: lit plate, physical cards
+
+**Goal**: implement the three-zone visual grammar from `CLAUDE.md` — the plate is the luminous surface (Zone 2); cards are 2.5D physical objects on it (Zone 3) with tiny shadows and no outer glow; semantic lights (class spine, state transitions) stay luminous.
+
+**What ships**:
+
+*Plate (Zone 2):*
+- **Outer bloom into the void**: baked into `composite.rs` shader — sample the plate RT's alpha mask, expand it by `bloom_radius`, feather to zero. Gives the plate a soft halo in the void without bloating the RT (no extra texture space, rotation-proof).
+- **Inner luminance**: panel fill gets a subtle radial gradient (brighter toward center) + top→bottom tint so the plate surface reads as a lit material, not flat paint.
+- **Top-edge rim light** along the plate's rounded top edge — implicit-above light cue (faint, 1–2px).
+- Plate still reads tinted-glass over the sky at low alpha; sky breathing stays visible.
+
+*Cards (Zone 3):*
+- **Remove outer glow** on cards. Card backgrounds become near-opaque tinted "paper" fills.
+- **Drop shadow** beneath each card: a softened, dark, low-alpha copy of the card shape, offset ~2–3pt down/right, blurred via the SDF edge fade (large glow radius with dark color ≈ shadow). Drawn before the card fill.
+- **Top-edge rim light** (1px bright inner line at card top) — "lit from above."
+- Public cards get a fractionally taller shadow than private ones (the spec's "elevated/sitting lower" affordance).
+
+*Semantic lights (stay emissive):*
+- Class spine — luminous, unchanged.
+- Fold-state color (handle color flip) — unchanged.
+- Rolling edge during fold animation — unchanged (a true emissive hairline).
+- Future diff flashes, hover state pulses — use the same "glow" path.
+
+**Why composite-shader bloom (not expanded RT)**: baking bloom into the composite pass means (a) no extra RT space needed (plate-sized RT is enough), (b) the bloom travels with any future model-matrix rotation of the plate for free, (c) single sampling point — cheap. The alternative (enlarge RT by `bloom_radius` on each side) bloats every plate's memory footprint and has to track which part of the RT is "plate" vs "pad."
+
+**Out of scope**: light direction changing, plate-to-plate shadows (plates don't shadow each other in the void), animated lighting, real-material simulation (PBR etc.).
+
+**Tests**: shadow offset + rim-light color presence in the instance stream (structural, not pixel-level), composite bloom shader math at known sample points.
+
+**Tests**: plate shader sampling at known positions produces expected luminance profiles (top-brighter than bottom; edge-rim > interior).
+
+#### M3.4 — Fold anatomy, two-button fold, nested cascade
+
+**Goal**: fold collapses the right part of the card; class fold propagates to nested cards; user has independent control over body vs docstring visibility.
+
+**What ships**:
+- Card anatomy splits into three bands: **header** (decorators as chips + signature blocks — always visible), **docstring** (optional, below header; foldable independently), **body** (code; foldable independently).
+- **Two fold buttons per card**: body toggle and docstring toggle. Independent state, four total combinations. Both use Lucide icons via M3.2.
+- **State model**: each card has `body_progress: f32` and `docstring_progress: f32`, each smoothstep-eased between 0 (hidden) and 1 (shown). Pure derivation — no event handlers animate these, only the per-frame interpolation toward targets.
+- **Nested fold cascade**: when a class's body folds, all child cards (methods, nested classes) ride the same eased progress — their y-positions interpolate toward the class-header baseline and their opacity fades in parallel. When fully folded, children are visually collapsed into the header. Reversing the fold unwinds them. Cascade is pure derivation over the hierarchy, not a separate animation system.
+- Decorator chips never animate with the body — they're part of the header and stay visible at every fold state.
+
+**Out of scope**: bulk fold controls across all cards (parked to post-prototype), keyboard shortcuts for fold (M8).
+
+**Tests**: fold progress interpolation per card, parent→children cascade (parameterized: class with 1/3/nested class of methods; verify children's y and opacity track parent's body_progress), two-button independent state correctness.
+
+#### M3.5a — `HeaderModel` ADT and Python builder, single-row layout *(architectural)*
+
+**Goal**: establish the language-agnostic header representation and a working Python builder. Layout is trivial one-row for now; the reflow engine is M3.5b.
+
+**What ships**:
+- `HeaderModel` ADT with language-agnostic blocks:
+  - **Prelude**: decorator chips + keyword badge (`def`/`class`/`async def`/future `fn`/`pub fn`).
+  - **Name**: the identifier.
+  - **Params**: vector of `ParamChip { name, ty: Option, default: Option, kind: Regular|Star|Slash|Kwargs }`.
+  - **Return**: `Option<TypeChip>`.
+  - **Docstring**: `Option<Docstring>` — always below all of 1–4 when present; never participates in row reflow.
+- Python builder: `python::build_header(ts_node, source) -> HeaderModel`. Maps Python AST shapes onto the universal structure.
+- Stubs (documentation only, not implementations) for `rust::build_header`, `typescript::build_header`, `go::build_header` — demonstrating that the ADT covers those languages' function/method shapes.
+- Renderer consumes `HeaderModel` directly; no language-specific code in the renderer path.
+- Single-row layout: blocks 1–4 sit on one line in order; long signatures overflow horizontally (temporary — fixed in M3.5b). Docstring block sits below.
+- Color-coded block backgrounds (muted tints consistent with the luminous-void palette — type cyan, default warm, return-type distinct hue, etc.).
+
+**Why architectural**: this ADT is the seam for every future language. Getting the structure wrong now means rewriting every header-consuming path later. Python-first-and-refactor-later is explicitly rejected by this sub-milestone.
+
+**Out of scope**: multi-row reflow (M3.5b), markdown rendering of docstring (later).
+
+**Tests**: Python builder parameterized across `def`, `async def`, `class`, classmethod, staticmethod, property, dataclass, decorated functions, default values, type annotations, `*args`/`**kwargs`, `/` and `*` separators, functions with docstrings, no-docstring case. Verify `HeaderModel` inputs from a hand-rolled fixture render identically regardless of which builder produced them.
+
+#### M3.5b — Block-flow reflow engine
+
+**Goal**: when the single-row layout would overflow the plate width, the header reformats into multi-row structure.
+
+**What ships**:
+- Reflow rules, consumed by the renderer from M3.5a's `HeaderModel`:
+  1. If the full row `[1][2][3 3 3 3][4]` fits the plate width: single row.
+  2. If params overflow: `[1][2][3a][4]` on row 1 (block 4 pins top-right); subsequent rows `  [3a]`, `  [3a]`, ... (remaining params, indented under block 2's column).
+  3. If the name column is also wide: `[1][2]    [4]` on row 1 (name and return together, block 4 still pinned top-right); params become their own indented column below.
+- Block 4 (return type) stays top-right regardless of how blocks 2 and 3 wrap.
+- Transitions when plate width changes (e.g. future zoom): reflow is smoothly animated via pure derivation on a `layout_width` parameter.
+- Uses M3.1's RT — reflow triggers RT redraw.
+
+**Out of scope**: any language not already supported; fold-aware reflow (the header is the header regardless of fold state).
+
+**Tests**: reflow rules parameterized across a matrix of plate-widths × `HeaderModel` shapes (short signature / long params / long name + long params). Each case asserts block positions and row count.
+
+#### M3.6 — Code-pane plate structure
+
+**Goal**: the code pane reads as a physical plate floating in the void, with a persistent filename header and generous edge breathing room.
+
+**What ships**:
+- **Fixed header band** at top of plate (filename now; metadata chips in later milestones). Does not scroll.
+- **Plate margins** from window edges: ~2.5–3% of `min(width, height)`. Visual gap between plate and window frame.
+- **Plate height** = `min(content_height, window_height − margins)`. Short files produce a plate that hugs their content, not one stretched empty.
+- **Scroll clipping** to the plate's rounded corners — no text leaks past the plate edge.
+- Built on M3.1 (plate RT).
+
+**Out of scope**: scroll-winding (M3.7), metadata chips beyond filename (M4+), horizontal scroll.
+
+**Tests**: plate-size derivation (parameterized: tall file, short file, window resized), clip-mask correctness at rounded corners.
+
+#### M3.7 — Scroll-winding: pin zones with cylindrical curl
+
+**Goal**: content above/below the visible window appears "wound on a scroll" at top and bottom of the plate — the key tactile metaphor.
+
+**What ships**:
+- **Top and bottom pin zones**, each exactly 1 line tall.
+- Pin zones only materialize when off-screen content exists in that direction (top-of-file → no top pin; bottom-of-file → no bottom pin). Fade in/out smoothly.
+- Content just past the visible window curls onto a cylinder in the pin zone — cylinder UV mapping sampled from the plate RT (M3.1). Foreshortened, faintly lit, not meant to be readable.
+- No prominent rod/dowel — just faint luminous **cap-glow** at the left and right plate edges where the dowel would exit, cueing "something is wound here."
+- Continuous transition as the scroll offset crosses integer line boundaries: a line gradually curves from flat to fully wound.
+- Works symmetrically top and bottom.
+
+**Out of scope**: tree-aura link (M4.3), other plates getting the same treatment (future — the primitive is reusable).
+
+**Tests**: cylinder UV function (parameterized progress), pin-zone visibility logic (at top-of-file / mid / bottom-of-file / shorter-than-window cases), cap-glow intensity as a function of wound-content depth.
+
+#### M3.8 — Background visibly alive
+
+**Goal**: the breathing-sky background is perceptually present — subtly alive, not invisible.
+
+**What ships**:
+- Plate alpha tuned (~0.6) so the sky reads through tinted-glass-style.
+- Breath/cloud amplitudes raised into perceptible range while staying well below "distracting."
+- Optional gentle vignette giving the void a center of gravity.
+- Plate itself gets a very subtle top→bottom tint (slight blue at top, dimming at bottom) reinforcing the tinted-glass feel.
+
+**Out of scope**: cloud shapes with parallax, weather metaphors, anything narrative.
+
+**Tests**: perceptual delta — not automated; verify by eye. (Consistent with "don't test rendering output" principle.)
+
 ---
 
 ## Milestone 4 — Two panes, real file tree
@@ -88,6 +258,43 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 **Out of scope**: git, diffs, multi-file side-by-side.
 
 **Tests**: file tree construction from a directory (parameterized with fixture trees: empty, nested, hidden files, symlinks), file selection state transitions.
+
+### M4 sub-milestones
+
+M4's main description covers the first pass (basic tree + code transitions + hover-glow + shared background animation). The sub-milestones below extend it with the "current file never scrolls out of view" behavior and the code↔tree aura link.
+
+#### M4.1 — Basic tree
+
+The main M4 description, implemented as stated.
+
+#### M4.2 — Sticky-pinned current file
+
+**Goal**: the currently-selected file is always visible in the tree, even when the user scrolls it out.
+
+**What ships**:
+- When the selected file's natural row scrolls outside the tree viewport, the row **detaches** from the list and floats at the nearest edge (top or bottom of the tree viewport).
+- Detach/re-attach animations: smooth lift-off when leaving, smooth snap-back when the natural position returns into view.
+- The pinned copy keeps its aura / glow state — it's still visibly "the selected file."
+- Pure-derivation state: pin position is a function of scroll offset and the selected file's natural row offset, nothing event-driven.
+
+**Out of scope**: sticky headers for directories (stretch), sticky for multiple selected items (not a selection model yet).
+
+**Tests**: pinning logic (parameterized across scroll positions relative to the selected row), detach/attach transitions.
+
+#### M4.3 — Tree ↔ code aura link *(independently-shippable)*
+
+**Goal**: a visible luminous link between the code you're reading and the file it comes from. Tactile "cable" — you never lose track of what's where.
+
+**What ships**:
+- Code plate emits a **left-edge viewport indicator** — a thin luminous segment indicating what vertical slice of the file is currently visible.
+- Ambient gradient bridges leftward from the viewport indicator across the void, landing on the tree row for that file.
+- Brightens on interaction (scrolling the code, hovering either pane).
+- Works with M4.2: when the file is pinned at the tree edge, the aura lands on the pinned copy.
+- Reusable primitive: the same "plate → target-row aura" construct should later link any relevant pairs (e.g. commit list in M5, diff-file list in M6).
+
+**Out of scope**: multi-target auras, 3D cable rendering (future).
+
+**Tests**: viewport indicator position as a function of scroll offset + plate height + total file lines (parameterized), target-row resolution (pinned vs natural position).
 
 ---
 
@@ -181,6 +388,8 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 - 2.5D alternative visual theme experiment.
 - Agent manifest format beyond basic consumption.
 - Deep integration with Claude Code / other agents (CLI invocation, MCP server, etc.).
+- **Bulk fold HUD overlay**: a floating control to fold all cards' bodies / fold all docstrings / expand all, globally. Deferred — but when implementing the fold model in M3.4 and the icon system in M3.2, leave space for this: fold state is per-card (so a global toggle just iterates targets), icons for the control should be covered by Lucide's set. Don't build the HUD now; do build so nothing blocks it.
+- **Actual 3D rotation of plates** (for repo browsing, "pages of the history book," branch-graph tilting). Deferred — but M3.1's offscreen-RT + 3D-quad architecture already makes this a drop-in feature rather than a rewrite.
 
 ---
 

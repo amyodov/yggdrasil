@@ -3601,6 +3601,7 @@ name = "ygg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "clap",
  "egui",
  "egui-wgpu",

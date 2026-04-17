@@ -2,8 +2,13 @@
 
 mod analyzer;
 mod app;
+mod background;
+mod cards;
 mod cli;
+mod composite;
+mod plate;
 mod renderer;
+mod shapes;
 mod state;
 mod syntax;
 
@@ -14,8 +19,9 @@ use clap::Parser;
 
 use crate::analyzer::SourceFile;
 use crate::app::App;
+use crate::cards::extract_cards;
 use crate::cli::{Cli, Mode, RealFs};
-use crate::state::{AppState, HighlightedSource};
+use crate::state::{compute_line_offsets, AppState, HighlightedSource};
 use crate::syntax::Highlighter;
 
 fn main() -> ExitCode {
@@ -39,11 +45,19 @@ fn run() -> Result<()> {
         Mode::File { path } => {
             let source = SourceFile::read(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            // M2: Python-only. Later milestones dispatch on file extension.
+            // Python-only in M3. Later milestones dispatch on file extension.
             let mut highlighter = Highlighter::new_python().context("load Python grammar")?;
-            let kinds = highlighter.highlight(&source.contents);
-            let highlighted = HighlightedSource::new(source, kinds);
-            let state = AppState::new(highlighted);
+            let line_offsets = compute_line_offsets(&source.contents);
+            // Parse once, use the tree for both highlighting and card extraction.
+            let tree = highlighter
+                .parse(&source.contents)
+                .context("tree-sitter failed to parse source")?;
+            let kinds = highlighter.highlight_tree(&tree, &source.contents);
+            let cards = extract_cards(&tree, &source.contents, &line_offsets);
+            drop(tree);
+
+            let highlighted = HighlightedSource::from_parts(source, kinds, line_offsets);
+            let state = AppState::new(highlighted, cards);
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }

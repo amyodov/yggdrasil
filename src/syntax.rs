@@ -15,7 +15,7 @@
 use std::ops::Range;
 
 use anyhow::Result;
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -63,13 +63,19 @@ impl Highlighter {
         Ok(Self { parser, query, capture_kind })
     }
 
-    /// Compute a flat `TokenKind`-per-byte vector matching `source`'s length.
+    /// Parse `source` into a tree-sitter `Tree`. Returns `None` if parsing
+    /// failed outright (the parser gave up — should be very rare).
+    pub fn parse(&mut self, source: &str) -> Option<Tree> {
+        self.parser.parse(source, None)
+    }
+
+    /// Compute a flat `TokenKind`-per-byte vector from an already-parsed tree.
     /// Bytes not covered by any non-default capture stay `Default`.
-    pub fn highlight(&mut self, source: &str) -> Vec<TokenKind> {
+    ///
+    /// The tree is taken by reference so the caller (M3: also card extraction)
+    /// can consume it for multiple purposes without re-parsing.
+    pub fn highlight_tree(&self, tree: &Tree, source: &str) -> Vec<TokenKind> {
         let mut kinds = vec![TokenKind::Default; source.len()];
-        let Some(tree) = self.parser.parse(source, None) else {
-            return kinds;
-        };
 
         // Collect every capture first so we can apply them outermost-to-innermost.
         // Tree-sitter doesn't guarantee iteration order matches nesting, so we
@@ -97,6 +103,16 @@ impl Highlighter {
             kinds[r.start..r.end].fill(kind);
         }
         kinds
+    }
+
+    /// Convenience: parse + highlight in one shot. Used by tests and any
+    /// caller that doesn't also want the `Tree`.
+    #[cfg(test)]
+    pub fn highlight(&mut self, source: &str) -> Vec<TokenKind> {
+        match self.parse(source) {
+            Some(tree) => self.highlight_tree(&tree, source),
+            None => vec![TokenKind::Default; source.len()],
+        }
     }
 }
 

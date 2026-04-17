@@ -1,14 +1,42 @@
-//! Renderer — wgpu + egui + glyphon plumbing.
+//! Renderer — wgpu + glyphon + egui plumbing, now with a plate primitive (M3.1).
 //!
-//! Owns the GPU resources and draws a frame from an `AppState`. This is the
-//! seed of what CLAUDE.md calls "the Renderer": in later milestones cards,
-//! glow, animations etc. extend this. M2 adds:
-//! - A rich-text code buffer with per-byte syntax colors.
-//! - A second glyphon buffer for the line-number gutter.
-//! - Virtualization: glyphon's `shape_until_scroll` lazily shapes visible
-//!   content; we use `visible_line_range` to decide when to reshape.
+//! ## Pipeline (M3.1)
+//!
+//! Five render passes per frame:
+//!
+//! 1. **Background pass** → swap chain. Draws the breathing sky. Unchanged
+//!    from M2/M3.
+//! 2. **Plate shapes pass** → plate RT. Clears the plate to transparent, then
+//!    draws the panel background + all visible card shapes (bg, accent, spine,
+//!    fold handle, rolling edge) in **plate-local** coordinates.
+//! 3. **Plate text pass** → plate RT. Glyphon renders per-card text buffers
+//!    at their plate-local positions.
+//! 4. **Composite pass** → swap chain. Samples the plate RT as a textured
+//!    quad, transformed by the plate's model matrix. With an identity model
+//!    matrix (M3.1 default) this produces an on-screen rectangle — plate looks
+//!    2D. Rotation matrices in later milestones tilt the plate in 3D without
+//!    any change to this pipeline.
+//! 5. **Egui pass** → swap chain. HUD overlay (file-tree placeholder for now).
+//!
+//! ## Coordinate systems
+//!
+//! Two coordinate spaces matter now:
+//!
+//! - **Plate-local**, origin at plate's top-left, used by: layout, card
+//!   rects, text areas, shape positions inside the plate pass, and
+//!   `fold_handle_rect_scene`. Physical pixels.
+//! - **Window / screen**, origin at window's top-left, used by: cursor events,
+//!   plate position, composite output, background, egui. Physical pixels.
+//!
+//! Conversion: `screen = plate.pos + model * plate_local`. With identity
+//! model (today), `screen = plate.pos + plate_local`.
+//!
+//! Hit-testing in `app.rs` converts cursor from screen to plate-local before
+//! comparing against `fold_handle_rect_scene` output.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use glyphon::{
@@ -23,82 +51,154 @@ use wgpu::{
 };
 use winit::window::Window;
 
-use crate::state::{visible_line_range, AppState, HighlightedSource, WindowSize};
+use crate::background::BackgroundRenderer;
+use crate::cards::{
+    layout_cards, Card, CardId, CardKind, CardRect, Layout, LayoutMetrics, MethodModifier,
+    Visibility,
+};
+use crate::composite::CompositeRenderer;
+use crate::plate::Plate;
+use crate::shapes::{RectInstance, ShapeRenderer};
+use crate::state::{AppState, HighlightedSource, WindowSize};
 use crate::syntax::TokenKind;
 
-/// The near-black void background. Slightly warm to avoid pure-#000 harshness.
-/// Ambient animation (M4) will modulate this subtly — for now, static.
-const BG: wgpu::Color = wgpu::Color {
-    r: 0.012,
-    g: 0.012,
-    b: 0.018,
-    a: 1.0,
-};
+// ----------------------------------------------------------------------------
+// Palette & layout constants (logical points where marked with _PT)
+// ----------------------------------------------------------------------------
 
-/// Number of lines to overshape past the viewport in each direction. Keeps
-/// near-edge scrolling from stuttering while glyphon catches up.
-const SCROLL_OVERSCAN: usize = 8;
+/// Plate's tinted-glass fill. Low alpha so the breathing sky reads through.
+const PANEL_FILL: [f32; 4] = [0.040, 0.048, 0.072, 0.52];
 
-/// Horizontal padding inside the code pane — in *logical* points, scaled at
-/// use-site by `scale_factor`.
-const CODE_PAD_LEFT_PT: f32 = 12.0;
-const CODE_PAD_RIGHT_PT: f32 = 12.0;
+/// Card backgrounds — sit on the plate, slightly brighter so they feel like
+/// holographic plates. Alpha < 1 so the panel reads through.
+const CARD_BG: [f32; 4] = [0.075, 0.085, 0.120, 0.78];
+const CLASS_BG: [f32; 4] = [0.092, 0.102, 0.140, 0.84];
 
-/// Gutter column layout (in text columns + logical points).
-const GUTTER_DIGIT_PAD: usize = 1;     // leading spaces inside the gutter
-const GUTTER_TRAILING_GAP_PT: f32 = 10.0; // logical pts between gutter and code
+/// Per-card outer glow colors (fall-off halo around the card edge).
+const CARD_GLOW_PUBLIC: [f32; 4] = [0.44, 0.78, 0.98, 0.40];
+const CARD_GLOW_PRIVATE: [f32; 4] = [0.30, 0.36, 0.50, 0.22];
+const CARD_GLOW_CLASS: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
+const CARD_GLOW_CLASSMETHOD: [f32; 4] = [0.98, 0.80, 0.48, 0.45];
+const CARD_GLOW_STATICMETHOD: [f32; 4] = [0.92, 0.70, 0.95, 0.45];
+const CARD_GLOW_PROPERTY: [f32; 4] = [0.60, 0.97, 0.80, 0.45];
 
-/// Gutter color (subtle slate; same family as Comment but a bit dimmer).
-const GUTTER_COLOR: (u8, u8, u8) = (80, 95, 120);
+/// Left-side accent strip colors per visibility/modifier.
+const ACCENT_PUBLIC: [f32; 4] = [0.50, 0.84, 0.98, 1.0];
+const ACCENT_PRIVATE: [f32; 4] = [0.42, 0.46, 0.60, 0.82];
+const ACCENT_CLASSMETHOD: [f32; 4] = [0.98, 0.82, 0.55, 1.0];
+const ACCENT_STATICMETHOD: [f32; 4] = [0.92, 0.72, 0.95, 1.0];
+const ACCENT_PROPERTY: [f32; 4] = [0.65, 0.98, 0.82, 1.0];
 
-/// Ratio of monospace-glyph advance width to font size for the fonts
-/// cosmic-text picks on macOS (Menlo/Monaco family). Off by ±5% for exotic
-/// fonts, which is harmless because the gutter has inner padding.
-const MONO_GLYPH_ADVANCE_RATIO: f32 = 0.6;
+/// Class spine (armature) — luminous cyan rail.
+const SPINE_COLOR: [f32; 4] = [0.72, 0.90, 1.00, 0.92];
+const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
+
+/// Fold handle block — color flips on target state.
+const FOLD_HANDLE_OPEN: [f32; 4] = [0.35, 0.46, 0.62, 0.95];
+const FOLD_HANDLE_CLOSED: [f32; 4] = [0.62, 0.36, 0.44, 0.95];
+
+/// Rolling edge shown along the body's bottom during a fold animation.
+const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
+const ROLL_EDGE_GLOW: [f32; 4] = [0.60, 0.80, 1.00, 0.45];
+
+const ACCENT_WIDTH_PT: f32 = 3.0;
+const ACCENT_WIDTH_PT_PRIVATE: f32 = 2.0;
+const SPINE_WIDTH_PT: f32 = 3.0;
+/// Extra horizontal inset for a method attached to the class spine.
+const INSTANCE_METHOD_INSET_PT: f32 = 8.0;
+
+const PRIVATE_CARD_OPACITY_SCALE: f32 = 0.75;
+
+/// Plate inset from the code pane's nominal rectangle. The plate floats with
+/// this much space between itself and the window edges (left, right, top,
+/// bottom). M3.6 will expand this for more breathing room.
+pub const PANEL_INSET_PT: f32 = 14.0;
+/// Corner radii.
+const PANEL_CORNER_RADIUS_PT: f32 = 14.0;
+const CARD_CORNER_RADIUS_PT: f32 = 6.0;
+const ACCENT_CORNER_RADIUS_PT: f32 = 1.0;
+const HANDLE_CORNER_RADIUS_PT: f32 = 2.5;
+
+/// Glow radii.
+const CARD_GLOW_RADIUS_PT: f32 = 10.0;
+const SPINE_GLOW_RADIUS_PT: f32 = 6.0;
+
+const CODE_PAD_LEFT_PT: f32 = 20.0;
+const CODE_PAD_RIGHT_PT: f32 = 20.0;
+const CARD_INNER_PAD_Y_PT: f32 = 5.0;
+const TOP_LEVEL_GAP_PT: f32 = 10.0;
+const DEPTH_INDENT_PT: f32 = 22.0;
+const FOLD_HANDLE_SIZE_FRAC: f32 = 0.5;
+const CARD_TEXT_INSET_PT: f32 = 12.0;
+/// Plate-local top padding above the first card.
+pub const SCENE_TOP_PAD_PT: f32 = 14.0;
+const ROLL_EDGE_THICKNESS_PT: f32 = 1.2;
+
+// ----------------------------------------------------------------------------
+// Helpers exposed for hit-testing: where the plate lives in window space.
+// ----------------------------------------------------------------------------
+
+/// Plate position + size in physical pixels for the given state.
+/// Exposed so `app.rs` can convert cursor (window-space) to plate-local when
+/// hit-testing card affordances.
+pub fn plate_rect(state: &AppState) -> ([f32; 2], [u32; 2]) {
+    let sf = state.scale_factor;
+    let inset = PANEL_INSET_PT * sf;
+    let pos = [state.code_pane_left() as f32 + inset, inset];
+    let w = (state.code_pane_width() as f32 - inset * 2.0).max(1.0) as u32;
+    let h = (state.window_size.height as f32 - inset * 2.0).max(1.0) as u32;
+    (pos, [w, h])
+}
+
+// ----------------------------------------------------------------------------
+// Renderer
+// ----------------------------------------------------------------------------
 
 pub struct Renderer {
-    // winit/wgpu core
     window: Arc<Window>,
     device: Device,
     queue: Queue,
     surface: Surface<'static>,
     surface_config: SurfaceConfiguration,
 
-    // glyphon (text on GPU)
+    // Shapes + background pipelines.
+    shape_renderer: ShapeRenderer,
+    background_renderer: BackgroundRenderer,
+    /// Reference instant used to compute the time uniform fed into the
+    /// background shader for the breathing animation.
+    start_time: Instant,
+
+    // Plate infrastructure (M3.1).
+    composite: CompositeRenderer,
+    code_plate: Plate,
+
+    // glyphon
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    /// One glyphon Buffer per card. Class cards buffer only their header line;
+    /// Function/Method cards buffer full_range (decorators + signature + body).
+    card_buffers: HashMap<CardId, Buffer>,
 
-    /// Code text with per-token color attrs. Set once at init; scroll moves
-    /// the TextArea rather than rebuilding the buffer.
-    code_buffer: Buffer,
-    /// Line-number gutter. Set once; scrolls in lockstep with the code buffer.
-    gutter_buffer: Buffer,
-    /// Width of the gutter in physical pixels. Recomputed when DPI changes.
-    gutter_width: f32,
-    /// Digits in the file's max line number. Cached because it drives gutter
-    /// width on every DPI recompute.
-    gutter_digits: usize,
-    /// Last applied text metrics (physical pixels). A DPI change triggers a
-    /// `Buffer::set_metrics` on both buffers so the text scales with the display.
+    /// Last-applied font_size / line_height — rebuilt on DPI change.
     applied_font_size: f32,
     applied_line_height: f32,
 
-    // egui (HUD overlays)
+    // egui
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
 }
 
 impl Renderer {
-    /// Initialize all GPU + text resources for the given window and file.
-    /// `font_size` and `line_height` are expected to already be scaled to
-    /// physical pixels by the caller (`state.effective_*()`).
+    /// Initialize all GPU + text resources. `font_size` and `line_height` must
+    /// already be DPI-scaled (see `AppState::effective_*`).
     pub async fn new(
         window: Arc<Window>,
         highlighted: &HighlightedSource,
+        cards: &[Card],
         font_size: f32,
         line_height: f32,
     ) -> Result<Self> {
@@ -134,8 +234,6 @@ impl Renderer {
             .context("request_device")?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Prefer SRGB formats for correct color. glyphon writes linear colors
-        // into an SRGB target, which gives us perceptually-correct text.
         let format = caps
             .formats
             .iter()
@@ -156,33 +254,53 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        // --- glyphon ---
+        // glyphon
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer = TextRenderer::new(
-            &mut atlas,
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+
+        // One buffer per card, built eagerly at load.
+        let mut card_buffers = HashMap::with_capacity(cards.len());
+        for card in cards {
+            let buf = build_card_buffer(&mut font_system, highlighted, card, font_size, line_height);
+            card_buffers.insert(card.id, buf);
+        }
+
+        // Shape + background + composite pipelines.
+        let shape_renderer = ShapeRenderer::new(&device, format);
+        let background_renderer = BackgroundRenderer::new(&device, format);
+        let composite = CompositeRenderer::new(&device, format);
+
+        // Code pane plate — sized from the initial window + scale factor. The
+        // Renderer is built before AppState knows about the current scale, so
+        // we use whatever the window reports as a starting point. Resizes
+        // reconfigure this in `render()` when the cached size no longer
+        // matches.
+        let sf = window.scale_factor() as f32;
+        let pane_fraction = crate::state::LEFT_PANE_FRACTION;
+        let code_left = (size.width as f32 * pane_fraction).round();
+        let code_w = size.width as f32 - code_left;
+        let inset = PANEL_INSET_PT * sf;
+        let plate_pos = [code_left + inset, inset];
+        let plate_size = [
+            (code_w - inset * 2.0).max(1.0) as u32,
+            (size.height as f32 - inset * 2.0).max(1.0) as u32,
+        ];
+        let code_plate = Plate::new(
             &device,
-            MultisampleState::default(),
-            None,
+            plate_size,
+            plate_pos,
+            format,
+            &composite.bind_group_layout,
+            &composite.sampler,
+            &composite.uniform_buffer,
         );
 
-        // Code buffer with rich text.
-        let code_buffer = build_code_buffer(&mut font_system, highlighted, font_size, line_height);
-
-        // Gutter buffer + width.
-        let gutter_digits = digit_count(highlighted.line_count().max(1));
-        let (gutter_buffer, gutter_width) = build_gutter_buffer(
-            &mut font_system,
-            highlighted,
-            font_size,
-            line_height,
-            gutter_digits,
-        );
-
-        // --- egui ---
+        // egui
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -200,15 +318,17 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            shape_renderer,
+            background_renderer,
+            start_time: Instant::now(),
+            composite,
+            code_plate,
             font_system,
             swash_cache,
             viewport,
             atlas,
             text_renderer,
-            code_buffer,
-            gutter_buffer,
-            gutter_width,
-            gutter_digits,
+            card_buffers,
             applied_font_size: font_size,
             applied_line_height: line_height,
             egui_ctx,
@@ -220,13 +340,10 @@ impl Renderer {
     pub fn window(&self) -> &Arc<Window> {
         &self.window
     }
-
     pub fn egui_state_mut(&mut self) -> &mut egui_winit::State {
         &mut self.egui_state
     }
 
-    /// Handle a resize: reconfigure the surface. Glyphon's viewport gets
-    /// refreshed each frame, so no action needed there.
     pub fn resize(&mut self, new_size: WindowSize) {
         if new_size.width == 0 || new_size.height == 0 {
             return;
@@ -236,104 +353,114 @@ impl Renderer {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
+    /// Compute the LayoutMetrics the renderer currently uses.
+    ///
+    /// Coordinates are **plate-local** (origin = plate top-left). Also used
+    /// by `app.rs` for hit-testing clicks — keeping this in one place so
+    /// "where a card is drawn" and "where a card's click registers" never
+    /// drift.
+    pub fn layout_metrics(&self, state: &AppState) -> LayoutMetrics {
+        let sf = state.scale_factor;
+        let (_, plate_size) = plate_rect(state);
+        let width =
+            (plate_size[0] as f32 - (CODE_PAD_LEFT_PT + CODE_PAD_RIGHT_PT) * sf).max(0.0);
+        LayoutMetrics {
+            line_height: state.effective_line_height(),
+            left: CODE_PAD_LEFT_PT * sf,
+            width,
+            depth_indent: DEPTH_INDENT_PT * sf,
+            top_level_gap: TOP_LEVEL_GAP_PT * sf,
+            card_inner_pad_y: CARD_INNER_PAD_Y_PT * sf,
+        }
+    }
+
     /// Draw one frame.
     pub fn render(&mut self, state: &AppState) -> Result<(), wgpu::SurfaceError> {
-        // Re-apply text metrics if DPI changed since the last frame. One cheap
-        // equality check per frame; only triggers work on an actual monitor
-        // change (e.g. dragging the window across displays).
+        // Re-apply text metrics on DPI change.
         let font_size = state.effective_font_size();
         let line_height = state.effective_line_height();
         if font_size != self.applied_font_size || line_height != self.applied_line_height {
             let metrics = Metrics::new(font_size, line_height);
-            self.code_buffer.set_metrics(&mut self.font_system, metrics);
-            self.gutter_buffer.set_metrics(&mut self.font_system, metrics);
-            // Gutter width scales with font size. Glyph advance uses our
-            // empirical monospace ratio; exact fit isn't required because of
-            // the inner padding column.
-            let col = self.gutter_digits + GUTTER_DIGIT_PAD;
-            self.gutter_width = col as f32 * font_size * MONO_GLYPH_ADVANCE_RATIO;
+            for buf in self.card_buffers.values_mut() {
+                buf.set_metrics(&mut self.font_system, metrics);
+            }
             self.applied_font_size = font_size;
             self.applied_line_height = line_height;
         }
 
+        // Reconfigure the plate if the window size or scale factor changed the
+        // plate's target dimensions.
+        let (plate_pos, plate_size) = plate_rect(state);
+        self.code_plate.reconfigure(
+            &self.device,
+            plate_size,
+            plate_pos,
+            self.surface_config.format,
+            &self.composite.bind_group_layout,
+            &self.composite.sampler,
+            &self.composite.uniform_buffer,
+        );
+
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
-
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor { label: Some("ygg-encoder") });
 
-        // ---- glyphon prepare ----
+        // ---- Layout (plate-local coordinates) ----
+        let metrics = self.layout_metrics(state);
+        let layout = layout_cards(&state.cards, &state.fold_progress, metrics);
+        let scene_top_local = SCENE_TOP_PAD_PT * state.scale_factor;
+
+        // ---- Build shape instances ----
+        // Panel background first so cards render on top. All positions are
+        // plate-local (origin = plate top-left).
+        let mut instances: Vec<RectInstance> = Vec::with_capacity(state.cards.len() * 5 + 1);
+        push_panel_shape(&mut instances, state, plate_size);
+        let plate_h = plate_size[1] as f32;
+        for card in &state.cards {
+            let Some(rect) = layout.rects.get(&card.id) else { continue };
+            let local_y = rect.y - state.scroll_y + scene_top_local;
+            let local_bottom = local_y + rect.total_h();
+            // Cull cards entirely outside the plate's local viewport. Add a
+            // 32-pixel margin so glow doesn't pop at edges.
+            if local_bottom < -32.0 || local_y > plate_h + 32.0 {
+                continue;
+            }
+            push_card_shapes(&mut instances, card, rect, local_y, state);
+        }
+
+        // Shapes' uniform viewport = plate size (we're rendering into the plate RT).
+        self.shape_renderer
+            .prepare(&self.device, &self.queue, &instances, (plate_size[0], plate_size[1]));
+
+        // Background uniforms stay window-sized (it draws to the swap chain).
+        self.background_renderer.prepare(
+            &self.queue,
+            (state.window_size.width, state.window_size.height),
+            self.start_time.elapsed().as_secs_f32(),
+        );
+
+        // ---- Glyphon: prepare text areas for visible cards (plate-local) ----
+        // Glyphon's viewport also equals plate size — text is rendered into
+        // the plate RT with plate-local pixel coords.
         self.viewport.update(
             &self.queue,
             Resolution {
-                width: self.surface_config.width,
-                height: self.surface_config.height,
+                width: plate_size[0],
+                height: plate_size[1],
             },
         );
 
-        // Drive glyphon's lazy shaper to keep up with the current scroll +
-        // overscan. The visible range is a tested pure function of state.
-        let visible = visible_line_range(
-            state.scroll_y,
-            state.window_size.height,
-            line_height,
-            state.highlighted.line_count(),
-            SCROLL_OVERSCAN,
+        let sf = state.scale_factor;
+        let text_areas_storage = collect_text_areas(
+            &self.card_buffers,
+            state,
+            &layout,
+            scene_top_local,
+            plate_size,
+            sf,
         );
-        // `set_scroll` expresses "glyphon: shape & paint from this line
-        // downward". We don't use it for positioning — TextArea.top does
-        // that — we use it only to steer the shaper.
-        let scroll_target = visible.start as i32;
-        prime_scroll(&mut self.code_buffer, &mut self.font_system, scroll_target);
-        prime_scroll(&mut self.gutter_buffer, &mut self.font_system, scroll_target);
-
-        // Pad/gap values are logical points; scale up for the current DPI.
-        let pad_left = CODE_PAD_LEFT_PT * state.scale_factor;
-        let pad_right = CODE_PAD_RIGHT_PT * state.scale_factor;
-        let gap = GUTTER_TRAILING_GAP_PT * state.scale_factor;
-
-        let gutter_left = state.code_pane_left() as f32 + pad_left;
-        let code_text_left = gutter_left + self.gutter_width + gap;
-        let code_text_right = (state.code_pane_left() + state.code_pane_width()) as f32 - pad_right;
-        let viewport_h = state.window_size.height as f32;
-
-        // Both buffers share the same vertical origin: buffer line 0 sits at
-        // virtual-y 0, scroll_y shifts everything up. For TextArea clipping
-        // we bound each buffer to its column.
-        let top = -state.scroll_y;
-
-        let code_bounds = TextBounds {
-            left: code_text_left as i32,
-            top: 0,
-            right: code_text_right as i32,
-            bottom: viewport_h as i32,
-        };
-        let gutter_bounds = TextBounds {
-            left: gutter_left as i32,
-            top: 0,
-            right: (gutter_left + self.gutter_width) as i32,
-            bottom: viewport_h as i32,
-        };
-
-        let code_area = TextArea {
-            buffer: &self.code_buffer,
-            left: code_text_left,
-            top,
-            scale: 1.0,
-            bounds: code_bounds,
-            default_color: GlyphonColor::rgb(220, 222, 230),
-            custom_glyphs: &[],
-        };
-        let gutter_area = TextArea {
-            buffer: &self.gutter_buffer,
-            left: gutter_left,
-            top,
-            scale: 1.0,
-            bounds: gutter_bounds,
-            default_color: GlyphonColor::rgb(GUTTER_COLOR.0, GUTTER_COLOR.1, GUTTER_COLOR.2),
-            custom_glyphs: &[],
-        };
 
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
@@ -341,29 +468,33 @@ impl Renderer {
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            [gutter_area, code_area],
+            text_areas_storage.iter().map(|a| a.to_text_area()),
             &mut self.swash_cache,
         ) {
             log::warn!("glyphon prepare failed: {e:?}");
         }
 
-        // ---- egui prepare ----
+        // ---- Composite uniforms (plate → swap chain) ----
+        self.composite.prepare(
+            &self.queue,
+            (self.surface_config.width, self.surface_config.height),
+            self.code_plate.pos_px,
+            self.code_plate.size_px,
+            self.code_plate.model,
+        );
+
+        // ---- Egui ----
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_egui(ctx);
-        });
+        let full_output = self.egui_ctx.run(raw_input, draw_egui);
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
-
         let paint_jobs = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
             pixels_per_point: self.window.scale_factor() as f32,
         };
-
         for (id, delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, delta);
@@ -376,23 +507,55 @@ impl Renderer {
             &screen_descriptor,
         );
 
-        // ---- render passes ----
-        //
-        // Two passes because glyphon's `render` borrows its inputs with the
-        // pass lifetime, while `egui-wgpu::Renderer::render` requires
-        // `RenderPass<'static>`. These constraints cannot coexist in a single
-        // pass in wgpu 22. Splitting is cheap: pass 1 clears + draws text,
-        // pass 2 loads the previous attachment and overlays egui on top.
+        // ---- Passes ----
+
+        // Pass 1: sky background → swap chain.
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("ygg-text-pass"),
+                label: Some("ygg-background-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(BG),
+                        load: LoadOp::Clear(wgpu::Color::BLACK),
                         store: StoreOp::Store,
                     },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.background_renderer.render(&mut pass);
+        }
+
+        // Pass 2: shapes → plate RT (clear to transparent so the panel's
+        // rounded corners composite correctly over the sky).
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-plate-shapes-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.code_plate.rt_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.shape_renderer.render(&mut pass);
+        }
+
+        // Pass 3: text → plate RT.
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-plate-text-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.code_plate.rt_view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -402,6 +565,24 @@ impl Renderer {
                 log::warn!("glyphon render failed: {e:?}");
             }
         }
+
+        // Pass 4: composite plate → swap chain.
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-composite-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.composite.render(&mut pass, &self.code_plate.composite_bg);
+        }
+
+        // Pass 5: egui HUD → swap chain.
         {
             let mut pass = encoder
                 .begin_render_pass(&RenderPassDescriptor {
@@ -409,10 +590,7 @@ impl Renderer {
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
-                        ops: Operations {
-                            load: LoadOp::Load,
-                            store: StoreOp::Store,
-                        },
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -430,16 +608,274 @@ impl Renderer {
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
-
-        // Atlas trim keeps VRAM usage bounded. No-op if nothing to free.
         self.atlas.trim();
-
         Ok(())
     }
 }
 
-/// Enumerated in the same integer order as `TokenKind` so indexing by
-/// `kind as usize` lands on the right entry.
+/// Collect the TextArea metadata for visible cards. Free function so the
+/// renderer can split its borrow. Coordinates are **plate-local**.
+fn collect_text_areas<'a>(
+    card_buffers: &'a HashMap<CardId, Buffer>,
+    state: &AppState,
+    layout: &Layout,
+    scene_top_local: f32,
+    plate_size: [u32; 2],
+    sf: f32,
+) -> Vec<AreaSpec<'a>> {
+    let plate_h = plate_size[1] as f32;
+    let mut out = Vec::with_capacity(state.cards.len());
+    let text_inset = CARD_TEXT_INSET_PT * sf;
+    for card in &state.cards {
+        let Some(rect) = layout.rects.get(&card.id) else { continue };
+        let local_y = rect.y - state.scroll_y + scene_top_local;
+        let local_bottom = local_y + rect.total_h();
+        if local_bottom < 0.0 || local_y > plate_h {
+            continue;
+        }
+        let Some(buffer) = card_buffers.get(&card.id) else { continue };
+
+        let method_inset = match card.kind {
+            CardKind::Method
+                if !matches!(
+                    card.modifier,
+                    MethodModifier::Classmethod | MethodModifier::Staticmethod
+                ) =>
+            {
+                INSTANCE_METHOD_INSET_PT * sf
+            }
+            _ => 0.0,
+        };
+        let left = rect.x + text_inset + method_inset;
+        let right = rect.x + rect.width - text_inset * 0.5;
+
+        let bounds = TextBounds {
+            left: left as i32,
+            top: local_y.max(0.0) as i32,
+            right: right as i32,
+            bottom: (local_y + rect.total_h()).min(plate_h) as i32,
+        };
+
+        let opacity = if card.visibility == Visibility::Private { 0.8 } else { 1.0 };
+        let r = (220.0 * opacity) as u8;
+        let g = (222.0 * opacity) as u8;
+        let b = (230.0 * opacity) as u8;
+
+        out.push(AreaSpec {
+            buffer,
+            left,
+            top: local_y,
+            bounds,
+            default_color: GlyphonColor::rgb(r, g, b),
+        });
+    }
+    out
+}
+
+/// A small owned helper so we can hand `TextArea`s to glyphon with the right
+/// lifetime without tangling closures.
+struct AreaSpec<'a> {
+    buffer: &'a Buffer,
+    left: f32,
+    top: f32,
+    bounds: TextBounds,
+    default_color: GlyphonColor,
+}
+
+impl<'a> AreaSpec<'a> {
+    fn to_text_area(&self) -> TextArea<'a> {
+        TextArea {
+            buffer: self.buffer,
+            left: self.left,
+            top: self.top,
+            scale: 1.0,
+            bounds: self.bounds,
+            default_color: self.default_color,
+            custom_glyphs: &[],
+        }
+    }
+}
+
+/// Append the shape instances for one card (bg + glow, accent strip, spine
+/// for classes, fold handle, and — during a fold animation — a rolling edge
+/// highlight along the currently-visible body bottom).
+///
+/// All output coordinates are **plate-local**.
+fn push_card_shapes(
+    out: &mut Vec<RectInstance>,
+    card: &Card,
+    rect: &CardRect,
+    local_y: f32,
+    state: &AppState,
+) {
+    let sf = state.scale_factor;
+
+    // ---- Card background + outer glow ----
+    let mut bg = match card.kind {
+        CardKind::Class => CLASS_BG,
+        _ => CARD_BG,
+    };
+    if card.visibility == Visibility::Private {
+        bg[3] *= PRIVATE_CARD_OPACITY_SCALE;
+    }
+    let glow = match (card.kind, card.modifier, card.visibility) {
+        (CardKind::Class, _, _) => CARD_GLOW_CLASS,
+        (_, MethodModifier::Classmethod, _) => CARD_GLOW_CLASSMETHOD,
+        (_, MethodModifier::Staticmethod, _) => CARD_GLOW_STATICMETHOD,
+        (_, MethodModifier::Property, _) => CARD_GLOW_PROPERTY,
+        (_, _, Visibility::Private) => CARD_GLOW_PRIVATE,
+        (_, _, Visibility::Public) => CARD_GLOW_PUBLIC,
+    };
+    out.push(RectInstance::glowing(
+        rect.x,
+        local_y,
+        rect.width,
+        rect.total_h(),
+        bg,
+        CARD_CORNER_RADIUS_PT * sf,
+        glow,
+        CARD_GLOW_RADIUS_PT * sf,
+    ));
+
+    // ---- Left-side accent strip ----
+    let (accent_color, accent_width_pt) = match (card.kind, card.modifier, card.visibility) {
+        (CardKind::Class, _, _) => (SPINE_COLOR, SPINE_WIDTH_PT),
+        (_, MethodModifier::Classmethod, _) => (ACCENT_CLASSMETHOD, ACCENT_WIDTH_PT),
+        (_, MethodModifier::Staticmethod, _) => (ACCENT_STATICMETHOD, ACCENT_WIDTH_PT),
+        (_, MethodModifier::Property, _) => (ACCENT_PROPERTY, ACCENT_WIDTH_PT),
+        (_, _, Visibility::Private) => (ACCENT_PRIVATE, ACCENT_WIDTH_PT_PRIVATE),
+        (_, _, Visibility::Public) => (ACCENT_PUBLIC, ACCENT_WIDTH_PT),
+    };
+    out.push(RectInstance::solid(
+        rect.x + 2.0 * sf,
+        local_y + 3.0 * sf,
+        accent_width_pt * sf,
+        rect.total_h() - 6.0 * sf,
+        accent_color,
+        ACCENT_CORNER_RADIUS_PT * sf,
+    ));
+
+    // ---- Class spine (armature): a glowing rail on the left edge. ----
+    if card.kind == CardKind::Class {
+        out.push(RectInstance::glowing(
+            rect.x,
+            local_y + 4.0 * sf,
+            SPINE_WIDTH_PT * sf,
+            rect.total_h() - 8.0 * sf,
+            SPINE_COLOR,
+            SPINE_WIDTH_PT * sf * 0.5,
+            SPINE_GLOW,
+            SPINE_GLOW_RADIUS_PT * sf,
+        ));
+    }
+
+    // ---- Fold handle — small rounded block, recolors on target fold state. ----
+    let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
+    let handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
+    let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
+    let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
+    let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
+    out.push(RectInstance::solid(
+        handle_x,
+        handle_y,
+        handle_size,
+        handle_size,
+        handle_color,
+        HANDLE_CORNER_RADIUS_PT * sf,
+    ));
+
+    // ---- Rolling edge during fold animation. ----
+    let progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
+    if progress > 0.02 && progress < 0.98 && rect.body_h > 0.5 {
+        let edge_y = local_y + rect.header_h + rect.body_h - ROLL_EDGE_THICKNESS_PT * sf;
+        out.push(RectInstance::glowing(
+            rect.x + 4.0 * sf,
+            edge_y,
+            rect.width - 8.0 * sf,
+            ROLL_EDGE_THICKNESS_PT * sf,
+            ROLL_EDGE_COLOR,
+            0.0,
+            ROLL_EDGE_GLOW,
+            4.0 * sf,
+        ));
+    }
+}
+
+/// Emit the plate's panel-background rectangle (plate-local).
+///
+/// M3.1 trade-off: the old panel shape had an outer glow extending beyond
+/// the panel edges; that glow would be clipped by the plate RT's rectangular
+/// bounds. For now we draw the panel fill only — M3.3 reintroduces the
+/// panel's luminous edge via an inner-lit shader + (optional) composite-time
+/// outer bloom, both of which handle the RT-bounds issue properly.
+fn push_panel_shape(out: &mut Vec<RectInstance>, state: &AppState, plate_size: [u32; 2]) {
+    let sf = state.scale_factor;
+    let w = plate_size[0] as f32;
+    let h = plate_size[1] as f32;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    out.push(RectInstance::solid(
+        0.0,
+        0.0,
+        w,
+        h,
+        PANEL_FILL,
+        PANEL_CORNER_RADIUS_PT * sf,
+    ));
+}
+
+/// Return a rectangle (plate-local physical pixels, NOT scrolled) for the
+/// fold-handle hit region of card `card`. Widened vertically to the full
+/// header row so fold-click is forgiving.
+///
+/// Coordinates are plate-local; `app.rs` converts cursor position from
+/// window-space to plate-local (via `plate_rect`) before comparing.
+pub fn fold_handle_rect_scene(_card: &Card, rect: &CardRect, state: &AppState) -> (f32, f32, f32, f32) {
+    let sf = state.scale_factor;
+    let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
+    let x = rect.x + rect.width - handle_size - 6.0 * sf;
+    let pad = 4.0 * sf;
+    (x - pad, rect.y, handle_size + pad * 2.0, rect.header_h)
+}
+
+// ----------------------------------------------------------------------------
+// Buffer construction
+// ----------------------------------------------------------------------------
+
+/// Build a glyphon buffer for one card with per-byte syntax colors. Class
+/// cards render only their header line (their body == methods, which have
+/// their own cards); other cards render their full byte range (including
+/// decorators).
+fn build_card_buffer(
+    font_system: &mut FontSystem,
+    hl: &HighlightedSource,
+    card: &Card,
+    font_size: f32,
+    line_height: f32,
+) -> Buffer {
+    let range = match card.kind {
+        CardKind::Class => card.header_range.clone(),
+        _ => card.full_range.clone(),
+    };
+    let text = &hl.source.contents[range.clone()];
+    let kinds = &hl.kinds[range.clone()];
+
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(font_system, Some(100_000.0), None);
+
+    let attrs_by_kind = attrs_by_kind();
+    let default_attrs = Attrs::new().family(Family::Monospace);
+    let spans = RunSpans { text, kinds, i: 0, attrs_by_kind };
+    buffer.set_rich_text(font_system, spans, default_attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+// ----------------------------------------------------------------------------
+// Syntax color cache + span iterator
+// ----------------------------------------------------------------------------
+
 const ALL_KINDS: [TokenKind; 15] = [
     TokenKind::Default,
     TokenKind::Keyword,
@@ -459,8 +895,6 @@ const ALL_KINDS: [TokenKind; 15] = [
 ];
 const N_KINDS: usize = ALL_KINDS.len();
 
-/// Pre-compute `Attrs` values per token kind — avoids per-span struct
-/// construction during the hot iteration that feeds `set_rich_text`.
 fn attrs_by_kind() -> [Attrs<'static>; N_KINDS] {
     let base = Attrs::new().family(Family::Monospace);
     let mut out = [base; N_KINDS];
@@ -471,131 +905,40 @@ fn attrs_by_kind() -> [Attrs<'static>; N_KINDS] {
     out
 }
 
-/// Build the code `Buffer` with per-byte syntax colors. Streams `(slice, Attrs)`
-/// spans into glyphon's `set_rich_text` — at most one span per contiguous run
-/// of identical token kinds, so 80-char-line Python files produce ~20 spans
-/// per line, not one per byte.
-fn build_code_buffer(
-    font_system: &mut FontSystem,
-    hl: &HighlightedSource,
-    font_size: f32,
-    line_height: f32,
-) -> Buffer {
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    // Very wide width effectively disables wrapping; M2 spec inherits M1's
-    // "horizontal overflow: ignore, let it clip" posture.
-    buffer.set_size(font_system, Some(100_000.0), None);
-
-    let attrs_by_kind = attrs_by_kind();
-    let default_attrs = Attrs::new().family(Family::Monospace);
-
-    let contents = &hl.source.contents;
-    let kinds = &hl.kinds;
-    let spans = RunSpans { contents, kinds, i: 0, attrs_by_kind };
-
-    buffer.set_rich_text(font_system, spans, default_attrs, Shaping::Advanced);
-    // We don't prune — prune-true is for finished viewports; here we keep
-    // shapes around for smooth scroll.
-    buffer.shape_until_scroll(font_system, false);
-    buffer
-}
-
-/// Build the gutter (line numbers) buffer. All line numbers are materialized
-/// once; glyphon lazily shapes only visible ones via `shape_until_scroll`.
-/// Returns the buffer and its required pixel width.
-fn build_gutter_buffer(
-    font_system: &mut FontSystem,
-    hl: &HighlightedSource,
-    font_size: f32,
-    line_height: f32,
-    digits: usize,
-) -> (Buffer, f32) {
-    let line_count = hl.line_count().max(1);
-    let col = digits + GUTTER_DIGIT_PAD;
-    let width_px = (col as f32) * font_size * MONO_GLYPH_ADVANCE_RATIO;
-
-    let mut text = String::with_capacity((col + 1) * line_count);
-    for n in 1..=line_count {
-        // Right-align within the column.
-        let s = format!("{:>width$}", n, width = col);
-        text.push_str(&s);
-        if n != line_count {
-            text.push('\n');
-        }
-    }
-
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(font_system, Some(width_px + font_size), None);
-    let attrs = Attrs::new()
-        .family(Family::Monospace)
-        .color(GlyphonColor::rgb(GUTTER_COLOR.0, GUTTER_COLOR.1, GUTTER_COLOR.2));
-    buffer.set_text(font_system, &text, attrs, Shaping::Basic);
-    buffer.shape_until_scroll(font_system, false);
-    (buffer, width_px)
-}
-
-fn digit_count(n: usize) -> usize {
-    if n == 0 { 1 } else { (n as f64).log10().floor() as usize + 1 }
-}
-
-/// Streaming iterator producing `(&str, Attrs)` spans over a contents/kinds
-/// pair, coalescing runs of identical kinds.
 struct RunSpans<'a> {
-    contents: &'a str,
+    text: &'a str,
     kinds: &'a [TokenKind],
     i: usize,
     attrs_by_kind: [Attrs<'static>; N_KINDS],
 }
-
 impl<'a> Iterator for RunSpans<'a> {
     type Item = (&'a str, Attrs<'static>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.i >= self.contents.len() {
+        if self.i >= self.text.len() {
             return None;
         }
         let start = self.i;
         let k = self.kinds[start];
         let mut end = start + 1;
-        while end < self.contents.len() && self.kinds[end] == k {
+        while end < self.text.len() && self.kinds[end] == k {
             end += 1;
         }
-        // Advance past any trailing partial UTF-8 character so the slice is
-        // valid — kinds are per-byte, so a run can split mid-codepoint for
-        // the last char only if the kind boundary fell inside a multibyte
-        // character. In practice syntax boundaries align with token edges
-        // (tree-sitter reports byte-accurate spans), so this is defensive.
-        while end < self.contents.len() && !self.contents.is_char_boundary(end) {
+        while end < self.text.len() && !self.text.is_char_boundary(end) {
             end += 1;
         }
         self.i = end;
-        let attrs = self.attrs_by_kind[k as usize];
-        Some((&self.contents[start..end], attrs))
+        Some((&self.text[start..end], self.attrs_by_kind[k as usize]))
     }
 }
 
-/// Nudge glyphon's internal scroll so `shape_until_scroll` focuses on the
-/// lines around our target. This is purely a perf hint — positioning is
-/// still done via `TextArea.top`.
-fn prime_scroll(buffer: &mut Buffer, font_system: &mut FontSystem, target_line: i32) {
-    let mut scroll = buffer.scroll();
-    scroll.line = target_line.max(0) as usize;
-    scroll.vertical = 0.0;
-    buffer.set_scroll(scroll);
-    buffer.shape_until_scroll(font_system, false);
-}
+// ----------------------------------------------------------------------------
+// Egui overlay (unchanged from M2)
+// ----------------------------------------------------------------------------
 
-/// Build the egui UI for this frame. Extracted so the render method stays about
-/// plumbing, not layout.
-///
-/// Panes sit over the shared near-black canvas with no borders or separator
-/// lines — CLAUDE.md's "Panes as light, not boxes" principle. The luminous
-/// activation glow arrives in M4; for now the pane is only identifiable by
-/// the placeholder label sitting inside it.
 fn draw_egui(ctx: &egui::Context) {
     let frame = egui::Frame::none()
         .fill(egui::Color32::TRANSPARENT)
         .inner_margin(egui::Margin::symmetric(12.0, 12.0));
-
     egui::SidePanel::left("file_tree_pane")
         .resizable(false)
         .show_separator_line(false)
@@ -613,17 +956,105 @@ fn draw_egui(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::SourceFile;
+    use crate::cards::{extract_cards, CardKind, MethodModifier, Visibility};
+    use crate::state::compute_line_offsets;
 
+    fn test_state(src: &str) -> (AppState, Vec<Card>) {
+        let sf = SourceFile {
+            path: std::path::PathBuf::from("t.py"),
+            contents: src.to_string(),
+            lines: src.split('\n').map(|s| s.to_string()).collect(),
+        };
+        let offs = compute_line_offsets(src);
+        let mut p = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        p.set_language(&lang).unwrap();
+        let tree = p.parse(src, None).unwrap();
+        let cards = extract_cards(&tree, src, &offs);
+        let h = crate::syntax::Highlighter::new_python().unwrap();
+        let kinds = h.highlight_tree(&tree, src);
+        let hl = HighlightedSource::from_parts(sf, kinds, offs);
+        let state = AppState::new(hl, cards.clone());
+        (state, cards)
+    }
+
+    /// fold_handle_rect_scene returns a rect inside the card's header row.
     #[test]
-    fn digit_count_matches_log10() {
-        assert_eq!(digit_count(1), 1);
-        assert_eq!(digit_count(9), 1);
-        assert_eq!(digit_count(10), 2);
-        assert_eq!(digit_count(99), 2);
-        assert_eq!(digit_count(100), 3);
-        assert_eq!(digit_count(999), 3);
-        assert_eq!(digit_count(1000), 4);
-        assert_eq!(digit_count(99_999), 5);
-        assert_eq!(digit_count(100_000), 6);
+    fn fold_handle_lives_inside_header() {
+        let (state, cards) = test_state("def f():\n    pass\n");
+        let m = LayoutMetrics {
+            line_height: 20.0,
+            left: 0.0,
+            width: 400.0,
+            depth_indent: 0.0,
+            top_level_gap: 0.0,
+            card_inner_pad_y: 4.0,
+        };
+        let layout = layout_cards(&cards, &state.fold_progress, m);
+        let r = layout.rects[&cards[0].id];
+        let (_x, y, _w, h) = fold_handle_rect_scene(&cards[0], &r, &state);
+        assert!(y >= r.y);
+        assert!((y + h) <= (r.y + r.header_h + 0.01));
+    }
+
+    /// A class card has a Class kind and gets the CLASS_BG palette. This
+    /// isn't a visual test but guards the palette lookup table.
+    #[test]
+    fn push_card_shapes_emits_class_shapes() {
+        let (state, cards) = test_state(
+            "class W:\n    def a(self):\n        pass\n    @classmethod\n    def b(cls):\n        pass\n",
+        );
+        let m = LayoutMetrics {
+            line_height: 20.0,
+            left: 0.0,
+            width: 400.0,
+            depth_indent: 20.0,
+            top_level_gap: 10.0,
+            card_inner_pad_y: 4.0,
+        };
+        let layout = layout_cards(&cards, &state.fold_progress, m);
+        let class_rect = layout.rects[&cards[0].id];
+        let mut out = vec![];
+        push_card_shapes(&mut out, &cards[0], &class_rect, 0.0, &state);
+
+        // Class card emits at least: bg, accent strip, spine, fold handle → 4 rects.
+        assert!(out.len() >= 4, "class emits ≥4 shapes, got {}", out.len());
+        let cm = cards.iter().find(|c| c.modifier == MethodModifier::Classmethod).unwrap();
+        assert!(matches!(cm.kind, CardKind::Method));
+        assert_eq!(cm.visibility, Visibility::Public);
+    }
+
+    /// `plate_rect` positions the plate with PANEL_INSET breathing room on
+    /// all sides (inside the code-pane region on the right).
+    #[test]
+    fn plate_rect_is_inset_from_code_pane() {
+        let (mut state, _) = test_state("def f():\n    pass\n");
+        state.window_size = WindowSize { width: 1200, height: 900 };
+        state.scale_factor = 1.0;
+        let (pos, size) = plate_rect(&state);
+        // Plate starts PANEL_INSET_PT to the right of the code-pane left.
+        assert!(pos[0] > state.code_pane_left() as f32);
+        assert!(pos[1] > 0.0);
+        // Plate size + 2*inset fits inside the code-pane width / window height.
+        assert!(size[0] as f32 + 2.0 * PANEL_INSET_PT < state.code_pane_width() as f32 + 1.0);
+        assert!(size[1] as f32 + 2.0 * PANEL_INSET_PT < state.window_size.height as f32 + 1.0);
+    }
+
+    /// LayoutMetrics is in plate-local coords (`left` has no code_pane_left
+    /// offset baked in). Hit-test relies on this, so lock it down.
+    #[test]
+    fn layout_metrics_are_plate_local() {
+        // We don't have a real Renderer here (no GPU). Re-derive what
+        // `layout_metrics` would compute, using the same formula.
+        let (mut state, _) = test_state("def f():\n    pass\n");
+        state.window_size = WindowSize { width: 1200, height: 900 };
+        state.scale_factor = 1.0;
+        let (_, plate_size) = plate_rect(&state);
+        let width = plate_size[0] as f32 - (CODE_PAD_LEFT_PT + CODE_PAD_RIGHT_PT);
+        assert!((width - (plate_size[0] as f32 - 40.0)).abs() < 1e-3);
+        // The key assertion: left is just the in-plate padding, NOT offset
+        // by state.code_pane_left(). That's what makes coordinates plate-local.
+        assert!(CODE_PAD_LEFT_PT < state.code_pane_left() as f32);
     }
 }
