@@ -76,6 +76,11 @@ pub struct Card {
     pub header_lines: Range<usize>,
     /// Line range of the body. None iff body_range is None.
     pub body_lines: Option<Range<usize>>,
+    /// Line range of the full definition including preceding decorators. For
+    /// a non-decorated function this equals (header_lines.start..body_lines.end).
+    /// For a decorated function, `full_lines.start` is the line of the `@`.
+    /// Used by layout to size leaf cards against the actually-rendered text.
+    pub full_lines: Range<usize>,
 }
 
 /// Walk a parse tree and extract Cards in source order.
@@ -170,6 +175,7 @@ fn process_statement(
 
     // Full range = decorators (if any) through body end.
     let full_range = full_start..def_node.end_byte();
+    let full_lines = byte_range_to_line_range(&full_range, line_offsets);
 
     // Classify @classmethod/@staticmethod/@property if we're a decorated_definition.
     let modifier = if kind == CardKind::Method {
@@ -193,6 +199,7 @@ fn process_statement(
         full_range,
         header_lines,
         body_lines,
+        full_lines,
     });
 
     // Recurse into class bodies for methods + nested classes.
@@ -379,9 +386,28 @@ fn layout_subtree(
     header_h + body_h
 }
 
-/// Height of a card's header area — one signature line plus inner padding.
-fn header_height(_card: &Card, m: &LayoutMetrics) -> f32 {
-    m.line_height + m.card_inner_pad_y * 2.0
+/// Height of a card's header area — the lines that stay visible when the
+/// card is fully folded.
+///
+/// - **Class**: just the `class Foo:` signature line (classes render only
+///   their header_range; decorators on a class aren't text inside the class
+///   card, they belong to the enclosing scope).
+/// - **Function/Method**: decorators *plus* the signature. A `@classmethod`
+///   function card shows `@classmethod\ndef foo(cls):` when folded — both
+///   the decorator context and the signature are structurally important.
+/// - Inner padding is added above AND below the visible preamble so the
+///   first/last line don't touch the frame.
+fn header_height(card: &Card, m: &LayoutMetrics) -> f32 {
+    let preamble_lines: usize = match (&card.kind, &card.body_lines) {
+        (CardKind::Class, _) => (card.header_lines.end - card.header_lines.start).max(1),
+        // For functions/methods, preamble = everything in full_range before
+        // the body starts: decorator lines + signature lines.
+        (_, Some(body_lines)) => {
+            body_lines.start.saturating_sub(card.full_lines.start).max(1)
+        }
+        (_, None) => (card.full_lines.end - card.full_lines.start).max(1),
+    };
+    (preamble_lines as f32) * m.line_height + m.card_inner_pad_y * 2.0
 }
 
 /// Cubic smoothstep — standard 3t²−2t³. Zero derivative at both endpoints,
@@ -392,13 +418,20 @@ fn smoothstep(t: f32) -> f32 {
 }
 
 /// Full (unfolded) body height for a leaf card (function or method).
+///
+/// Just the body text lines — no extra padding here. The header already
+/// reserves `card_inner_pad_y` above the preamble AND a matching pad below
+/// it (via `* 2.0` in `header_height`), so the bottom of that header-pad is
+/// exactly where body text starts. `body_h` only adds the collapsible body
+/// lines themselves, which matches what the text cursor actually advances
+/// through.
 fn leaf_body_height(card: &Card, m: &LayoutMetrics) -> f32 {
     let lines = card
         .body_lines
         .as_ref()
         .map(|r| (r.end.saturating_sub(r.start)) as f32)
         .unwrap_or(0.0);
-    lines * m.line_height + m.card_inner_pad_y
+    lines * m.line_height
 }
 
 // ---------------------------------------------------------------------------
@@ -639,8 +672,10 @@ mod tests {
 
         let delta =
             unfolded.rects[&cards[1].id].y - folded.rects[&cards[1].id].y;
-        // The height of a's body (2 lines + pad) should be exactly what b moved up.
-        let expected_body_h = 2.0 * m.line_height + m.card_inner_pad_y;
+        // The height of a's body (just the 2 body lines — `body_h` no longer
+        // double-counts inner padding; the header's `pad*2` provides the
+        // bottom gutter) should be exactly what b moved up.
+        let expected_body_h = 2.0 * m.line_height;
         assert!(
             (delta - expected_body_h).abs() < 0.01,
             "delta={} expected_body_h={}",

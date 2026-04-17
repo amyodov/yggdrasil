@@ -66,21 +66,24 @@ use crate::syntax::TokenKind;
 // Palette & layout constants (logical points where marked with _PT)
 // ----------------------------------------------------------------------------
 
-/// Plate's tinted-glass fill. Low alpha so the breathing sky reads through.
-const PANEL_FILL: [f32; 4] = [0.040, 0.048, 0.072, 0.52];
+/// Card backgrounds (Zone-3 paper). Near-opaque so cards read as physical
+/// objects lying on the plate, not as tinted glass panels. A tiny bit of
+/// translucency (~0.92) lets the plate's inner luminance just barely affect
+/// them, so they pick up a hint of the plate's warmth.
+const CARD_BG: [f32; 4] = [0.080, 0.090, 0.120, 0.92];
+const CLASS_BG: [f32; 4] = [0.095, 0.105, 0.140, 0.94];
 
-/// Card backgrounds — sit on the plate, slightly brighter so they feel like
-/// holographic plates. Alpha < 1 so the panel reads through.
-const CARD_BG: [f32; 4] = [0.075, 0.085, 0.120, 0.78];
-const CLASS_BG: [f32; 4] = [0.092, 0.102, 0.140, 0.84];
-
-/// Per-card outer glow colors (fall-off halo around the card edge).
-const CARD_GLOW_PUBLIC: [f32; 4] = [0.44, 0.78, 0.98, 0.40];
-const CARD_GLOW_PRIVATE: [f32; 4] = [0.30, 0.36, 0.50, 0.22];
-const CARD_GLOW_CLASS: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
-const CARD_GLOW_CLASSMETHOD: [f32; 4] = [0.98, 0.80, 0.48, 0.45];
-const CARD_GLOW_STATICMETHOD: [f32; 4] = [0.92, 0.70, 0.95, 0.45];
-const CARD_GLOW_PROPERTY: [f32; 4] = [0.60, 0.97, 0.80, 0.45];
+/// Card drop shadow — reads as "card lifted slightly off the plate." Drawn
+/// BEFORE the card fill, with transparent fill + dark blurred glow. The
+/// offset says "light comes from above-left" (consistent with the plate's
+/// top-edge rim light). Blur radius is the shadow's softness; higher =
+/// softer edge.
+const CARD_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.40];
+const CARD_SHADOW_OFFSET_PT: f32 = 2.5;
+const CARD_SHADOW_BLUR_PT: f32 = 10.0;
+/// Private cards sit a hair lower (smaller shadow) than public ones — this
+/// is the three-zone-grammar's "sits lower" affordance.
+const PRIVATE_SHADOW_SCALE: f32 = 0.65;
 
 /// Left-side accent strip colors per visibility/modifier.
 const ACCENT_PUBLIC: [f32; 4] = [0.50, 0.84, 0.98, 1.0];
@@ -107,8 +110,6 @@ const SPINE_WIDTH_PT: f32 = 3.0;
 /// Extra horizontal inset for a method attached to the class spine.
 const INSTANCE_METHOD_INSET_PT: f32 = 8.0;
 
-const PRIVATE_CARD_OPACITY_SCALE: f32 = 0.75;
-
 /// Plate inset from the code pane's nominal rectangle. The plate floats with
 /// this much space between itself and the window edges (left, right, top,
 /// bottom). M3.6 will expand this for more breathing room.
@@ -119,13 +120,29 @@ const CARD_CORNER_RADIUS_PT: f32 = 6.0;
 const ACCENT_CORNER_RADIUS_PT: f32 = 1.0;
 const HANDLE_CORNER_RADIUS_PT: f32 = 2.5;
 
-/// Glow radii.
-const CARD_GLOW_RADIUS_PT: f32 = 10.0;
+/// Spine (class armature) glow radius — the one card-zone element that is
+/// truly emissive, because it's a semantic light (the class's identity rail).
 const SPINE_GLOW_RADIUS_PT: f32 = 6.0;
+
+/// Plate outer bloom (Zone-2 halo into the void). Baked into the composite
+/// shader so it doesn't consume extra RT space and follows the plate's
+/// rounded silhouette — not its rectangular RT bounds.
+const PLATE_BLOOM_RADIUS_PT: f32 = 14.0;
+/// Cool blue-violet halo color, tuned to complement the nebula palette. The
+/// alpha channel is peak bloom intensity (the shader multiplies by SDF
+/// falloff, so this is the brightness right at the plate edge).
+const PLATE_BLOOM_COLOR: [f32; 4] = [0.40, 0.55, 0.95, 0.26];
+
+/// Rim light along the plate's top inner edge — the "lit from above" cue
+/// that confirms the plate is a lit material, not a printed rectangle.
+/// Thickness is how far inward the rim reaches before fading out; intensity
+/// multiplies the rim color in `composite.rs`.
+const PLATE_RIM_THICKNESS_PT: f32 = 2.0;
+const PLATE_RIM_INTENSITY: f32 = 1.25;
 
 const CODE_PAD_LEFT_PT: f32 = 20.0;
 const CODE_PAD_RIGHT_PT: f32 = 20.0;
-const CARD_INNER_PAD_Y_PT: f32 = 5.0;
+const CARD_INNER_PAD_Y_PT: f32 = 7.0;
 const TOP_LEVEL_GAP_PT: f32 = 10.0;
 const DEPTH_INDENT_PT: f32 = 22.0;
 const FOLD_HANDLE_SIZE_FRAC: f32 = 0.5;
@@ -413,10 +430,11 @@ impl Renderer {
         let scene_top_local = SCENE_TOP_PAD_PT * state.scale_factor;
 
         // ---- Build shape instances ----
-        // Panel background first so cards render on top. All positions are
-        // plate-local (origin = plate top-left).
-        let mut instances: Vec<RectInstance> = Vec::with_capacity(state.cards.len() * 5 + 1);
-        push_panel_shape(&mut instances, state, plate_size);
+        // All positions are plate-local (origin = plate top-left). The plate
+        // background (lit material + outer bloom) is drawn by the composite
+        // shader in M3.3, not as a shape instance here — so the RT starts
+        // transparent and we only draw cards into it.
+        let mut instances: Vec<RectInstance> = Vec::with_capacity(state.cards.len() * 5);
         let plate_h = plate_size[1] as f32;
         for card in &state.cards {
             let Some(rect) = layout.rects.get(&card.id) else { continue };
@@ -480,6 +498,11 @@ impl Renderer {
             (self.surface_config.width, self.surface_config.height),
             self.code_plate.pos_px,
             self.code_plate.size_px,
+            PANEL_CORNER_RADIUS_PT * sf,
+            PLATE_BLOOM_RADIUS_PT * sf,
+            PLATE_BLOOM_COLOR,
+            PLATE_RIM_THICKNESS_PT * sf,
+            PLATE_RIM_INTENSITY,
             self.code_plate.model,
         );
 
@@ -626,6 +649,10 @@ fn collect_text_areas<'a>(
     let plate_h = plate_size[1] as f32;
     let mut out = Vec::with_capacity(state.cards.len());
     let text_inset = CARD_TEXT_INSET_PT * sf;
+    // Vertical text inset — text sits this far below the card's top edge
+    // (and the card's layout also reserves this much padding at the bottom)
+    // so first/last lines don't touch the frame.
+    let text_inset_y = CARD_INNER_PAD_Y_PT * sf;
     for card in &state.cards {
         let Some(rect) = layout.rects.get(&card.id) else { continue };
         let local_y = rect.y - state.scroll_y + scene_top_local;
@@ -648,10 +675,11 @@ fn collect_text_areas<'a>(
         };
         let left = rect.x + text_inset + method_inset;
         let right = rect.x + rect.width - text_inset * 0.5;
+        let text_top = local_y + text_inset_y;
 
         let bounds = TextBounds {
             left: left as i32,
-            top: local_y.max(0.0) as i32,
+            top: text_top.max(0.0) as i32,
             right: right as i32,
             bottom: (local_y + rect.total_h()).min(plate_h) as i32,
         };
@@ -664,7 +692,7 @@ fn collect_text_areas<'a>(
         out.push(AreaSpec {
             buffer,
             left,
-            top: local_y,
+            top: text_top,
             bounds,
             default_color: GlyphonColor::rgb(r, g, b),
         });
@@ -696,9 +724,17 @@ impl<'a> AreaSpec<'a> {
     }
 }
 
-/// Append the shape instances for one card (bg + glow, accent strip, spine
-/// for classes, fold handle, and — during a fold animation — a rolling edge
-/// highlight along the currently-visible body bottom).
+/// Append the shape instances for one card. Order matters — each instance
+/// draws on top of the previous via premultiplied-alpha blend.
+///
+/// 1. **Drop shadow** — transparent fill + dark blurred glow, offset down-
+///    right. Reads as "card is slightly above the plate."
+/// 2. **Card background** — solid (no outer glow). Near-opaque tinted paper.
+/// 3. **Accent strip** — left-edge visibility/modifier cue.
+/// 4. **Class spine** (for class cards) — luminous emissive metal rail
+///    (Zone-3 semantic light exception).
+/// 5. **Fold handle** — solid, color-coded by fold target.
+/// 6. **Rolling edge** (during fold animation) — thin luminous hairline.
 ///
 /// All output coordinates are **plate-local**.
 fn push_card_shapes(
@@ -709,32 +745,42 @@ fn push_card_shapes(
     state: &AppState,
 ) {
     let sf = state.scale_factor;
+    let corner = CARD_CORNER_RADIUS_PT * sf;
 
-    // ---- Card background + outer glow ----
-    let mut bg = match card.kind {
+    // ---- Drop shadow (BEFORE the card so it renders behind) ----
+    // Private cards get a fainter, shorter shadow — they sit lower.
+    let shadow_scale = if card.visibility == Visibility::Private {
+        PRIVATE_SHADOW_SCALE
+    } else {
+        1.0
+    };
+    let shadow_offset = CARD_SHADOW_OFFSET_PT * sf * shadow_scale;
+    let shadow_blur = CARD_SHADOW_BLUR_PT * sf * shadow_scale;
+    let mut shadow_color = CARD_SHADOW_COLOR;
+    shadow_color[3] *= shadow_scale;
+    out.push(RectInstance::glowing(
+        rect.x + shadow_offset,
+        local_y + shadow_offset,
+        rect.width,
+        rect.total_h(),
+        [0.0, 0.0, 0.0, 0.0], // transparent fill; the "shadow" IS the glow
+        corner,
+        shadow_color,
+        shadow_blur,
+    ));
+
+    // ---- Card background (solid, no outer glow — cards don't emit). ----
+    let bg = match card.kind {
         CardKind::Class => CLASS_BG,
         _ => CARD_BG,
     };
-    if card.visibility == Visibility::Private {
-        bg[3] *= PRIVATE_CARD_OPACITY_SCALE;
-    }
-    let glow = match (card.kind, card.modifier, card.visibility) {
-        (CardKind::Class, _, _) => CARD_GLOW_CLASS,
-        (_, MethodModifier::Classmethod, _) => CARD_GLOW_CLASSMETHOD,
-        (_, MethodModifier::Staticmethod, _) => CARD_GLOW_STATICMETHOD,
-        (_, MethodModifier::Property, _) => CARD_GLOW_PROPERTY,
-        (_, _, Visibility::Private) => CARD_GLOW_PRIVATE,
-        (_, _, Visibility::Public) => CARD_GLOW_PUBLIC,
-    };
-    out.push(RectInstance::glowing(
+    out.push(RectInstance::solid(
         rect.x,
         local_y,
         rect.width,
         rect.total_h(),
         bg,
-        CARD_CORNER_RADIUS_PT * sf,
-        glow,
-        CARD_GLOW_RADIUS_PT * sf,
+        corner,
     ));
 
     // ---- Left-side accent strip ----
@@ -799,30 +845,6 @@ fn push_card_shapes(
             4.0 * sf,
         ));
     }
-}
-
-/// Emit the plate's panel-background rectangle (plate-local).
-///
-/// M3.1 trade-off: the old panel shape had an outer glow extending beyond
-/// the panel edges; that glow would be clipped by the plate RT's rectangular
-/// bounds. For now we draw the panel fill only — M3.3 reintroduces the
-/// panel's luminous edge via an inner-lit shader + (optional) composite-time
-/// outer bloom, both of which handle the RT-bounds issue properly.
-fn push_panel_shape(out: &mut Vec<RectInstance>, state: &AppState, plate_size: [u32; 2]) {
-    let sf = state.scale_factor;
-    let w = plate_size[0] as f32;
-    let h = plate_size[1] as f32;
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    out.push(RectInstance::solid(
-        0.0,
-        0.0,
-        w,
-        h,
-        PANEL_FILL,
-        PANEL_CORNER_RADIUS_PT * sf,
-    ));
 }
 
 /// Return a rectangle (plate-local physical pixels, NOT scrolled) for the
