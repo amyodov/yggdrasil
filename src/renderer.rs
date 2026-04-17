@@ -91,6 +91,8 @@ const ACCENT_PRIVATE: [f32; 4] = [0.42, 0.46, 0.60, 0.82];
 const ACCENT_CLASSMETHOD: [f32; 4] = [0.98, 0.82, 0.55, 1.0];
 const ACCENT_STATICMETHOD: [f32; 4] = [0.92, 0.72, 0.95, 1.0];
 const ACCENT_PROPERTY: [f32; 4] = [0.65, 0.98, 0.82, 1.0];
+/// Neutral slate for top-level orphan code (imports, constants, `if __name__`).
+const ACCENT_SNIPPET: [f32; 4] = [0.52, 0.58, 0.68, 0.85];
 
 /// Class spine (armature) — luminous cyan rail.
 const SPINE_COLOR: [f32; 4] = [0.72, 0.90, 1.00, 0.92];
@@ -786,6 +788,7 @@ fn push_card_shapes(
     // ---- Left-side accent strip ----
     let (accent_color, accent_width_pt) = match (card.kind, card.modifier, card.visibility) {
         (CardKind::Class, _, _) => (SPINE_COLOR, SPINE_WIDTH_PT),
+        (CardKind::Snippet, _, _) => (ACCENT_SNIPPET, ACCENT_WIDTH_PT_PRIVATE),
         (_, MethodModifier::Classmethod, _) => (ACCENT_CLASSMETHOD, ACCENT_WIDTH_PT),
         (_, MethodModifier::Staticmethod, _) => (ACCENT_STATICMETHOD, ACCENT_WIDTH_PT),
         (_, MethodModifier::Property, _) => (ACCENT_PROPERTY, ACCENT_WIDTH_PT),
@@ -815,20 +818,23 @@ fn push_card_shapes(
         ));
     }
 
-    // ---- Fold handle — small rounded block, recolors on target fold state. ----
-    let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
-    let handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
-    let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
-    let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
-    let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
-    out.push(RectInstance::solid(
-        handle_x,
-        handle_y,
-        handle_size,
-        handle_size,
-        handle_color,
-        HANDLE_CORNER_RADIUS_PT * sf,
-    ));
+    // ---- Fold handle — small rounded block, recolors on target fold state.
+    //      Skipped for snippets (they have no collapsible body). ----
+    if card.kind != CardKind::Snippet {
+        let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
+        let handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
+        let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
+        let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
+        let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
+        out.push(RectInstance::solid(
+            handle_x,
+            handle_y,
+            handle_size,
+            handle_size,
+            handle_color,
+            HANDLE_CORNER_RADIUS_PT * sf,
+        ));
+    }
 
     // ---- Rolling edge during fold animation. ----
     let progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
@@ -880,18 +886,69 @@ fn build_card_buffer(
         CardKind::Class => card.header_range.clone(),
         _ => card.full_range.clone(),
     };
-    let text = &hl.source.contents[range.clone()];
-    let kinds = &hl.kinds[range.clone()];
+
+    // The card's text starts at `range.start`, which in source is usually
+    // mid-line (e.g. at `def` in `    def foo():`, column 4). The characters
+    // before it — the leading whitespace of that line — aren't in the range.
+    // But subsequent lines in the range carry their full source indentation,
+    // which reads as a staircase (first line flush-left, body deeply
+    // indented). Strip the first line's source column from every other line
+    // so the card's internal indentation is relative to its signature.
+    let line_idx = hl
+        .line_offsets
+        .partition_point(|&o| o <= range.start)
+        .saturating_sub(1);
+    let base_col = range.start - hl.line_offsets[line_idx];
+
+    let raw_text = &hl.source.contents[range.clone()];
+    let raw_kinds = &hl.kinds[range.clone()];
+    let (text, kinds) = dedent_with_kinds(raw_text, raw_kinds, base_col);
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     buffer.set_size(font_system, Some(100_000.0), None);
 
     let attrs_by_kind = attrs_by_kind();
     let default_attrs = Attrs::new().family(Family::Monospace);
-    let spans = RunSpans { text, kinds, i: 0, attrs_by_kind };
+    let spans = RunSpans { text: &text, kinds: &kinds, i: 0, attrs_by_kind };
     buffer.set_rich_text(font_system, spans, default_attrs, Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
     buffer
+}
+
+/// Strip up to `strip` leading ASCII spaces from every line except the first
+/// of `text`, keeping `kinds` synchronized byte-for-byte.
+///
+/// "Except the first" is deliberate: the first line's leading whitespace was
+/// already elided by the card's byte range starting mid-line (at `def` / `@`).
+/// Subsequent lines still carry the full source indentation, so we peel off
+/// the same amount the first line was missing — giving a coherent picture
+/// where the body sits one indent level below the signature.
+fn dedent_with_kinds(text: &str, kinds: &[TokenKind], strip: usize) -> (String, Vec<TokenKind>) {
+    if strip == 0 {
+        return (text.to_string(), kinds.to_vec());
+    }
+    let mut out_text = String::with_capacity(text.len());
+    let mut out_kinds = Vec::with_capacity(kinds.len());
+    let mut byte_i = 0usize;
+    let mut first = true;
+    for line in text.split_inclusive('\n') {
+        let line_len = line.len();
+        if first {
+            out_text.push_str(line);
+            out_kinds.extend_from_slice(&kinds[byte_i..byte_i + line_len]);
+            first = false;
+        } else {
+            let to_strip = line
+                .bytes()
+                .take(strip)
+                .take_while(|&b| b == b' ')
+                .count();
+            out_text.push_str(&line[to_strip..]);
+            out_kinds.extend_from_slice(&kinds[byte_i + to_strip..byte_i + line_len]);
+        }
+        byte_i += line_len;
+    }
+    (out_text, out_kinds)
 }
 
 // ----------------------------------------------------------------------------

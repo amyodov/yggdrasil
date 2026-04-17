@@ -26,6 +26,10 @@ pub enum CardKind {
     Function,
     /// `def foo(self): ...` inside a class body.
     Method,
+    /// Top-level orphan code — anything that isn't a def/class, rendered so
+    /// nothing in the file is invisible. Covers imports, module constants,
+    /// and control-flow blocks like `if __name__ == "__main__":`.
+    Snippet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +129,17 @@ fn process_statement(
                 None => return,
             }
         }
-        _ => return,
+        "comment" => return,
+        // Anything else at module top level becomes a Snippet card. Skipped
+        // inside class bodies (parent.is_some()) — class-level statements
+        // (class-vars, dataclass fields) get their own visual treatment in
+        // a future semantic-rendering pass, not a generic snippet.
+        _ => {
+            if parent.is_none() {
+                emit_snippet(node, line_offsets, out, next_id);
+            }
+            return;
+        }
     };
 
     let kind = match def_node.kind() {
@@ -212,6 +226,35 @@ fn process_statement(
         }
     }
     // Nested functions inside functions are out of scope for M3.
+}
+
+/// Emit a `Snippet` card for a top-level orphan statement. No body / no
+/// fold — snippets always render fully.
+fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id: &mut u32) {
+    let full_range = node.byte_range();
+    let full_lines = byte_range_to_line_range(&full_range, line_offsets);
+    let header_range = full_range.clone();
+    let header_lines = full_lines.clone();
+
+    let id = CardId(*next_id);
+    *next_id += 1;
+    out.push(Card {
+        id,
+        kind: CardKind::Snippet,
+        parent: None,
+        depth: 0,
+        // The node kind is a decent placeholder name for snippets until we
+        // have something more specific (e.g. the target of `if __name__`).
+        name: node.kind().to_string(),
+        visibility: Visibility::Public,
+        modifier: MethodModifier::None,
+        header_range,
+        body_range: None,
+        full_range,
+        header_lines,
+        body_lines: None,
+        full_lines,
+    });
 }
 
 /// If `node` is a `decorated_definition`, inspect its decorators and return
@@ -374,6 +417,9 @@ fn layout_subtree(
             total
         }
         CardKind::Function | CardKind::Method => leaf_body_height(card, m),
+        // Snippets have no collapsible body — all their text is in the
+        // "preamble" (full_lines), which `header_height` already reserves.
+        CardKind::Snippet => 0.0,
     };
 
     let body_h = body_full_h * progress;
@@ -565,10 +611,16 @@ mod tests {
             (CardKind::Method, "outer_m", Visibility::Public, MethodModifier::None, 1),
         ],
     )]
-    // Module-level assignments, imports etc. are not cards.
-    #[case::ignores_non_definitions(
+    // Module-level orphan code becomes Snippet cards so nothing is invisible.
+    // Per-node: one card per top-level statement (keep distinction between
+    // imports vs constants vs functions).
+    #[case::snippets_for_orphan_top_level(
         "import os\nCONST = 1\ndef f():\n    pass\n",
-        &[(CardKind::Function, "f", Visibility::Public, MethodModifier::None, 0)],
+        &[
+            (CardKind::Snippet,  "import_statement",     Visibility::Public, MethodModifier::None, 0),
+            (CardKind::Snippet,  "expression_statement", Visibility::Public, MethodModifier::None, 0),
+            (CardKind::Function, "f",                    Visibility::Public, MethodModifier::None, 0),
+        ],
     )]
     fn extraction(
         #[case] src: &str,
