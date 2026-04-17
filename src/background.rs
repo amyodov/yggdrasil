@@ -152,8 +152,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
 };
 
-// A single oversized triangle that covers the clip-space square. Skips
-// needing a vertex buffer or index buffer — classic fullscreen-quad trick.
+// Fullscreen-triangle VS (no vertex buffer).
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     var out: VsOut;
@@ -161,82 +160,145 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     let y = f32(vi & 2u);
     let clip = vec2<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0);
     out.pos = vec4<f32>(clip, 0.0, 1.0);
-    // UV in [0, 1] with origin top-left (y grows downward in pixel space).
     out.uv = vec2<f32>(x, 1.0 - y);
     return out;
 }
 
-// 2D hash — cheap noise for a very subtle grain at low amplitude.
-fn hash21(p: vec2<f32>) -> f32 {
+// ---- Value noise + fBm ----------------------------------------------------
+//
+// We want ORGANIC spatial variation, not sine-lattice patterns. Value noise
+// at a few octaves (fBm) gives cloud/nebula-shaped patches without visibly
+// regular structure. fBm is fractal: each octave adds finer detail on top of
+// the large shapes from the previous octave.
+
+fn hash12(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
     p3 = p3 + dot(p3, p3.yzx + vec3<f32>(33.33));
     return fract((p3.x + p3.y) * p3.z);
 }
 
-// Two-octave cloud-field: two sine lattices at different frequencies,
-// multiplied together. Each lattice drifts at its own slow rate, creating
-// apparent depth (parallax-like motion between scales).
-fn cloud_field(uv: vec2<f32>, t: f32) -> f32 {
-    // Slow-drift large cloud layer.
-    let drift_a = vec2<f32>(sin(t * 0.031) * 0.18, cos(t * 0.023) * 0.12);
-    let uv_a = uv + drift_a;
-    let a = (sin(uv_a.x * 2.1) * 0.5 + 0.5)
-          * (sin(uv_a.y * 1.5 + 1.2) * 0.5 + 0.5);
-
-    // Faster, smaller-scale cloud layer drifting the other way — breaks the
-    // regularity of a single sine lattice.
-    let drift_b = vec2<f32>(cos(t * 0.047 + 0.9) * 0.24, sin(t * 0.037) * 0.18);
-    let uv_b = uv + drift_b;
-    let b = (sin(uv_b.x * 4.3 - 0.5) * 0.5 + 0.5)
-          * (sin(uv_b.y * 3.1 + 2.2) * 0.5 + 0.5);
-
-    // Weighted blend — large layer dominates, small layer adds texture.
-    return mix(a, b, 0.35);
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let a = hash12(i);
+    let b = hash12(i + vec2<f32>(1.0, 0.0));
+    let c = hash12(i + vec2<f32>(0.0, 1.0));
+    let d = hash12(i + vec2<f32>(1.0, 1.0));
+    // Hermite smoothing — no visible grid artefacts.
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
+
+// 3-octave fBm. `p` is any 2D position; bigger values give finer detail.
+fn fbm(p: vec2<f32>) -> f32 {
+    var total = 0.0;
+    var amp = 0.55;
+    var freq = 1.0;
+    for (var i = 0; i < 3; i = i + 1) {
+        total = total + amp * value_noise(p * freq);
+        freq = freq * 2.1;
+        amp  = amp * 0.55;
+    }
+    return total;  // roughly 0..1 range
+}
+
+// --------------------------------------------------------------------------
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let px = in.uv * u.viewport_size;
     let t = u.time_seconds;
 
-    // ---- Base palette: deep blue-violet void with a hint of warmth ----
-    // A touch brighter than pre-M3.8 to give subsequent layers room to
-    // modulate visibly without crushing to black.
-    let base_top    = vec3<f32>(0.028, 0.031, 0.052);  // cool blue-violet at top
-    let base_bottom = vec3<f32>(0.038, 0.030, 0.048);  // slightly warmer, a hair redder at bottom
-    let base_color  = mix(base_top, base_bottom, in.uv.y * 0.70);
-
-    // ---- Breathing: two slow sine pulses, out of phase. ----
-    // Period ~25-40s — longer than a held breath, so conscious perception
-    // dissolves. Amplitude ~4% on brightness + a tiny hue shift.
-    let breath_bright = 1.0
-        + 0.028 * sin(t * 0.22)
-        + 0.014 * sin(t * 0.13 + 1.9);
-    // Subtle hue breathing: a very small shift toward warm/cool that the
-    // eye reads as "the sky is alive," not as a color change.
-    let hue_shift = 0.010 * sin(t * 0.08 + 0.4);
-    let hue_bias  = vec3<f32>(hue_shift * 0.6, 0.0, -hue_shift * 0.8);
-
-    // ---- Cloud field — adds depth and variation. ----
-    // Tinted slightly toward violet so clouds read as "atmosphere," not as
-    // visible shapes. Amplitude ~3% of total range.
-    let cloud = cloud_field(in.uv, t);
-    let cloud_tint = vec3<f32>(0.022, 0.024, 0.044) * cloud * 1.0;
-
-    // ---- Fine noise at pixel granularity. ----
-    let n = (hash21(floor(px / 2.0)) - 0.5) * 0.010;
-
-    // ---- Radial vignette: center of gravity for the void. ----
-    // Use aspect-corrected coordinates so the vignette is circular, not
-    // elliptical on wide windows.
+    // Aspect-correct coords so features are circular on wide/tall windows.
     let aspect = u.viewport_size.x / max(u.viewport_size.y, 1.0);
+    let auv    = vec2<f32>(in.uv.x * aspect, in.uv.y);
+
+    // ---- Near-black base so nebula layers rise above it visibly. ----
+    let base = vec3<f32>(0.010, 0.010, 0.018);
+
+    // ---- Deep-space palette. Wider than before so the slow hue layer has
+    // real diapason: when it shifts, it's noticeable ("was blue, now green"). ----
+    let violet   = vec3<f32>(0.090, 0.035, 0.130);
+    let indigo   = vec3<f32>(0.020, 0.035, 0.120);
+    let magenta  = vec3<f32>(0.090, 0.030, 0.075);
+    let teal     = vec3<f32>(0.020, 0.065, 0.080);
+    let aurora_g = vec3<f32>(0.020, 0.095, 0.060);   // new: aurora green
+    let ember    = vec3<f32>(0.095, 0.045, 0.020);   // new: rare warm ember
+
+    // ---- Principle: slow layers have WIDE range; fast layers have NARROW
+    // range. The slow "epoch" picks from a broad palette (big changes over
+    // minutes); the fast cloud layers drift visibly but stay within a
+    // narrow amplitude. This is how the eye reads "volumetric" rather than
+    // "one thing moving in front of a static backdrop." ----
+
+    // ===== SLOW EPOCH (wide palette) =====
+    // Two fBm samples pick primary + accent hues from the full palette.
+    // Periods ~1–2 min. When you come back later, the sky has noticeably
+    // shifted mood.
+    let epoch_a_uv = auv * 0.75 + vec2<f32>(t * 0.030, t * 0.022);
+    let epoch_b_uv = auv * 0.85 + vec2<f32>(-t * 0.025, t * 0.033);
+    let epoch_a = fbm(epoch_a_uv);
+    let epoch_b = fbm(epoch_b_uv);
+
+    // Primary: four-stop blend across violet→indigo→teal→aurora-green.
+    // Using nested mix+smoothstep lets the primary go through the full
+    // arc — not just A↔B — so "it was blue, now green" is possible.
+    let p_01 = mix(violet,  indigo,    smoothstep(0.20, 0.45, epoch_a));
+    let p_12 = mix(p_01,    teal,      smoothstep(0.40, 0.62, epoch_a));
+    let primary = mix(p_12, aurora_g,  smoothstep(0.60, 0.85, epoch_a));
+
+    // Accent: three-stop, rarer ember on the hot end.
+    let a_01 = mix(magenta, teal,      smoothstep(0.25, 0.55, epoch_b));
+    let accent = mix(a_01,  ember,     smoothstep(0.75, 0.90, epoch_b));
+
+    // ===== THREE CLOUD LAYERS at different depths =====
+    // Each has its own scale, speed, direction, AND slight color bias — so
+    // the eye reads them as distinct atmospheric depths, not one blob.
+
+    // FAR CLOUDS: large, soft, slow. Broad diffuse patches in the distance.
+    let far_uv = auv * 1.7 + vec2<f32>(t * 0.040, -t * 0.030);
+    let far    = smoothstep(0.40, 0.80, fbm(far_uv));
+    // Tinted toward primary (the deep-space mood color), slightly dimmer.
+    let far_color = primary * 0.9;
+
+    // MID CLOUDS: the main kinetic layer. Medium scale, medium speed.
+    // Visibly moves across the window — reads as "clouds drifting through."
+    let mid_uv = auv * 3.2 + vec2<f32>(-t * 0.090, t * 0.070);
+    let mid    = smoothstep(0.45, 0.85, fbm(mid_uv));
+    // Blend primary + accent — mid clouds are where hue variation is
+    // most visible.
+    let mid_color = mix(primary, accent, 0.55);
+
+    // NEAR CLOUDS: small, fast, crisp-edged. Reads as "wisps close to the
+    // camera." Lower amplitude so they don't dominate.
+    let near_uv = auv * 7.0 + vec2<f32>(t * 0.180, t * 0.135);
+    let near    = smoothstep(0.55, 0.92, fbm(near_uv)) * 0.55;
+    // Near clouds bias toward accent — visually distinct from far clouds
+    // even in the same frame.
+    let near_color = accent * 1.1;
+
+    // FINE TURBULENCE: surface shimmer, not a cloud layer — just texture.
+    let turb_uv = auv * 12.0 + vec2<f32>(-t * 0.280, t * 0.210);
+    let turb = fbm(turb_uv) * 0.12;
+
+    // Compose. Three cloud layers sum additively because in real nebulae,
+    // atmospheric emission stacks. Peak composite ≈ 0.18 — visible but
+    // keeps the sky comfortably dim.
+    let nebula = far_color  * far  * 0.55
+               + mid_color  * mid  * 0.75
+               + near_color * near * 0.60
+               + vec3<f32>(turb, turb, turb) * 0.25;
+
+    // ---- Extremely faint pixel grain breaks up uniform regions. ----
+    let grain = (hash12(floor(px / 2.0)) - 0.5) * 0.006;
+
+    // ---- Aspect-corrected radial vignette. ----
     let centered = vec2<f32>((in.uv.x - 0.5) * aspect, in.uv.y - 0.5);
-    let r = length(centered) / 0.75;          // normalize so ~1.0 at corners
-    let vignette = 1.0 - smoothstep(0.35, 1.2, r) * 0.28;
+    let r = length(centered) / 0.75;
+    let vignette = 1.0 - smoothstep(0.30, 1.15, r) * 0.42;
 
     // ---- Compose ----
-    var color = (base_color + hue_bias) * breath_bright + cloud_tint + vec3<f32>(n, n, n);
-    color = color * vignette;
+    var color = (base + nebula) * vignette + vec3<f32>(grain, grain, grain);
     return vec4<f32>(color, 1.0);
 }
 "#;

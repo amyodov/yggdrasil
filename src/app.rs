@@ -30,8 +30,15 @@ impl App {
 
     pub fn run(self) -> Result<()> {
         let event_loop = winit::event_loop::EventLoop::new()?;
-        // Start in Wait; we switch to Poll while any fold is animating.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // Poll always: the void has ambient breathing/cloud-drift animation
+        // that must keep ticking even when nothing else is happening.
+        // `about_to_wait` requests the next redraw; VSync (AutoVsync) caps
+        // the rate at display refresh.
+        //
+        // A future optimization could drop to WaitUntil with a ~30fps budget
+        // when the window is unfocused; for the prototype, 60fps background
+        // animation is fine.
+        event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = self;
         event_loop.run_app(&mut app)?;
         Ok(())
@@ -124,8 +131,6 @@ impl ApplicationHandler for App {
                 let metrics = renderer.layout_metrics(&self.state);
                 if let Some(card_id) = hit_test_fold_handle(&self.state, metrics) {
                     self.state.toggle_fold(card_id);
-                    // Kick the animation loop.
-                    event_loop.set_control_flow(ControlFlow::Poll);
                     renderer.window().request_redraw();
                 }
             }
@@ -150,14 +155,10 @@ impl ApplicationHandler for App {
                 };
                 self.last_frame = Some(now);
 
-                let animating = self.state.tick_animations(dt);
-                // Poll continuously while animating, Wait when idle. Redraws
-                // during Poll are self-perpetuating via request_redraw below.
-                if animating {
-                    event_loop.set_control_flow(ControlFlow::Poll);
-                } else {
-                    event_loop.set_control_flow(ControlFlow::Wait);
-                }
+                // Fold animations still use the dt tick, but redraw scheduling
+                // is handled unconditionally by `about_to_wait` (the void
+                // always breathes).
+                let _ = self.state.tick_animations(dt);
 
                 match renderer.render(&self.state) {
                     Ok(()) => {}
@@ -170,17 +171,20 @@ impl ApplicationHandler for App {
                     }
                     Err(e) => log::warn!("surface error: {e:?}"),
                 }
-
-                if animating {
-                    renderer.window().request_redraw();
-                }
             }
 
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+    /// In Poll mode, called after each batch of events is processed. Request
+    /// a redraw here so the void's breathing/cloud animation keeps ticking
+    /// independent of user input. VSync caps the actual rate.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.window().request_redraw();
+        }
+    }
 }
 
 /// Is the cursor (from `state.cursor_pos`) over a fold handle? Free function

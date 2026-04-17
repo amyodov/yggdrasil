@@ -12,6 +12,67 @@ The name Ygg is a shortening of Yggdrasil — the Norse world tree. Odin hung on
 
 Short form: `ygg` (the CLI). Longer form: Yggdrasil (when we want gravitas).
 
+### Canonical mode: a review on a Fairlight console, under a cosmic void
+
+Ygg's default state is **a PR review, laid out on a Fairlight-style production console, under a cosmic void.** The console is a wooden-cased workstation built for deliberation: dark oak body, metal trim, glass/display areas where the artifacts sit, an integrated transport timeline on the front face. The void (deep-space nebulae, slow spatial motion) is what you see behind and above the console — the workshop's window onto the cosmos. Review lives on the console; the code artifacts lie on its work-surface; the timeline scrubber is a row of transport controls embedded in its front face.
+
+Three interaction modes, distinguished by how much of the console is in view:
+
+| Mode | Console | Void | The user is… |
+|---|---|---|---|
+| **Void-only** | absent | full canvas | navigating freely — no active review |
+| **Full console** | dominant, lit from above | background, dimmed | actively reviewing a PR |
+| **Partial console** | edge visible as a wooden horizon at the screen's bottom | main canvas | exploring history/context while a review stays pinned, returnable |
+
+Transitions are physical. The console rises from below when a review begins, recedes to its edge when the user steps off to explore context, rises back when the user returns, dissolves entirely when the review is closed. No modal dialogs, no tabs — the wooden horizon *is* the affordance that says "your review is still here, come back when ready."
+
+This framing is load-bearing. Ygg is not "a code viewer that can also do diffs." Ygg is **a review console, with a navigation mode for when you're not reviewing.**
+
+## Design dialect: diegetic cosmic-library
+
+Ygg's visual language is neither skeuomorphism (faithful imitation of real objects) nor flat abstraction. It's **diegetic design** — a term from game-UI theory: the UI lives *inside a world*, and its physicality is how it explains itself. References include Dead Space's 3D health meter on the character's suit, Star Wars' holographic chess, *The Expanse*'s cockpit consoles, *Foundation* (Apple TV) vault projections, Mass Effect's omni-tool, *Blade Runner 2049*'s layered materials, *Sandman*'s Dream-library.
+
+The specific dialect is **cosmic-library**: ancient physical artifacts (scrolls, planks, cardboard, foil, parchment) in a quiet cosmic context (deep-space nebulae, slow drift, cool palette). Ancient knowledge, cosmic frame. Entirely fitting for a tool named after Odin's world-tree.
+
+### Reference anchors for judgment calls
+When it's unclear whether a design choice fits the dialect, ask: *"Would this sit naturally in (a) a Fairlight CMI control room, (b) the Vault of Foundation, (c) the Library of Dream from Sandman, or (d) the apartment of K in Blade Runner 2049?"* A yes across two or more of those is strong evidence the dialect is holding. A yes to only one (or none) is a smell.
+
+### What keeps it coherent (rules)
+1. **One world, shared physics.** Every element obeys the same lighting grammar (see *The world: three zones*). The physics is the coherence; the vocabulary can be eclectic.
+2. **Metaphors picked for didactic clarity, not cleverness.** A scroll is used because it *is* long rolled-up content. A console is used because it *is* a deliberation surface. A hologram is used because it *is* a projection linking A to B. Each metaphor earns its place by teaching its function.
+3. **Restrained palette and luminance.** Deep-space darks, dim materials lit from within, rare specular glints. Never glossy, never saturated-bright.
+4. **One material per object class.** Cards are always paper. Plates are always parchment. Projections are always pale-blue holographic. The types are consistent even though the palette of types is rich.
+5. **Function-first.** If an element doesn't teach the reader something or anchor an interaction, it doesn't belong — no matter how pretty.
+
+### Visual vocabulary (the "words")
+
+The dialect has a small fixed vocabulary. When adding a new visual, first identify which word(s) it's using:
+
+- **Zone** — *where are we?* Void / plate / on-plate. Governs lighting (see *The world: three zones* below).
+- **Paper** — *what kind of content is this?* Multiple papers, each a specific semantic class:
+  - **White paper** — regular code implementation (default).
+  - **Blueprint blue** — interfaces, declarations, contracts (`.pyi`, `.h`, Rust `trait`, TS `interface`, Python `Protocol`/`ABC`).
+  - **Graph paper** (blue rule on white) — tests.
+  - **Kraft** (tan/brown) — configuration / data (YAML, TOML, JSON-config).
+  - **Vellum / tissue** (cream, translucent) — prose / docs / docstring bands.
+  - **Parchment** — the scroll plate itself (its own distinct paper).
+- **Cardboard** — headers / planks / title bands. Heavier than paper, smaller than metal. The header-plank of a scroll is cardboard.
+- **Metal** — *joining, at every scale.* Three uses: (a) small structural (brass rivets, rod caps, bolt where plank meets rod); (b) foil inlay (a thin metal stripe on paper, used to say "this edge matters" without introducing a full metal object); (c) big structural (the class armature spine — glowing, emissive-metal — plus its connectors to method cards). Metal catches light from the void: occasional directional specular glints (~1 every 4–8 seconds per element) when nebula or aurora brightens past it. That's how the eye reads "actually metal" rather than "gray paint."
+- **Projection** — *this thing and that thing are identical, seen from different places.* Pale blue-white, ~40% opacity, scan-line edges, occasional Leia-crackle flicker. Always makes an identity claim — never used decoratively. Examples: code pane ↔ file in the tree, code pane ↔ timeline position, symbol definition ↔ each call-site, diff-before ↔ diff-after.
+- **Wood / Workbench** — *deliberation mode.* Wood is the body of the Fairlight console. Appears when the user shifts from flow to comparison (PR review is the canonical case). Changes the lighting grammar: light falls on the workbench from above (a lamp), unlike void-light which comes from within plates. Three interaction modes: full / edge / absent (see *Canonical mode* above).
+
+Implicit (not vocabulary words, don't need naming):
+- **Void-matter** — what nebulae and sky are made of (spatial noise, deep hues, vignette).
+- **Glass / display areas** on the console — where the artifacts sit; reads as a lit surface, not as its own material.
+
+### Sub-material: cardstock weight
+Within a single card, bands can use different weights of the same paper family for one-glance hierarchy:
+- **Header band** — heavier cardstock, small bevel at edge.
+- **Body band** — regular paper.
+- **Docstring band** — vellum / tissue, translucent over the paper below.
+
+This gets hierarchy from *material*, not from color — the palette stays free for other meanings.
+
 ## Guiding principles
 
 ### This is a viewer, not an editor

@@ -199,7 +199,7 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 **Goal**: the code pane reads as a physical plate floating in the void, with a persistent filename header and generous edge breathing room.
 
 **What ships**:
-- **Fixed header band** at top of plate (filename now; metadata chips in later milestones). Does not scroll.
+- **Fixed header band** at top of plate (filename now; metadata chips in later milestones). Does not scroll. Think of it as a small *plank* sitting above the scrolling parchment — structurally its own object, even before the scroll rods appear in M3.7. Design it so that when M3.7 adds the rods, the plank visibly sits *on top of* the upper rod (see M3.7 for the physical-attachment detail).
 - **Plate margins** from window edges: ~2.5–3% of `min(width, height)`. Visual gap between plate and window frame.
 - **Plate height** = `min(content_height, window_height − margins)`. Short files produce a plate that hugs their content, not one stretched empty.
 - **Scroll clipping** to the plate's rounded corners — no text leaks past the plate edge.
@@ -217,13 +217,14 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 - **Top and bottom pin zones**, each exactly 1 line tall.
 - Pin zones only materialize when off-screen content exists in that direction (top-of-file → no top pin; bottom-of-file → no bottom pin). Fade in/out smoothly.
 - Content just past the visible window curls onto a cylinder in the pin zone — cylinder UV mapping sampled from the plate RT (M3.1). Foreshortened, faintly lit, not meant to be readable.
-- No prominent rod/dowel — just faint luminous **cap-glow** at the left and right plate edges where the dowel would exit, cueing "something is wound here."
+- No prominent rod/dowel body — just faint luminous **cap-glow** at the left and right plate edges where the dowel would exit, cueing "something is wound here."
+- **The header plank (from M3.6) visibly sits on top of the upper rod.** Treat the scroll as one physical object: two dowels with parchment wound between them *and* a small plank mounted above the top dowel carrying the filename/title. A thin skeuomorphic connector (a hairline or subtle bright seam) may appear where the plank meets the upper rod, so the eye reads "this plank is bolted to the rods; together with the rods and the parchment this is one artifact." When there's no off-screen content above (no upper pin zone) the plank still sits there — it's part of the scroll, not just an adornment of the pin zone. The bottom of the scroll has no such plank, just the rod (asymmetric by design — herald-scrolls had a title header, not a title footer).
 - Continuous transition as the scroll offset crosses integer line boundaries: a line gradually curves from flat to fully wound.
-- Works symmetrically top and bottom.
+- Works symmetrically top-rod-and-bottom-rod for the curl; plank is top-only.
 
-**Out of scope**: tree-aura link (M4.3), other plates getting the same treatment (future — the primitive is reusable).
+**Out of scope**: tree-aura link (M4.3), other plates getting the same treatment (future — the primitive is reusable), metadata chips in the plank beyond filename (M4+).
 
-**Tests**: cylinder UV function (parameterized progress), pin-zone visibility logic (at top-of-file / mid / bottom-of-file / shorter-than-window cases), cap-glow intensity as a function of wound-content depth.
+**Tests**: cylinder UV function (parameterized progress), pin-zone visibility logic (at top-of-file / mid / bottom-of-file / shorter-than-window cases), cap-glow intensity as a function of wound-content depth, plank-to-rod connector geometry at the top edge.
 
 #### M3.8 — Background visibly alive
 
