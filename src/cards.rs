@@ -53,10 +53,11 @@ pub enum MethodModifier {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `name`, `body_range`, `header_lines` are part of the
-// Card shape we commit to from M3 onward. They land in window titles,
-// future tooltips, and M6 diff presentation; keeping them now avoids
-// re-deriving them later.
+#[allow(dead_code)] // `name`, `body_range`, `header_lines`, `decorators` are
+// part of the Card shape we commit to from M3 onward. They land in window
+// titles, future tooltips, M6 diff presentation, and M8 semantic visuals
+// (dashed-outline abstract methods, dataclass-aware attribute rendering);
+// keeping them now avoids re-deriving them later.
 pub struct Card {
     pub id: CardId,
     pub kind: CardKind,
@@ -65,6 +66,13 @@ pub struct Card {
     pub name: String,
     pub visibility: Visibility,
     pub modifier: MethodModifier,
+    /// All decorators attached to this card, in source order, with `@` and
+    /// call arguments stripped. Dotted identifiers are preserved
+    /// (`@abc.abstractmethod` → `"abc.abstractmethod"`, `@functools.wraps(f)`
+    /// → `"functools.wraps"`). `MethodModifier` is derived from a subset of
+    /// these; `is_abstract()` / `is_dataclass()` are derived from the rest.
+    /// Empty for snippets and for non-decorated definitions.
+    pub decorators: Vec<String>,
 
     /// Byte range of the `def ... :` or `class ... :` header (the signature line).
     /// Does NOT include preceding decorators.
@@ -85,6 +93,43 @@ pub struct Card {
     /// For a decorated function, `full_lines.start` is the line of the `@`.
     /// Used by layout to size leaf cards against the actually-rendered text.
     pub full_lines: Range<usize>,
+}
+
+// Semantic-rules accessors on Card. `#[allow(dead_code)]` because consumers
+// (M8 armature — dashed outline for abstract, dataclass-aware attribute
+// rendering) don't exist yet. Tests cover both methods today.
+#[allow(dead_code)]
+impl Card {
+    /// True if any decorator on this card names one of Python's abstract
+    /// decorators as its final dotted component — matches `@abstractmethod`,
+    /// `@abc.abstractmethod`, `@abstractstaticmethod`, `@abstractclassmethod`,
+    /// `@abstractproperty`.
+    pub fn is_abstract(&self) -> bool {
+        self.decorators.iter().any(|d| {
+            let last = d.rsplit('.').next().unwrap_or(d);
+            matches!(
+                last,
+                "abstractmethod"
+                    | "abstractstaticmethod"
+                    | "abstractclassmethod"
+                    | "abstractproperty"
+            )
+        })
+    }
+
+    /// True if this is a `Class` card decorated with `@dataclass` (bare or
+    /// dotted — `@dataclasses.dataclass` also counts). Always false for
+    /// non-class cards: dataclass decoration on a method is not a Python
+    /// idiom and would be ignored by the semantic layer anyway.
+    pub fn is_dataclass(&self) -> bool {
+        if self.kind != CardKind::Class {
+            return false;
+        }
+        self.decorators.iter().any(|d| {
+            let last = d.rsplit('.').next().unwrap_or(d);
+            last == "dataclass"
+        })
+    }
 }
 
 /// Walk a parse tree and extract Cards in source order.
@@ -198,6 +243,11 @@ fn process_statement(
         MethodModifier::None
     };
 
+    // Preserve every decorator's dotted name for the semantic-rules layer
+    // (is_abstract, is_dataclass, future M8 visual differentiation). Empty
+    // when `node` isn't a decorated_definition.
+    let decorators = extract_decorators(node, source);
+
     let id = CardId(*next_id);
     *next_id += 1;
     out.push(Card {
@@ -208,6 +258,7 @@ fn process_statement(
         name,
         visibility,
         modifier,
+        decorators,
         header_range,
         body_range: body_range.clone(),
         full_range,
@@ -248,6 +299,7 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
         name: node.kind().to_string(),
         visibility: Visibility::Public,
         modifier: MethodModifier::None,
+        decorators: Vec::new(),
         header_range,
         body_range: None,
         full_range,
@@ -255,6 +307,34 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
         body_lines: None,
         full_lines,
     });
+}
+
+/// If `node` is a `decorated_definition`, return the dotted identifier of
+/// every decorator in source order, with leading `@` and trailing call-args
+/// stripped. Preserves dotting: `@abc.abstractmethod` → `"abc.abstractmethod"`,
+/// `@functools.wraps(f)` → `"functools.wraps"`. Empty vec for non-decorated
+/// nodes.
+fn extract_decorators(node: Node, source: &str) -> Vec<String> {
+    if node.kind() != "decorated_definition" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.kind() != "decorator" {
+            continue;
+        }
+        let Ok(text) = c.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let raw = text.trim_start_matches('@').trim();
+        // Strip call args; keep dotted identifier intact.
+        let name = raw.split('(').next().unwrap_or(raw).trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 /// If `node` is a `decorated_definition`, inspect its decorators and return
@@ -684,6 +764,105 @@ mod tests {
         let cards = extract(src);
         let got: Vec<_> = cards.iter().map(sig).collect();
         assert_eq!(got, expected.to_vec());
+    }
+
+    /// `decorators` preserves every decorator on each card in source order,
+    /// with `@` and call args stripped but dotted identifiers intact. The
+    /// cases cover the variations the semantic-rules layer needs to recognize.
+    #[rstest]
+    // Plain function — no decorators.
+    #[case::no_decorator(
+        "def f():\n    pass\n",
+        0, &[] as &[&str]
+    )]
+    // @classmethod preserved verbatim (same decorator that drives MethodModifier).
+    #[case::classmethod_preserved(
+        "class W:\n    @classmethod\n    def make(cls):\n        pass\n",
+        1, &["classmethod"]
+    )]
+    // @dataclass on a class.
+    #[case::dataclass_on_class(
+        "@dataclass\nclass A:\n    x: int = 0\n",
+        0, &["dataclass"]
+    )]
+    // @abstractmethod on a method.
+    #[case::abstractmethod_on_method(
+        "class A:\n    @abstractmethod\n    def m(self):\n        pass\n",
+        1, &["abstractmethod"]
+    )]
+    // Dotted decorator — full dotted identifier retained.
+    #[case::dotted_decorator(
+        "class A:\n    @abc.abstractmethod\n    def m(self):\n        pass\n",
+        1, &["abc.abstractmethod"]
+    )]
+    // Call-args stripped but dotted name kept.
+    #[case::call_args_stripped(
+        "@functools.wraps(f)\ndef g():\n    pass\n",
+        0, &["functools.wraps"]
+    )]
+    // Stacked decorators — source order, all preserved.
+    #[case::stacked(
+        "class A:\n    @someother\n    @classmethod\n    def f(cls):\n        pass\n",
+        1, &["someother", "classmethod"]
+    )]
+    // Custom decorator passes through unchanged.
+    #[case::custom(
+        "@my_decorator\ndef f():\n    pass\n",
+        0, &["my_decorator"]
+    )]
+    fn decorators_preserved(
+        #[case] src: &str,
+        #[case] card_idx: usize,
+        #[case] expected: &[&str],
+    ) {
+        let cards = extract(src);
+        let got: Vec<&str> = cards[card_idx].decorators.iter().map(String::as_str).collect();
+        assert_eq!(got, expected);
+    }
+
+    /// `is_abstract()` and `is_dataclass()` derive from the decorator list.
+    /// Last-component match handles both bare and dotted forms; `is_dataclass`
+    /// is gated on `CardKind::Class` so it never misfires on methods.
+    #[rstest]
+    #[case::plain_function(
+        "def f():\n    pass\n", 0, false, false
+    )]
+    #[case::abstractmethod_bare(
+        "class A:\n    @abstractmethod\n    def m(self):\n        pass\n",
+        1, true, false
+    )]
+    #[case::abstractmethod_dotted(
+        "class A:\n    @abc.abstractmethod\n    def m(self):\n        pass\n",
+        1, true, false
+    )]
+    #[case::abstractclassmethod(
+        "class A:\n    @abstractclassmethod\n    def m(cls):\n        pass\n",
+        1, true, false
+    )]
+    #[case::dataclass_bare(
+        "@dataclass\nclass A:\n    x: int = 0\n",
+        0, false, true
+    )]
+    #[case::dataclass_dotted(
+        "@dataclasses.dataclass\nclass A:\n    x: int = 0\n",
+        0, false, true
+    )]
+    // is_dataclass must be false on methods even if somehow decorated —
+    // gating on CardKind::Class.
+    #[case::dataclass_on_method_ignored(
+        "class A:\n    @dataclass\n    def m(self):\n        pass\n",
+        1, false, false
+    )]
+    fn abstract_and_dataclass_flags(
+        #[case] src: &str,
+        #[case] card_idx: usize,
+        #[case] expect_abstract: bool,
+        #[case] expect_dataclass: bool,
+    ) {
+        let cards = extract(src);
+        let c = &cards[card_idx];
+        assert_eq!(c.is_abstract(), expect_abstract, "is_abstract()");
+        assert_eq!(c.is_dataclass(), expect_dataclass, "is_dataclass()");
     }
 
     /// Parent/child links: methods of a class have that class as parent.
