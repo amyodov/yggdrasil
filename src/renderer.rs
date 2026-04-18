@@ -686,7 +686,13 @@ fn collect_text_areas<'a>(
             bottom: (local_y + rect.total_h()).min(plate_h) as i32,
         };
 
-        let opacity = if card.visibility == Visibility::Private { 0.8 } else { 1.0 };
+        let visibility_dim = if card.visibility == Visibility::Private { 0.8 } else { 1.0 };
+        // Rect opacity carries the nested-fold cascade — when a class folds,
+        // descendant text dims in lockstep with its shapes.
+        let opacity = visibility_dim * rect.opacity;
+        if opacity < 0.01 {
+            continue;
+        }
         let r = (220.0 * opacity) as u8;
         let g = (222.0 * opacity) as u8;
         let b = (230.0 * opacity) as u8;
@@ -746,8 +752,15 @@ fn push_card_shapes(
     local_y: f32,
     state: &AppState,
 ) {
+    // If this card has been almost-fully collapsed by a parent's nested-fold
+    // cascade, skip drawing it. Saves instance buffer space and avoids the
+    // last-pixel shimmer of rects with < 1px dimensions.
+    if rect.opacity < 0.01 {
+        return;
+    }
     let sf = state.scale_factor;
     let corner = CARD_CORNER_RADIUS_PT * sf;
+    let alpha = rect.opacity;
 
     // ---- Drop shadow (BEFORE the card so it renders behind) ----
     // Private cards get a fainter, shorter shadow — they sit lower.
@@ -759,7 +772,7 @@ fn push_card_shapes(
     let shadow_offset = CARD_SHADOW_OFFSET_PT * sf * shadow_scale;
     let shadow_blur = CARD_SHADOW_BLUR_PT * sf * shadow_scale;
     let mut shadow_color = CARD_SHADOW_COLOR;
-    shadow_color[3] *= shadow_scale;
+    shadow_color[3] *= shadow_scale * alpha;
     out.push(RectInstance::glowing(
         rect.x + shadow_offset,
         local_y + shadow_offset,
@@ -772,10 +785,11 @@ fn push_card_shapes(
     ));
 
     // ---- Card background (solid, no outer glow — cards don't emit). ----
-    let bg = match card.kind {
+    let mut bg = match card.kind {
         CardKind::Class => CLASS_BG,
         _ => CARD_BG,
     };
+    bg[3] *= alpha;
     out.push(RectInstance::solid(
         rect.x,
         local_y,
@@ -786,7 +800,7 @@ fn push_card_shapes(
     ));
 
     // ---- Left-side accent strip ----
-    let (accent_color, accent_width_pt) = match (card.kind, card.modifier, card.visibility) {
+    let (mut accent_color, accent_width_pt) = match (card.kind, card.modifier, card.visibility) {
         (CardKind::Class, _, _) => (SPINE_COLOR, SPINE_WIDTH_PT),
         (CardKind::Snippet, _, _) => (ACCENT_SNIPPET, ACCENT_WIDTH_PT_PRIVATE),
         (_, MethodModifier::Classmethod, _) => (ACCENT_CLASSMETHOD, ACCENT_WIDTH_PT),
@@ -795,6 +809,7 @@ fn push_card_shapes(
         (_, _, Visibility::Private) => (ACCENT_PRIVATE, ACCENT_WIDTH_PT_PRIVATE),
         (_, _, Visibility::Public) => (ACCENT_PUBLIC, ACCENT_WIDTH_PT),
     };
+    accent_color[3] *= alpha;
     out.push(RectInstance::solid(
         rect.x + 2.0 * sf,
         local_y + 3.0 * sf,
@@ -806,14 +821,18 @@ fn push_card_shapes(
 
     // ---- Class spine (armature): a glowing rail on the left edge. ----
     if card.kind == CardKind::Class {
+        let mut spine_color = SPINE_COLOR;
+        let mut spine_glow = SPINE_GLOW;
+        spine_color[3] *= alpha;
+        spine_glow[3] *= alpha;
         out.push(RectInstance::glowing(
             rect.x,
             local_y + 4.0 * sf,
             SPINE_WIDTH_PT * sf,
             rect.total_h() - 8.0 * sf,
-            SPINE_COLOR,
+            spine_color,
             SPINE_WIDTH_PT * sf * 0.5,
-            SPINE_GLOW,
+            spine_glow,
             SPINE_GLOW_RADIUS_PT * sf,
         ));
     }
@@ -822,7 +841,8 @@ fn push_card_shapes(
     //      Skipped for snippets (they have no collapsible body). ----
     if card.kind != CardKind::Snippet {
         let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
-        let handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
+        let mut handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
+        handle_color[3] *= alpha;
         let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
         let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
         let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
@@ -840,14 +860,18 @@ fn push_card_shapes(
     let progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
     if progress > 0.02 && progress < 0.98 && rect.body_h > 0.5 {
         let edge_y = local_y + rect.header_h + rect.body_h - ROLL_EDGE_THICKNESS_PT * sf;
+        let mut edge_color = ROLL_EDGE_COLOR;
+        let mut edge_glow = ROLL_EDGE_GLOW;
+        edge_color[3] *= alpha;
+        edge_glow[3] *= alpha;
         out.push(RectInstance::glowing(
             rect.x + 4.0 * sf,
             edge_y,
             rect.width - 8.0 * sf,
             ROLL_EDGE_THICKNESS_PT * sf,
-            ROLL_EDGE_COLOR,
+            edge_color,
             0.0,
-            ROLL_EDGE_GLOW,
+            edge_glow,
             4.0 * sf,
         ));
     }

@@ -301,6 +301,11 @@ pub struct CardRect {
     /// Current body height (full * fold_progress for leaf cards; sum of
     /// children's effective heights for class cards).
     pub body_h: f32,
+    /// Rendering opacity 0..1. Used by the nested-fold cascade: when a class
+    /// folds, descendant cards' opacity is multiplied by the class's fold
+    /// progress so they fade in/out in lockstep with the parent. Leaf cards
+    /// at identity state have opacity = 1.0.
+    pub opacity: f32,
 }
 
 impl CardRect {
@@ -398,7 +403,7 @@ fn layout_subtree(
     // to; body_h is filled in after we know our children's total.
     rects.insert(
         card.id,
-        CardRect { x, y, width, header_h, body_h: 0.0 },
+        CardRect { x, y, width, header_h, body_h: 0.0, opacity: 1.0 },
     );
 
     let body_full_h = match card.kind {
@@ -429,7 +434,57 @@ fn layout_subtree(
         r.body_h = body_h;
     }
 
+    // Nested fold cascade (M3.4): when this class is partially folded
+    // (progress < 1), shrink every descendant toward the class's body top.
+    // Positions, heights, and opacities all multiply by the same `progress`
+    // factor — so child cards ride the fold animation in lockstep with
+    // the class's shrinking body, rather than hovering at their unfolded
+    // positions while only the class border collapses.
+    //
+    // Applied per-class level. Nested classes compound: a method inside an
+    // inner class inside an outer class gets scaled by inner_progress at
+    // the inner level, then by outer_progress at the outer level. The math
+    // is multiplicative and the visible result is coherent.
+    if matches!(card.kind, CardKind::Class) && progress < 0.999 {
+        let pivot_y = y + header_h;
+        if let Some(kids) = children_of.get(&Some(card.id)) {
+            let roots: Vec<CardId> = kids.iter().map(|&k| cards[k].id).collect();
+            scale_subtree(&roots, children_of, cards, rects, pivot_y, progress);
+        }
+    }
+
     header_h + body_h
+}
+
+/// Walk the subtree rooted at each of `roots` (inclusive) and scale every
+/// descendant's position, header/body height, and opacity by `scale`.
+/// Positions scale relative to `pivot_y` (typically the class's body top).
+///
+/// Card lookup by id is linear but the overall work is bounded by the
+/// number of descendants of a folding class, which is small in practice.
+fn scale_subtree(
+    roots: &[CardId],
+    children_of: &HashMap<Option<CardId>, Vec<usize>>,
+    cards: &[Card],
+    rects: &mut HashMap<CardId, CardRect>,
+    pivot_y: f32,
+    scale: f32,
+) {
+    let mut stack: Vec<CardId> = roots.to_vec();
+    while let Some(id) = stack.pop() {
+        if let Some(r) = rects.get_mut(&id) {
+            let dy = r.y - pivot_y;
+            r.y = pivot_y + dy * scale;
+            r.header_h *= scale;
+            r.body_h *= scale;
+            r.opacity *= scale;
+        }
+        if let Some(child_indices) = children_of.get(&Some(id)) {
+            for &ci in child_indices {
+                stack.push(cards[ci].id);
+            }
+        }
+    }
 }
 
 /// Height of a card's header area — the lines that stay visible when the
