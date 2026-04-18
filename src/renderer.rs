@@ -152,16 +152,19 @@ const FOLD_LENS_SHADOW_OFFSET_X_PT: f32 = 0.5;
 const FOLD_LENS_SHADOW_OFFSET_Y_PT: f32 = 1.5;
 const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
 
-/// Lens specular highlight — a tiny bright spot in the upper-left quadrant
-/// of the disc. One of the single strongest "this is glass" cues, barely
-/// costs anything (one small rect). Ships with a fixed position today; will
-/// move with SkyLight once that state lands.
-const FOLD_LENS_SPECULAR_COLOR: [f32; 4] = [0.95, 0.97, 1.00, 0.70];
+/// Lens specular highlight — a tiny bright spot on the glass, positioned
+/// by the current `SkyLight` direction (the unseen star's reflection on
+/// the lens surface). Tinted by `SkyLight.color` so the glint borrows the
+/// sky's color temperature. One of the strongest "this is glass" cues.
+const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [0.95, 0.97, 1.00, 0.75];
 const FOLD_LENS_SPECULAR_SIZE_PT: f32 = 4.5;
-/// Specular offset from disc center, as a fraction of the disc radius.
-/// (-0.35, -0.35) puts the highlight in the upper-left — consistent with
-/// the plate's implicit above-left light direction.
-const FOLD_LENS_SPECULAR_OFFSET: [f32; 2] = [-0.35, -0.35];
+/// Fraction of disc radius the specular can offset toward.
+/// Keeps the highlight clearly inside the disc rather than on the rim.
+const FOLD_LENS_SPECULAR_OFFSET_SCALE: f32 = 0.55;
+/// Blend weight of SkyLight.color into the specular highlight color.
+/// 0.0 = pure white highlight; 1.0 = pure sky-colored. 0.35 reads as
+/// "warm/cool-tinted glass glint" without losing the bright-glass quality.
+const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.35;
 
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
@@ -1138,20 +1141,27 @@ fn push_card_shapes(
         let lens_slot_pos = card_well_position(card, fold_progress);
         let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
 
-        // ---- Lens glass: drop shadow + disc + specular. Drawn in the
-        //      shape pass, before icons. The disc's fill is opaque so
-        //      anything rendered in the shape pass underneath it is
-        //      hidden; the magnified icon sits on top in the icon pass
-        //      and reads as "seen through glass." ----
+        // ---- Lens glass: drop shadow + disc + sky-driven specular.
+        //      Drawn in the shape pass, before icons. The disc's fill is
+        //      opaque so anything rendered in the shape pass underneath
+        //      it is hidden; the magnified icon sits on top in the icon
+        //      pass and reads as "seen through glass."
+        //
+        //      The specular highlight's position follows SkyLight.direction
+        //      (unseen star → reflection point on lens surface), its color
+        //      borrows SkyLight.color, and its brightness scales with
+        //      SkyLight.intensity — so over the ~9-min sky cycle the
+        //      glint drifts around the lens and warms/cools in lockstep
+        //      with the rest of the environment. ----
         if !USE_DENT_METAPHOR {
+            let sky = state.sky_light();
+
             let lens_disc_size = FOLD_LENS_DISC_SIZE_PT * sf;
             let lens_disc_x = lens_x - lens_disc_size * 0.5;
             let lens_disc_y = widget_y + (widget_height - lens_disc_size) * 0.5;
             let lens_corner = lens_disc_size * 0.5; // perfect circle
 
-            // Drop shadow: transparent fill with a dark glow halo — the
-            // glow appears around the offset disc, giving the lens a
-            // subtle shadow on the widget below.
+            // Drop shadow: transparent fill with a dark glow halo.
             let mut lens_shadow_color = FOLD_LENS_SHADOW_COLOR;
             lens_shadow_color[3] *= alpha;
             out.push(RectInstance::glowing(
@@ -1159,16 +1169,21 @@ fn push_card_shapes(
                 lens_disc_y + FOLD_LENS_SHADOW_OFFSET_Y_PT * sf,
                 lens_disc_size,
                 lens_disc_size,
-                [0.0, 0.0, 0.0, 0.0], // transparent fill — only the glow renders
+                [0.0, 0.0, 0.0, 0.0],
                 lens_corner,
                 lens_shadow_color,
                 FOLD_LENS_SHADOW_GLOW_PT * sf,
             ));
 
-            // Disc body: glass-tint fill + positive dome shading so the
-            // center reads brighter than the rim (convex-lens lighting
-            // cue — light gathers toward the center of a real magnifier).
+            // Disc body: glass-tint fill + positive dome shading
+            // (convex-lens lighting — light gathers toward the center).
+            // Gentle intensity modulation so the glass brightens/dims
+            // with the sky without losing legibility at low intensity.
+            let disc_intensity_mod = 0.85 + 0.15 * sky.intensity;
             let mut lens_disc_color = FOLD_LENS_DISC_COLOR;
+            lens_disc_color[0] *= disc_intensity_mod;
+            lens_disc_color[1] *= disc_intensity_mod;
+            lens_disc_color[2] *= disc_intensity_mod;
             lens_disc_color[3] *= alpha;
             out.push(
                 RectInstance::solid(
@@ -1180,22 +1195,34 @@ fn push_card_shapes(
                     lens_corner,
                 )
                 .with_dome(FOLD_CHIP_DOME)
-                // No pillow on a round disc — a circle doesn't have mid-
-                // edge bulges; pillow here would look weird.
                 .with_pillow_mask([0.0, 0.0]),
             );
 
-            // Specular highlight: a tiny bright circle in the upper-left
-            // quadrant of the disc. This single rect sells "glass" harder
-            // than any other element of the lens.
+            // Specular highlight: sky-positioned, sky-tinted.
+            // Position = projection of SkyLight.direction onto the disc,
+            // scaled so the spot stays clear of the rim. Star "above"
+            // (direction.y < 0) lands the spot above center; star
+            // "above-left" lands upper-left; etc.
             let spec_size = FOLD_LENS_SPECULAR_SIZE_PT * sf;
-            let spec_cx =
-                lens_x + FOLD_LENS_SPECULAR_OFFSET[0] * lens_disc_size * 0.5;
+            let spec_half_radius = lens_disc_size * 0.5 * FOLD_LENS_SPECULAR_OFFSET_SCALE;
+            let spec_cx = lens_x + sky.direction.x * spec_half_radius;
             let spec_cy = lens_disc_y
                 + lens_disc_size * 0.5
-                + FOLD_LENS_SPECULAR_OFFSET[1] * lens_disc_size * 0.5;
-            let mut spec_color = FOLD_LENS_SPECULAR_COLOR;
-            spec_color[3] *= alpha;
+                + sky.direction.y * spec_half_radius;
+            // Color: blend base white with sky color. `mix` weight stays
+            // modest so the spot always reads as "bright" first, "tinted"
+            // second.
+            let mix = FOLD_LENS_SPECULAR_SKY_MIX;
+            let spec_color = [
+                FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
+                FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
+                FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
+                // Intensity gates the specular's visibility: a "dim star"
+                // produces a faint glint; a "peak star" produces a bright
+                // one. Wider range than the disc's modulation — the
+                // specular is where environmental liveness shows.
+                FOLD_LENS_SPECULAR_BASE[3] * alpha * (0.35 + 0.65 * sky.intensity),
+            ];
             out.push(RectInstance::solid(
                 spec_cx - spec_size * 0.5,
                 spec_cy - spec_size * 0.5,
