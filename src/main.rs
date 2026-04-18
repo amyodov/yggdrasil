@@ -11,6 +11,7 @@ mod icons;
 mod plate;
 mod renderer;
 mod shapes;
+mod sky;
 mod state;
 mod syntax;
 

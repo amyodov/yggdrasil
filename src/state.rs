@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::analyzer::SourceFile;
 use crate::cards::{Card, CardId};
+use crate::sky::SkyLight;
 use crate::syntax::TokenKind;
 
 /// Window size in physical pixels.
@@ -199,6 +200,11 @@ pub struct AppState {
     /// clicked slot immediately); we remember the pre-press target here so
     /// `cancel_press` can restore it when the user releases off-button.
     pub press: Option<ActivePress>,
+    /// Wall-clock seconds since the app started. Advances monotonically
+    /// each frame by `dt`. Sole input to `SkyLight::at_elapsed` — every
+    /// environmental-light-dependent visual derives from this scalar via
+    /// `sky_light()`.
+    pub elapsed_secs: f32,
 }
 
 impl AppState {
@@ -213,6 +219,7 @@ impl AppState {
             scale_factor: 1.0,
             cursor_pos: None,
             press: None,
+            elapsed_secs: 0.0,
         }
     }
 
@@ -285,6 +292,19 @@ impl AppState {
         if let Some(press) = self.press.take() {
             self.fold_target.insert(press.card_id, press.original_target);
         }
+    }
+
+    /// Advance the wall-clock `elapsed_secs` by `dt`. Called each frame
+    /// alongside `tick_animations`. Sole driver of `SkyLight` evolution.
+    pub fn advance_clock(&mut self, dt: f32) {
+        self.elapsed_secs += dt;
+    }
+
+    /// Current SkyLight sampled at `elapsed_secs`. Pure function of time;
+    /// consumers derive their appearance from the returned struct.
+    #[allow(dead_code)] // Wired to consumers in step 3 (lens) and step 4 (foil).
+    pub fn sky_light(&self) -> SkyLight {
+        SkyLight::at_elapsed(self.elapsed_secs)
     }
 
     /// Width of the code pane in physical pixels.

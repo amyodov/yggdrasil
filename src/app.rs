@@ -190,6 +190,10 @@ impl ApplicationHandler for App {
                 // is handled unconditionally by `about_to_wait` (the void
                 // always breathes).
                 let _ = self.state.tick_animations(dt);
+                // Advance the SkyLight clock. Every environmental-light-
+                // dependent visual (nebula tint, lens glint, foil specular,
+                // …) derives from this single scalar.
+                self.state.advance_clock(dt);
 
                 match renderer.render(&self.state) {
                     Ok(()) => {}
