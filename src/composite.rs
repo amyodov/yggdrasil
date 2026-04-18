@@ -344,11 +344,13 @@ fn linen_weave(p_px: vec2<f32>) -> f32 {
     let h_wave = abs(sin(h_phase));
     let v_wave = abs(sin(v_phase));
 
-    // Wide, soft thread edges: thread alpha ramps gradually across the
-    // cycle. The result reads as a soft rhythmic texture rather than a
-    // high-contrast grid.
-    let thread_edge_inner = 0.15;
-    let thread_edge_outer = 0.80;
+    // Thread dominates; holes are pin-prick sparse. Thresholds picked so
+    // each axis is "gap" only for ~14% of its phase and both-axes-gap (a
+    // true weave hole) lands at ~2% of surface — matches real linen,
+    // where the fabric is almost continuous material with tiny holes at
+    // warp/weft intersections.
+    let thread_edge_inner = 0.92;
+    let thread_edge_outer = 0.99;
     let h = smoothstep(thread_edge_outer, thread_edge_inner, h_wave);
     let v = smoothstep(thread_edge_outer, thread_edge_inner, v_wave);
 
