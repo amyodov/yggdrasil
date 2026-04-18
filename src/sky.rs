@@ -73,55 +73,78 @@ struct SkyMood {
     intensity: f32,
 }
 
-/// Six moods, chosen to span the luminous-void palette without any two
-/// adjacent entries mudding through gray. Sequence matters: adjacent
-/// pairs are the ones the sky interpolates between, so we alternate
-/// warm/cool/magenta/etc. rather than clustering similar moods.
+/// Life-cycle sky: the unseen star traces the sun's arc. Eight moods
+/// spanning one day — night → pre-dawn → dawn → morning → noon →
+/// afternoon → evening → dusk → (back to night). Direction.x swings
+/// east-to-west across the cycle; direction.y dips under the horizon
+/// at night so consumers can detect "below horizon" and hide their
+/// specular highlights. Colors warm dramatically at dawn/dusk (classic
+/// red-orange), cool in daylight, go deep-blue at night.
+///
+/// Sequence order matters: adjacent pairs are the ones we interpolate
+/// between, so a smooth day cycle walks through them in time order.
 #[allow(dead_code)]
 const SKY_MOODS: &[SkyMood] = &[
     SkyMood {
-        name: "warm-nebula",
-        direction: Vec3::new(-0.30, -0.80, 0.52),
-        color: Vec3::new(1.00, 0.82, 0.60),
-        intensity: 0.90,
+        name: "deep-night",
+        direction: Vec3::new(0.00, 0.55, -0.84), // below horizon, behind
+        color: Vec3::new(0.30, 0.38, 0.62), // deep cool blue
+        intensity: 0.04,
     },
     SkyMood {
-        name: "cold-void",
-        direction: Vec3::new(0.35, -0.85, 0.40),
-        color: Vec3::new(0.52, 0.64, 0.85),
-        intensity: 0.55,
+        name: "pre-dawn",
+        direction: Vec3::new(0.55, 0.15, -0.82), // east, still below
+        color: Vec3::new(0.55, 0.45, 0.65), // muted violet
+        intensity: 0.12,
     },
     SkyMood {
-        name: "magenta-aurora",
-        direction: Vec3::new(-0.55, -0.60, 0.58),
-        color: Vec3::new(0.92, 0.52, 0.85),
+        name: "morning-dawn",
+        direction: Vec3::new(0.82, -0.15, 0.55), // low east, just risen
+        color: Vec3::new(0.95, 0.55, 0.35), // warm red-orange
+        intensity: 0.45,
+    },
+    SkyMood {
+        name: "morning-light",
+        direction: Vec3::new(0.55, -0.62, 0.56), // east, climbing
+        color: Vec3::new(0.95, 0.85, 0.66), // warm yellow
+        intensity: 0.80,
+    },
+    SkyMood {
+        name: "noon",
+        direction: Vec3::new(0.00, -0.96, 0.28), // overhead
+        color: Vec3::new(0.93, 0.92, 0.86), // warm white, not 1.0
+        intensity: 0.95,
+    },
+    SkyMood {
+        name: "afternoon",
+        direction: Vec3::new(-0.55, -0.62, 0.56), // west, descending
+        color: Vec3::new(0.95, 0.82, 0.62), // amber
         intensity: 0.75,
     },
     SkyMood {
-        name: "rose-dust",
-        direction: Vec3::new(0.20, -0.90, 0.38),
-        color: Vec3::new(0.88, 0.62, 0.60),
-        intensity: 0.82,
+        name: "evening-dawn",
+        direction: Vec3::new(-0.82, -0.15, 0.55), // low west
+        color: Vec3::new(0.92, 0.45, 0.28), // deep warm red
+        intensity: 0.40,
     },
     SkyMood {
-        name: "deep-blue-stillness",
-        direction: Vec3::new(0.00, -0.65, 0.76),
-        color: Vec3::new(0.48, 0.66, 0.95),
-        intensity: 0.48,
-    },
-    SkyMood {
-        name: "green-aurora",
-        direction: Vec3::new(-0.42, -0.75, 0.51),
-        color: Vec3::new(0.55, 0.92, 0.70),
-        intensity: 0.70,
+        name: "dusk",
+        direction: Vec3::new(-0.55, 0.15, -0.82), // west, sinking below
+        color: Vec3::new(0.48, 0.35, 0.52), // violet-grey
+        intensity: 0.10,
     },
 ];
 
-/// Seconds to cross between two adjacent moods. 90s × 6 moods ≈ 9 min
-/// full cycle — matches `project_motion_diapason.md`: slow period +
-/// wide hue range.
+/// Seconds to cross between two adjacent moods.
+///
+/// **Debug value:** 15s × 8 moods = 2 min full day cycle — fast enough
+/// to see the cycle visibly during a single sitting. The motion-
+/// diapason target (10–15 min cycle) lands when we set this back to
+/// ~90–110s for release. Keeping it fast during debug so mood
+/// transitions, glints, and dawn colors can be verified without
+/// waiting.
 #[allow(dead_code)]
-const MOOD_TRANSITION_SECS: f32 = 90.0;
+const MOOD_TRANSITION_SECS: f32 = 15.0;
 
 /// The shared stellar-illumination state.
 ///

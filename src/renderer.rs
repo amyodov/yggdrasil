@@ -107,16 +107,20 @@ const ACCENT_SNIPPET: [f32; 4] = [0.52, 0.58, 0.68, 0.85];
 /// this is the Zone-3 semantic light the spine is permitted;
 /// (3) a **glint** — a small bright spot that drifts along the spine as
 /// the SkyLight direction changes and picks up the sky's color.
-const SPINE_FOIL_COLOR: [f32; 4] = [0.58, 0.42, 0.20, 1.00]; // burnished brass
-const SPINE_SEAM_COLOR: [f32; 4] = [1.00, 0.90, 0.60, 0.95]; // hot warm seam
-const SPINE_SEAM_GLOW: [f32; 4] = [0.95, 0.75, 0.35, 0.55]; // warm halo from the seam
+///
+/// None of these ever hit pure 0/255 — the palette stays gray-leaning
+/// so brightest spots read as "lighter than everything else around"
+/// rather than hard dots punched through the UI.
+const SPINE_FOIL_COLOR: [f32; 4] = [0.55, 0.40, 0.20, 1.00]; // burnished brass
+const SPINE_SEAM_COLOR: [f32; 4] = [0.88, 0.78, 0.54, 0.95]; // warm seam, not pure white
+const SPINE_SEAM_GLOW: [f32; 4] = [0.82, 0.64, 0.30, 0.50]; // warm halo from the seam
 const SPINE_SEAM_WIDTH_PT: f32 = 1.0;
 const SPINE_SEAM_GLOW_RADIUS_PT: f32 = 4.0;
 /// Foil glint — the SkyLight-driven specular spot riding on the spine.
-/// Base color blends with SkyLight.color (60% sky / 40% base); much more
-/// sky-dominant than the lens specular because metal reflection takes
-/// more of the environment color than glass does.
-const SPINE_GLINT_BASE: [f32; 4] = [1.00, 0.95, 0.82, 0.95];
+/// Base color blends with SkyLight.color; much more sky-dominant than
+/// the lens specular because metal reflection takes more of the
+/// environment color than glass does.
+const SPINE_GLINT_BASE: [f32; 4] = [0.88, 0.84, 0.74, 0.90];
 const SPINE_GLINT_SIZE_PT: f32 = 4.0;
 const SPINE_GLINT_SKY_MIX: f32 = 0.55;
 
@@ -163,9 +167,10 @@ const FOLD_LENS_DISC_SIZE_PT: f32 = 30.0;
 /// Fully opaque so it covers the small icon in the slot it overlays.
 const FOLD_LENS_DISC_COLOR: [f32; 4] = [0.34, 0.40, 0.50, 1.0];
 
-/// Lens drop shadow — dark glow, slightly offset, creating the "floating
-/// above the widget" cue. Offset is small; the lens doesn't hover high.
-const FOLD_LENS_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.35];
+/// Lens drop shadow — dark-gray glow (not pure black), slightly offset,
+/// creating the "floating above the widget" cue. Offset is small; the
+/// lens doesn't hover high.
+const FOLD_LENS_SHADOW_COLOR: [f32; 4] = [0.04, 0.05, 0.08, 0.35];
 const FOLD_LENS_SHADOW_OFFSET_X_PT: f32 = 0.5;
 const FOLD_LENS_SHADOW_OFFSET_Y_PT: f32 = 1.5;
 const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
@@ -173,16 +178,21 @@ const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
 /// Lens specular highlight — a tiny bright spot on the glass, positioned
 /// by the current `SkyLight` direction (the unseen star's reflection on
 /// the lens surface). Tinted by `SkyLight.color` so the glint borrows the
-/// sky's color temperature. One of the strongest "this is glass" cues.
-const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [0.95, 0.97, 1.00, 0.75];
+/// sky's color temperature. Deliberately not pure white so the spot reads
+/// as "a bit lighter than the disc" rather than a white pixel-hole.
+const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [0.82, 0.85, 0.90, 0.75];
 const FOLD_LENS_SPECULAR_SIZE_PT: f32 = 4.5;
-/// Fraction of disc radius the specular can offset toward.
-/// Keeps the highlight clearly inside the disc rather than on the rim.
-const FOLD_LENS_SPECULAR_OFFSET_SCALE: f32 = 0.55;
+/// Radius at which the specular sits on the disc, as a fraction of the
+/// disc radius. 0.80 puts it near the rim — the highlight visibly traces
+/// a circle as the sky's direction rotates (sun arcing across the sky →
+/// glint arcing around the lens edge).
+const FOLD_LENS_SPECULAR_RIM_RADIUS: f32 = 0.80;
 /// Blend weight of SkyLight.color into the specular highlight color.
-/// 0.0 = pure white highlight; 1.0 = pure sky-colored. 0.35 reads as
-/// "warm/cool-tinted glass glint" without losing the bright-glass quality.
 const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.35;
+/// Intensity threshold below which the specular disappears entirely.
+/// Matches "night" moods (intensity ~0.04–0.12) so the sun's reflection
+/// vanishes when the star is below the horizon.
+const FOLD_LENS_SPECULAR_NIGHT_THRESHOLD: f32 = 0.15;
 
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
@@ -996,29 +1006,32 @@ fn push_card_shapes(
         // (3) Glint — sky-positioned specular on the metal. Vertical
         //     position on the spine maps from SkyLight.direction.y
         //     ([-1 = top, +1 = bottom] in our convention → clamped to
-        //     the spine's visible range). Color blends 55% sky into a
-        //     bright base so the glint picks up warmth / coolness from
-        //     whatever mood the sky is in. Alpha scales with intensity
-        //     so dim skies produce faint glints and peak skies shine.
-        let glint_size = SPINE_GLINT_SIZE_PT * sf;
-        let glint_pos_fraction = ((sky.direction.y + 1.0) * 0.5).clamp(0.0, 1.0);
-        let glint_cy = spine_top + spine_height * glint_pos_fraction;
-        let glint_cx = spine_left + spine_width * 0.5;
-        let mix = SPINE_GLINT_SKY_MIX;
-        let glint_color = [
-            SPINE_GLINT_BASE[0] * (1.0 - mix) + sky.color.x * mix,
-            SPINE_GLINT_BASE[1] * (1.0 - mix) + sky.color.y * mix,
-            SPINE_GLINT_BASE[2] * (1.0 - mix) + sky.color.z * mix,
-            SPINE_GLINT_BASE[3] * alpha * (0.3 + 0.7 * sky.intensity),
-        ];
-        out.push(RectInstance::solid(
-            glint_cx - glint_size * 0.5,
-            glint_cy - glint_size * 0.5,
-            glint_size,
-            glint_size,
-            glint_color,
-            glint_size * 0.5,
-        ));
+        //     the spine's visible range). Hidden during night (star
+        //     below horizon): the metal can't glint without light.
+        let glint_intensity = ((sky.intensity - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
+            / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
+            .clamp(0.0, 1.0);
+        if glint_intensity > 0.001 {
+            let glint_size = SPINE_GLINT_SIZE_PT * sf;
+            let glint_pos_fraction = ((sky.direction.y + 1.0) * 0.5).clamp(0.0, 1.0);
+            let glint_cy = spine_top + spine_height * glint_pos_fraction;
+            let glint_cx = spine_left + spine_width * 0.5;
+            let mix = SPINE_GLINT_SKY_MIX;
+            let glint_color = [
+                SPINE_GLINT_BASE[0] * (1.0 - mix) + sky.color.x * mix,
+                SPINE_GLINT_BASE[1] * (1.0 - mix) + sky.color.y * mix,
+                SPINE_GLINT_BASE[2] * (1.0 - mix) + sky.color.z * mix,
+                SPINE_GLINT_BASE[3] * alpha * glint_intensity,
+            ];
+            out.push(RectInstance::solid(
+                glint_cx - glint_size * 0.5,
+                glint_cy - glint_size * 0.5,
+                glint_size,
+                glint_size,
+                glint_color,
+                glint_size * 0.5,
+            ));
+        }
     }
 
     // ---- Fold-switch widget — one wide chip whose corners and left/right
@@ -1270,39 +1283,43 @@ fn push_card_shapes(
                 .with_pillow_mask([0.0, 0.0]),
             );
 
-            // Specular highlight: sky-positioned, sky-tinted.
-            // Position = projection of SkyLight.direction onto the disc,
-            // scaled so the spot stays clear of the rim. Star "above"
-            // (direction.y < 0) lands the spot above center; star
-            // "above-left" lands upper-left; etc.
-            let spec_size = FOLD_LENS_SPECULAR_SIZE_PT * sf;
-            let spec_half_radius = lens_disc_size * 0.5 * FOLD_LENS_SPECULAR_OFFSET_SCALE;
-            let spec_cx = lens_x + sky.direction.x * spec_half_radius;
-            let spec_cy = lens_disc_y
-                + lens_disc_size * 0.5
-                + sky.direction.y * spec_half_radius;
-            // Color: blend base white with sky color. `mix` weight stays
-            // modest so the spot always reads as "bright" first, "tinted"
-            // second.
-            let mix = FOLD_LENS_SPECULAR_SKY_MIX;
-            let spec_color = [
-                FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
-                FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
-                FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
-                // Intensity gates the specular's visibility: a "dim star"
-                // produces a faint glint; a "peak star" produces a bright
-                // one. Wider range than the disc's modulation — the
-                // specular is where environmental liveness shows.
-                FOLD_LENS_SPECULAR_BASE[3] * alpha * (0.35 + 0.65 * sky.intensity),
-            ];
-            out.push(RectInstance::solid(
-                spec_cx - spec_size * 0.5,
-                spec_cy - spec_size * 0.5,
-                spec_size,
-                spec_size,
-                spec_color,
-                spec_size * 0.5,
-            ));
+            // Specular highlight: sky-positioned, sky-tinted, hidden at
+            // night. Position is atan2-based — we take the angle of
+            // SkyLight.direction's xy-projection and place the spot on a
+            // fixed-radius circle near the disc rim, so the spot traces
+            // a circular arc around the lens as the sun rotates (morning
+            // spot on the right, noon on top, evening on the left).
+            // Hidden when intensity is below the night threshold —
+            // classic "sun below horizon, no glint" behavior.
+            let spec_intensity = ((sky.intensity - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
+                / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
+                .clamp(0.0, 1.0);
+            if spec_intensity > 0.001 {
+                let spec_size = FOLD_LENS_SPECULAR_SIZE_PT * sf;
+                let spec_rim = lens_disc_size * 0.5 * FOLD_LENS_SPECULAR_RIM_RADIUS;
+                // angle in sky's xy-plane; |dir.xy| may be small but angle
+                // remains well-defined except at the pole (dir.xy == 0),
+                // where atan2 returns 0 — fine for our purposes.
+                let angle = sky.direction.y.atan2(sky.direction.x);
+                let spec_cx = lens_x + angle.cos() * spec_rim;
+                let spec_cy =
+                    lens_disc_y + lens_disc_size * 0.5 + angle.sin() * spec_rim;
+                let mix = FOLD_LENS_SPECULAR_SKY_MIX;
+                let spec_color = [
+                    FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
+                    FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
+                    FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
+                    FOLD_LENS_SPECULAR_BASE[3] * alpha * spec_intensity,
+                ];
+                out.push(RectInstance::solid(
+                    spec_cx - spec_size * 0.5,
+                    spec_cy - spec_size * 0.5,
+                    spec_size,
+                    spec_size,
+                    spec_color,
+                    spec_size * 0.5,
+                ));
+            }
         }
 
         // ---- Small icons at every slot except the one the lens is
