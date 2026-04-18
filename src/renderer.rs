@@ -967,12 +967,17 @@ fn push_card_shapes(
         let mut body_color = FOLD_CHIP_BG;
         body_color[3] *= alpha;
 
-        // Bulge amount used inside the shape shader for pillow caps
-        // (`min(half_w, half_h) * 0.12`). We duplicate the calc here so
-        // the plateau's vertical extension matches the cap's peak exactly,
-        // guaranteeing a seamless join at the slot-center transition.
+        // Pillow peak extent: the cap's actual SDF silhouette reaches
+        // `bulge / (1 - bulge/h)` past the un-pillowed rect, not just raw
+        // `bulge`. That's because outside the rect `mid_weight` grows past
+        // 1 (norm.y > 1 above the top edge), extending the silhouette
+        // further. For our bulge/h = 0.12, the factor is `1/0.88`. Using
+        // the true peak extent here lets the plateau sit exactly at the
+        // cap's silhouette top — otherwise the cap's pillow peaks poke
+        // out above the plateau as two visible humps.
         let cap_half = chip_size * 0.5;
-        let bulge_max = cap_half * 0.12;
+        let bulge_raw = cap_half * 0.12;
+        let peak_extent = bulge_raw / 0.88;
 
         let slot_center_x =
             |slot: usize| -> f32 { widget_x + slot_stride * (slot as f32 + 0.5) };
@@ -1007,17 +1012,17 @@ fn push_card_shapes(
         }
 
         // Plateau: flat rectangle from first slot center to last slot
-        // center, extended vertically by bulge_max so its top/bottom align
-        // with the caps' pillow peaks. Sharp corners (they're hidden
-        // underneath the caps' rounded corners at the join).
+        // center, extended vertically by `peak_extent` so its top/bottom
+        // align with the caps' true pillow-peak silhouette. Sharp corners
+        // (they're hidden underneath the caps' rounded corners at the join).
         if slot_count >= 2 {
             let first_cx = slot_center_x(0);
             let last_cx = slot_center_x(slot_count - 1);
             out.push(RectInstance::solid(
                 first_cx,
-                widget_y - bulge_max,
+                widget_y - peak_extent,
                 last_cx - first_cx,
-                widget_height + 2.0 * bulge_max,
+                widget_height + 2.0 * peak_extent,
                 body_color,
                 0.0,
             ));

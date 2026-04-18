@@ -380,11 +380,16 @@ fn corner_for(vi: u32) -> vec2<f32> {
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     // Expand the quad by glow_radius on each side so the halo fits. Also
-    // add a small pad when the pillow is active on either axis, so the
-    // outward mid-edge bulge doesn't clip the quad.
+    // pad for the pillow peak extent when pillow is active: outside the
+    // rect `mid_weight` in sdf_pillow_box grows past 1 (norm.y > 1 above
+    // the top edge), so the silhouette peak sits at `bulge / (1 - bulge/h)`
+    // — further out than the raw `bulge` constant. For our bulge/h = 0.12
+    // that's `bulge / 0.88 ≈ 1.136 × bulge`. Add a 1-px margin for AA.
     let g = inst.glow_radius;
     let pillow_on = (inst.pillow_mask.x > 0.001) || (inst.pillow_mask.y > 0.001);
-    let dome_pad = select(0.0, 2.0, pillow_on);
+    let bulge_mag = min(inst.size.x, inst.size.y) * 0.06; // same as fs_main's min(h, 1) * 0.12
+    let peak_extent = bulge_mag / 0.88;
+    let dome_pad = select(0.0, peak_extent + 1.0, pillow_on);
     let pad = g + dome_pad;
     let expanded_pos  = inst.pos  - vec2<f32>(pad, pad);
     let expanded_size = inst.size + vec2<f32>(pad * 2.0, pad * 2.0);
