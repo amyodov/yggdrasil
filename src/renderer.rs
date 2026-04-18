@@ -57,8 +57,10 @@ use crate::cards::{
     Visibility,
 };
 use crate::composite::CompositeRenderer;
+use crate::icon_pipeline::{IconInstance, IconRenderer};
+use crate::icons::IconId;
 use crate::plate::Plate;
-use crate::shapes::{icon_kind, RectInstance, ShapeRenderer};
+use crate::shapes::{RectInstance, ShapeRenderer};
 use crate::state::{AppState, HighlightedSource, WindowSize};
 use crate::syntax::TokenKind;
 
@@ -100,7 +102,10 @@ const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
 
 /// Fold handle chevron icon tint (M3.2). Single colour; direction comes
 /// from the chevron orientation, not a palette flip.
-const FOLD_HANDLE_ICON: [f32; 4] = [0.72, 0.80, 0.92, 0.85];
+const FOLD_HANDLE_ICON: [f32; 4] = [0.78, 0.86, 0.96, 0.95];
+/// Fold handle "chip" background — a subtle rounded tint behind the icon
+/// so the fold control reads as a clickable button, not a floating glyph.
+const FOLD_CHIP_BG: [f32; 4] = [0.20, 0.24, 0.32, 0.55];
 
 /// Rolling edge shown along the body's bottom during a fold animation.
 const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
@@ -182,6 +187,7 @@ pub struct Renderer {
     // Shapes + background pipelines.
     shape_renderer: ShapeRenderer,
     background_renderer: BackgroundRenderer,
+    icon_renderer: IconRenderer,
     /// Reference instant used to compute the time uniform fed into the
     /// background shader for the breathing animation.
     start_time: Instant,
@@ -292,6 +298,7 @@ impl Renderer {
         let shape_renderer = ShapeRenderer::new(&device, format);
         let background_renderer = BackgroundRenderer::new(&device, format);
         let composite = CompositeRenderer::new(&device, format);
+        let icon_renderer = IconRenderer::new(&device, &queue, format);
 
         // Code pane plate — sized from the initial window + scale factor. The
         // Renderer is built before AppState knows about the current scale, so
@@ -338,6 +345,7 @@ impl Renderer {
             surface_config,
             shape_renderer,
             background_renderer,
+            icon_renderer,
             start_time: Instant::now(),
             composite,
             code_plate,
@@ -430,12 +438,13 @@ impl Renderer {
         let layout = layout_cards(&state.cards, &state.fold_progress, metrics);
         let scene_top_local = SCENE_TOP_PAD_PT * state.scale_factor;
 
-        // ---- Build shape instances ----
+        // ---- Build shape + icon instances ----
         // All positions are plate-local (origin = plate top-left). The plate
         // background (lit material + outer bloom) is drawn by the composite
         // shader in M3.3, not as a shape instance here — so the RT starts
         // transparent and we only draw cards into it.
         let mut instances: Vec<RectInstance> = Vec::with_capacity(state.cards.len() * 5);
+        let mut icon_instances: Vec<IconInstance> = Vec::with_capacity(state.cards.len());
         let plate_h = plate_size[1] as f32;
         for card in &state.cards {
             let Some(rect) = layout.rects.get(&card.id) else { continue };
@@ -446,12 +455,21 @@ impl Renderer {
             if local_bottom < -32.0 || local_y > plate_h + 32.0 {
                 continue;
             }
-            push_card_shapes(&mut instances, card, rect, local_y, state);
+            push_card_shapes(&mut instances, &mut icon_instances, card, rect, local_y, state);
         }
 
         // Shapes' uniform viewport = plate size (we're rendering into the plate RT).
         self.shape_renderer
             .prepare(&self.device, &self.queue, &instances, (plate_size[0], plate_size[1]));
+
+        // Icons go into the plate RT on top of text, so their viewport is
+        // plate size as well.
+        self.icon_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &icon_instances,
+            (plate_size[0], plate_size[1]),
+        );
 
         // Background uniforms stay window-sized (it draws to the swap chain).
         self.background_renderer.prepare(
@@ -588,6 +606,23 @@ impl Renderer {
             if let Err(e) = self.text_renderer.render(&self.atlas, &self.viewport, &mut pass) {
                 log::warn!("glyphon render failed: {e:?}");
             }
+        }
+
+        // Pass 3b: icons → plate RT. Rendered on top of text so fold
+        // handles sit above any card glyphs underneath them.
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-plate-icon-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.code_plate.rt_view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.icon_renderer.render(&mut pass);
         }
 
         // Pass 4: composite plate → swap chain.
@@ -746,6 +781,7 @@ impl<'a> AreaSpec<'a> {
 /// All output coordinates are **plate-local**.
 fn push_card_shapes(
     out: &mut Vec<RectInstance>,
+    icons_out: &mut Vec<IconInstance>,
     card: &Card,
     rect: &CardRect,
     local_y: f32,
@@ -836,26 +872,45 @@ fn push_card_shapes(
         ));
     }
 
-    // ---- Fold handle — chevron icon (M3.2). Orientation signals the
-    //      *current* fold target: chevron-down (∨) when body will be shown,
-    //      chevron-right (>) when body will be collapsed. Colour is a single
-    //      pale tint for both states — directional meaning comes from the
-    //      glyph shape, not from a colour flip. Skipped for snippets (no
-    //      collapsible body). ----
+    // ---- Fold handle — Lucide chevron on a subtle button chip.
+    //      The chip (tinted rounded rect) reads as "clickable target"; the
+    //      chevron on top signals direction. Orientation: chevron-down (∨)
+    //      when body will be shown, chevron-right (>) when body will be
+    //      collapsed. Skipped for snippets (no collapsible body). ----
     if card.kind != CardKind::Snippet {
         let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
-        let kind = if target < 0.5 { icon_kind::CHEVRON_RIGHT } else { icon_kind::CHEVRON_DOWN };
-        let mut handle_color = FOLD_HANDLE_ICON;
-        handle_color[3] *= alpha;
+        let icon_id = if target < 0.5 { IconId::ChevronRight } else { IconId::ChevronDown };
+
         let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
         let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
         let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
-        out.push(RectInstance::icon(
+
+        // Button chip: subtle rounded-rect backing. Slightly larger than
+        // the icon so the glyph doesn't fill it edge-to-edge.
+        let chip_pad = 2.0 * sf;
+        let chip_x = handle_x - chip_pad;
+        let chip_y = handle_y - chip_pad;
+        let chip_size = handle_size + chip_pad * 2.0;
+        let mut chip_color = FOLD_CHIP_BG;
+        chip_color[3] *= alpha;
+        out.push(RectInstance::solid(
+            chip_x,
+            chip_y,
+            chip_size,
+            chip_size,
+            chip_color,
+            4.0 * sf,
+        ));
+
+        // Icon itself.
+        let mut icon_tint = FOLD_HANDLE_ICON;
+        icon_tint[3] *= alpha;
+        icons_out.push(IconInstance::new(
             handle_x,
             handle_y,
             handle_size,
-            handle_color,
-            kind,
+            icon_tint,
+            icon_id.atlas_index(),
         ));
     }
 
@@ -1122,7 +1177,8 @@ mod tests {
         let layout = layout_cards(&cards, &state.fold_progress, m);
         let class_rect = layout.rects[&cards[0].id];
         let mut out = vec![];
-        push_card_shapes(&mut out, &cards[0], &class_rect, 0.0, &state);
+        let mut icons = vec![];
+        push_card_shapes(&mut out, &mut icons, &cards[0], &class_rect, 0.0, &state);
 
         // Class card emits at least: bg, accent strip, spine, fold handle → 4 rects.
         assert!(out.len() >= 4, "class emits ≥4 shapes, got {}", out.len());

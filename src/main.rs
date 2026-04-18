@@ -6,6 +6,8 @@ mod background;
 mod cards;
 mod cli;
 mod composite;
+mod icon_pipeline;
+mod icons;
 mod plate;
 mod renderer;
 mod shapes;
