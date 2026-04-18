@@ -975,7 +975,12 @@ fn push_card_shapes(
         let mut dent_color = FOLD_CHIP_BG;
         dent_color[3] *= alpha;
 
-        // ---- Dent (1): state-well at the current fold_progress position. ----
+        // ---- Dent (1): state-well at the current fold_progress position.
+        //      Concave shading only — no pillow bulge. A dent is an interior
+        //      feature of the widget; it should share the widget's outline,
+        //      not carry its own. `with_pillow_mask([0,0])` overrides the
+        //      default `with_dome` pillow enablement (which was built for
+        //      standalone single-button chips, not interior dents). ----
         let well_slot = card_well_position(card, fold_progress);
         let well_center_x = widget_x + slot_stride * (well_slot + 0.5);
         out.push(
@@ -987,14 +992,13 @@ fn push_card_shapes(
                 dent_color,
                 dent_corner,
             )
-            // Negative dome = concave shading (center valley, top-left
-            // shadow, bottom-right rim-lit). Same visual contract as
-            // holding down a single button.
-            .with_dome(-FOLD_CHIP_DOME),
+            .with_dome(-FOLD_CHIP_DOME)
+            .with_pillow_mask([0.0, 0.0]),
         );
 
         // ---- Dent (2): finger-press at the mousedown slot, if the user
-        //      is currently pressing this card. ----
+        //      is currently pressing this card. Same "shading only, plain
+        //      rounded-rect silhouette" treatment as the state-well. ----
         if let Some(press) = state.press {
             if press.card_id == card.id {
                 if let Some(pressed_slot_idx) =
@@ -1010,7 +1014,8 @@ fn push_card_shapes(
                             dent_color,
                             dent_corner,
                         )
-                        .with_dome(-FOLD_CHIP_DOME),
+                        .with_dome(-FOLD_CHIP_DOME)
+                        .with_pillow_mask([0.0, 0.0]),
                     );
                 }
             }
