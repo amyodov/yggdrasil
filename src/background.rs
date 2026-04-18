@@ -202,6 +202,78 @@ fn fbm(p: vec2<f32>) -> f32 {
     return total;  // roughly 0..1 range
 }
 
+// ---- Star field (M3.8.1) --------------------------------------------------
+//
+// Sparse pinpoints distributed across the void on a hash-based grid. Each
+// grid cell gets zero or one star with a randomized center offset, baseline
+// brightness, and twinkle phase. Most cells are empty or very dim; a few
+// rare cells fire a nova-pulse (5–10× peak, ~1.5 s envelope) every ~30 s
+// within their own lifecycle.
+//
+// Output: scalar brightness for this pixel. The fs_main composes it onto
+// the nebula with a starlight-blue tint. Future M3.3.1 (linen): when the
+// plate renders, its weave-hole alpha gates these pinpoints so only stars
+// behind holes punch through — that's the decoupled-opacity contract. For
+// now (no plate yet at swap-chain level), stars appear everywhere.
+
+fn star_field(uv: vec2<f32>, t: f32) -> f32 {
+    // Grid density: ~90 cells wide across the viewport. Non-square cells
+    // (scaled by aspect) would distort twinkle timing, so uv is already
+    // aspect-corrected by the caller.
+    let grid = 90.0;
+    let cell_uv = uv * grid;
+    let cell = floor(cell_uv);
+    let local = fract(cell_uv);
+
+    // Most cells are empty. Keep ~30% populated — higher density means more
+    // visual noise; lower, and there are long blank stretches.
+    let presence = hash12(cell + vec2<f32>(101.7, 37.1));
+    if (presence < 0.70) {
+        return 0.0;
+    }
+
+    // Per-star center offset within the cell (keeps stars from lining up on
+    // the grid). Range [0.2, 0.8] so pinpoints sit away from cell edges.
+    let cx = hash12(cell + vec2<f32>(17.3, 42.1));
+    let cy = hash12(cell + vec2<f32>(81.9, 9.7));
+    let center = vec2<f32>(0.2 + cx * 0.6, 0.2 + cy * 0.6);
+    let d = distance(local, center);
+
+    // Gaussian falloff. Star size is a small fraction of the cell so each
+    // star is a pinpoint, not a disc.
+    let star_sigma = 0.035;
+    let glow = exp(-(d * d) / (star_sigma * star_sigma));
+
+    // Baseline brightness: most stars dim, a few moderately bright.
+    let bright_roll = hash12(cell + vec2<f32>(5.1, 23.9));
+    let baseline = 0.08 + pow(bright_roll, 3.0) * 0.22;
+
+    // Slow twinkle — per-star phase, modest amplitude. Shouldn't catch the
+    // eye on its own; it's "the stars feel alive."
+    let phase = hash12(cell + vec2<f32>(55.7, 13.2)) * 6.28318;
+    let twinkle = 0.75 + 0.25 * sin(t * 0.9 + phase);
+
+    // Nova-pulse. Rare cells (~0.5%) are potential novae. Each such cell
+    // cycles through a 32-second lifecycle with a ~1.5s active window; so
+    // across the viewport (thousands of cells, of which ~0.5% nova-capable)
+    // you see roughly one nova flash every 20–40 seconds somewhere.
+    let nova_roll = hash12(cell + vec2<f32>(211.3, 77.7));
+    var nova = 0.0;
+    if (nova_roll > 0.995) {
+        let offset = hash12(cell + vec2<f32>(3.3, 88.8)) * 32.0;
+        let cycle = 32.0;
+        let phase_t = (t + offset) - cycle * floor((t + offset) / cycle);
+        if (phase_t < 1.5) {
+            // Smooth bump centred on t = 0.75: quick rise, gentler decay.
+            let nt = phase_t / 1.5;
+            let envelope = 4.0 * nt * (1.0 - nt);
+            nova = envelope * 5.0;  // 5× baseline boost at peak
+        }
+    }
+
+    return glow * baseline * (twinkle + nova);
+}
+
 // --------------------------------------------------------------------------
 
 @fragment
@@ -289,6 +361,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                + near_color * near * 0.60
                + vec3<f32>(turb, turb, turb) * 0.25;
 
+    // ---- Star field (M3.8.1). Pinpoint starlight tinted blue-white; nova
+    // pulses inherit the same tint but spike through the cloud layers.
+    // Computed in aspect-corrected UV so stars are circular not stretched.
+    // When M3.3.1 lands, this same layer will be gated by the plate's
+    // linen-weave alpha so only stars behind holes punch through. ----
+    let star_tint = vec3<f32>(0.85, 0.92, 1.00);
+    let stars = star_field(auv, t) * star_tint;
+
     // ---- Extremely faint pixel grain breaks up uniform regions. ----
     let grain = (hash12(floor(px / 2.0)) - 0.5) * 0.006;
 
@@ -298,7 +378,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let vignette = 1.0 - smoothstep(0.30, 1.15, r) * 0.42;
 
     // ---- Compose ----
-    var color = (base + nebula) * vignette + vec3<f32>(grain, grain, grain);
+    var color = (base + nebula) * vignette
+              + stars
+              + vec3<f32>(grain, grain, grain);
     return vec4<f32>(color, 1.0);
 }
 "#;
