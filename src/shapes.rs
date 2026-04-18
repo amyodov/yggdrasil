@@ -33,11 +33,15 @@ pub struct RectInstance {
     pub corner_radius: f32,
     /// Halo falloff radius in physical pixels. 0 = no glow.
     pub glow_radius: f32,
-    /// Padding to keep the struct size a multiple of 16 bytes. Originally
-    /// `icon_kind` for the parametric-SDF icon path; that was superseded
-    /// by the texture-atlas icon pipeline (see `icon_pipeline.rs`), so
-    /// this pair is unused for now.
-    pub _pad: [f32; 2],
+    /// Dome amount (M3.2 Pass 3): 0.0 = flat; >0.0 applies a subtle
+    /// convex-lens shading to the rect's interior — lit on the top-left,
+    /// shadowed on the bottom-right, matching the plate's implicit above-
+    /// light. Makes rounded "chips" read as physical buttons without any
+    /// geometry change. Typical values around 0.5–1.0; above that is
+    /// cartoonish.
+    pub dome: f32,
+    /// Padding to keep the struct size a multiple of 16 bytes.
+    pub _pad: f32,
 }
 
 impl RectInstance {
@@ -51,8 +55,17 @@ impl RectInstance {
             glow_color: [0.0; 4],
             corner_radius,
             glow_radius: 0.0,
-            _pad: [0.0; 2],
+            dome: 0.0,
+            _pad: 0.0,
         }
+    }
+
+    /// Builder-style override: domed shading on an already-constructed rect.
+    /// `amount` 0.0 disables the effect; values around 0.6–1.0 read as a
+    /// subtle physical button.
+    pub fn with_dome(mut self, amount: f32) -> Self {
+        self.dome = amount;
+        self
     }
 
     /// Build a rectangle with an outer glow halo.
@@ -74,7 +87,8 @@ impl RectInstance {
             glow_color,
             corner_radius,
             glow_radius,
-            _pad: [0.0; 2],
+            dome: 0.0,
+            _pad: 0.0,
         }
     }
 }
@@ -178,6 +192,11 @@ impl ShapeRenderer {
                         wgpu::VertexAttribute {
                             offset: 52,
                             shader_location: 5,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 56,
+                            shader_location: 6,
                             format: wgpu::VertexFormat::Float32,
                         },
                     ],
@@ -305,6 +324,7 @@ struct Instance {
     @location(3) glow_color:    vec4<f32>,
     @location(4) corner_radius: f32,
     @location(5) glow_radius:   f32,
+    @location(6) dome:          f32,
 };
 
 struct VsOut {
@@ -315,6 +335,7 @@ struct VsOut {
     @location(3) glow_color:     vec4<f32>,
     @location(4) corner_radius:  f32,
     @location(5) glow_radius:    f32,
+    @location(6) dome:           f32,
 };
 
 fn corner_for(vi: u32) -> vec2<f32> {
@@ -354,6 +375,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.glow_color = inst.glow_color;
     out.corner_radius = inst.corner_radius;
     out.glow_radius = inst.glow_radius;
+    out.dome = inst.dome;
     return out;
 }
 
@@ -379,11 +401,45 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         glow_alpha = t * t * in.glow_color.a;
     }
 
+    // ---- Dome shading (M3.2 Pass 3) ----
+    // If this instance carries a `dome` amount, apply subtle lit/shadow
+    // modulation inside the rect so it reads as a convex button:
+    //   - Top-left of the rect: slightly brighter (facing light).
+    //   - Bottom-right:          slightly darker  (away from light).
+    //   - A small radial falloff (brightest near center, neutral at edge)
+    //     keeps the effect concentrated on the "dome" surface.
+    // All computed per pixel, no geometry change. Effect disabled entirely
+    // when `in.dome` is zero so regular shapes take zero extra cost.
+    var fill_rgb = in.color.rgb;
+    if (in.dome > 0.001) {
+        // Normalized position within the rect: [-1, 1] on each axis.
+        let np = in.rel_pos / max(in.half_size, vec2<f32>(1.0, 1.0));
+        // Diagonal from top-left (-1, -1) to bottom-right (+1, +1):
+        // dot with (1, 1)/√2 is +1 at bottom-right, -1 at top-left.
+        let diag = dot(np, vec2<f32>(0.7071, 0.7071));
+        // Brighter where diag is negative (top-left), darker where positive.
+        // Multiply by a radial falloff so the effect fades to zero at the
+        // rect corners rather than dropping off abruptly.
+        let r = length(np);
+        let falloff = 1.0 - smoothstep(0.35, 1.0, r);
+        let tilt = -diag * falloff * in.dome;
+        // Overall brightness modulation ±12% at tilt = ±1.
+        let shade = 1.0 + tilt * 0.12;
+        fill_rgb = fill_rgb * shade;
+        // Tiny specular glint near the top-left quadrant's peak (a
+        // narrow bright spot where the dome's surface directly faces the
+        // light). Concentrated, low amplitude.
+        let spec_center = vec2<f32>(-0.40, -0.40);
+        let spec_d = distance(np, spec_center);
+        let spec = exp(-spec_d * spec_d / 0.04) * falloff * in.dome * 0.10;
+        fill_rgb = fill_rgb + vec3<f32>(spec, spec, spec);
+    }
+
     // Composite fill over glow, output premultiplied so the blend state
     // (One, OneMinusSrcAlpha) gives correct results.
-    let fill_rgb = in.color.rgb * fill_alpha;
+    let fill_rgb_pre = fill_rgb * fill_alpha;
     let glow_rgb = in.glow_color.rgb * glow_alpha;
-    let rgb = fill_rgb + glow_rgb * (1.0 - fill_alpha);
+    let rgb = fill_rgb_pre + glow_rgb * (1.0 - fill_alpha);
     let a = fill_alpha + glow_alpha * (1.0 - fill_alpha);
     return vec4<f32>(rgb, a);
 }

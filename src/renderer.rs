@@ -106,6 +106,9 @@ const FOLD_HANDLE_ICON: [f32; 4] = [0.78, 0.86, 0.96, 0.95];
 /// Fold handle "chip" background — a subtle rounded tint behind the icon
 /// so the fold control reads as a clickable button, not a floating glyph.
 const FOLD_CHIP_BG: [f32; 4] = [0.20, 0.24, 0.32, 0.55];
+/// Dome amount applied to the fold-handle chip (M3.2 Pass 3). 0.0 = flat;
+/// ~0.8 gives a visible but subtle physical-button feel.
+const FOLD_CHIP_DOME: f32 = 0.8;
 
 /// Rolling edge shown along the body's bottom during a fold animation.
 const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
@@ -903,14 +906,17 @@ fn push_card_shapes(
         let chip_size = handle_size + chip_pad * 2.0;
         let mut chip_color = FOLD_CHIP_BG;
         chip_color[3] *= alpha;
-        out.push(RectInstance::solid(
-            chip_x,
-            chip_y,
-            chip_size,
-            chip_size,
-            chip_color,
-            4.0 * sf,
-        ));
+        out.push(
+            RectInstance::solid(
+                chip_x,
+                chip_y,
+                chip_size,
+                chip_size,
+                chip_color,
+                4.0 * sf,
+            )
+            .with_dome(FOLD_CHIP_DOME),
+        );
 
         // Icon itself.
         let mut icon_tint = FOLD_HANDLE_ICON;
