@@ -1354,8 +1354,11 @@ fn push_card_shapes(
 
         // ---- Magnified icon inside the lens. Drawn in the icon pass
         //      after the small icons, so it sits on top of everything.
-        //      Icon_id picks the nearest slot's target; during the short
-        //      slide between slots the icon_id swaps at the midpoint. ----
+        //      `with_distort(1.0)` switches this instance onto the
+        //      aberration shader path: barrel distortion (convex-lens
+        //      outward curvature) + chromatic fringing (red/blue split
+        //      near the rim). The magnified icon reads as "seen through
+        //      real glass" rather than "just scaled up." ----
         if !USE_DENT_METAPHOR {
             let nearest_slot_idx = lens_slot_pos
                 .round()
@@ -1364,13 +1367,16 @@ fn push_card_shapes(
             let lens_state = fold_states[nearest_slot_idx];
             let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
             let lens_icon_y = widget_y + (widget_height - lens_icon_size) * 0.5;
-            icons_out.push(IconInstance::new(
-                lens_x - lens_icon_size * 0.5,
-                lens_icon_y,
-                lens_icon_size,
-                icon_tint,
-                icon_for_fold_state(lens_state).atlas_index(),
-            ));
+            icons_out.push(
+                IconInstance::new(
+                    lens_x - lens_icon_size * 0.5,
+                    lens_icon_y,
+                    lens_icon_size,
+                    icon_tint,
+                    icon_for_fold_state(lens_state).atlas_index(),
+                )
+                .with_distort(1.0),
+            );
         }
     }
 

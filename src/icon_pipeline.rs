@@ -16,7 +16,7 @@ use wgpu::{util::DeviceExt, Device, Queue, TextureFormat};
 
 use crate::icons::IconAtlas;
 
-/// Per-icon instance. 32 bytes → instance buffer is cheap.
+/// Per-icon instance.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct IconInstance {
@@ -31,7 +31,14 @@ pub struct IconInstance {
     /// Which atlas tile to sample: `0.0` = chevron-down, `1.0` =
     /// chevron-right, ... See `IconId::atlas_index`.
     pub icon_index: f32,
-    pub _pad: [f32; 3],
+    /// Lens-aberration strength. `0.0` = crisp regular icon (the
+    /// default — no extra work in the shader). `>0.0` = magnified-
+    /// through-glass look: barrel distortion (straight strokes curve
+    /// outward at the edges) + chromatic aberration (red shifts
+    /// outward, blue inward radially). Set this on the lens's
+    /// magnified icon only.
+    pub distort: f32,
+    pub _pad: [f32; 2],
 }
 
 impl IconInstance {
@@ -41,8 +48,18 @@ impl IconInstance {
             size: [size_px, size_px],
             color,
             icon_index: icon_index as f32,
-            _pad: [0.0; 3],
+            distort: 0.0,
+            _pad: [0.0; 2],
         }
+    }
+
+    /// Builder override: enable lens aberration on this icon. `strength`
+    /// scales both the barrel distortion and the chromatic-aberration
+    /// offset; ~1.0 gives a readable "through glass" look without
+    /// looking cartoonish.
+    pub fn with_distort(mut self, strength: f32) -> Self {
+        self.distort = strength;
+        self
     }
 }
 
@@ -138,6 +155,11 @@ impl IconRenderer {
                         wgpu::VertexAttribute {
                             offset: 32,
                             shader_location: 3,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 36,
+                            shader_location: 4,
                             format: wgpu::VertexFormat::Float32,
                         },
                     ],
@@ -262,6 +284,7 @@ struct Instance {
     @location(1) size:       vec2<f32>,
     @location(2) color:      vec4<f32>,
     @location(3) icon_index: f32,
+    @location(4) distort:    f32,
 };
 
 struct VsOut {
@@ -269,6 +292,7 @@ struct VsOut {
     @location(0) uv:             vec2<f32>,
     @location(1) color:          vec4<f32>,
     @location(2) icon_index:     f32,
+    @location(3) distort:        f32,
 };
 
 fn corner_for(vi: u32) -> vec2<f32> {
@@ -294,18 +318,59 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.uv = corner;
     out.color = inst.color;
     out.icon_index = inst.icon_index;
+    out.distort = inst.distort;
     return out;
+}
+
+// Sample just the coverage alpha of the glyph at a given UV-within-tile.
+// Clamps to the tile bounds so distortion can't bleed into a neighbour.
+fn sample_mask(uv: vec2<f32>, icon_index: f32) -> f32 {
+    let clamped = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+    let tile_u = (clamped.x + icon_index) / u.atlas_tiles;
+    return textureSample(atlas, atlas_s, vec2<f32>(tile_u, clamped.y)).a;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Atlas is horizontally packed: tile N spans U ∈ [N/count, (N+1)/count].
-    let tile_u = (in.uv.x + in.icon_index) / u.atlas_tiles;
-    let sample = textureSample(atlas, atlas_s, vec2<f32>(tile_u, in.uv.y));
-    // Atlas stores RGBA8Unorm; RGB channels are white (1.0) where drawn,
-    // alpha channel is the coverage mask. Tint by instance colour.
-    let a = sample.a * in.color.a;
-    let rgb = in.color.rgb * a;
-    return vec4<f32>(rgb, a);
+    // --- Fast path for non-lens icons (distort == 0) ---
+    if (in.distort < 0.001) {
+        let a = sample_mask(in.uv, in.icon_index) * in.color.a;
+        let rgb = in.color.rgb * a;
+        return vec4<f32>(rgb, a);
+    }
+
+    // --- Lens path: barrel distortion + chromatic aberration ---
+    // p is centered on the tile, range [-0.5, 0.5].
+    let p = in.uv - vec2<f32>(0.5, 0.5);
+    let r2 = dot(p, p);
+    let dist = sqrt(r2);
+
+    // Barrel distortion: convex lens bulges outward — points farther
+    // from center get pushed further still. For our glyph icons at the
+    // lens's size, 0.35 × r² gives visible curvature on the stroke
+    // ends without turning the icon into a blob.
+    let barrel_k = in.distort * 0.35;
+    let distorted_p = p * (1.0 + barrel_k * r2);
+    let distorted_uv = distorted_p + vec2<f32>(0.5, 0.5);
+
+    // Chromatic aberration: R shifts outward, B inward radially.
+    // `radial_dir` is the unit vector toward the rim from center;
+    // `ca_amount` ramps from 0 at center to max near the edge.
+    let radial_dir = select(vec2<f32>(0.0, 0.0), p / max(dist, 1e-5), dist > 1e-5);
+    let ca_amount = in.distort * 0.020 * dist;
+
+    let r_mask = sample_mask(distorted_uv + radial_dir * ca_amount, in.icon_index);
+    let g_mask = sample_mask(distorted_uv, in.icon_index);
+    let b_mask = sample_mask(distorted_uv - radial_dir * ca_amount, in.icon_index);
+
+    // Output: per-channel coverage gives the colored fringing at the
+    // rim where R/G/B no longer coincide. Alpha uses the max coverage
+    // so the glyph's outline is the outermost of all three channels —
+    // exactly what a real lens aberration does.
+    let out_a = max(max(r_mask, g_mask), b_mask) * in.color.a;
+    let out_r = in.color.r * r_mask * in.color.a;
+    let out_g = in.color.g * g_mask * in.color.a;
+    let out_b = in.color.b * b_mask * in.color.a;
+    return vec4<f32>(out_r, out_g, out_b, out_a);
 }
 "#;
