@@ -351,10 +351,14 @@ fn corner_for(vi: u32) -> vec2<f32> {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
-    // Expand the quad by glow_radius on each side so the halo fits.
+    // Expand the quad by glow_radius on each side so the halo fits. Also
+    // add a small pad when the dome is active so the pillowed outer edge
+    // (which pushes slightly outward at mid-edges) doesn't clip.
     let g = inst.glow_radius;
-    let expanded_pos  = inst.pos  - vec2<f32>(g, g);
-    let expanded_size = inst.size + vec2<f32>(g * 2.0, g * 2.0);
+    let dome_pad = select(0.0, 2.0, inst.dome > 0.001);
+    let pad = g + dome_pad;
+    let expanded_pos  = inst.pos  - vec2<f32>(pad, pad);
+    let expanded_size = inst.size + vec2<f32>(pad * 2.0, pad * 2.0);
 
     let corner = corner_for(vi);
     let px = expanded_pos + corner * expanded_size;
@@ -386,9 +390,38 @@ fn sdf_rounded_box(p: vec2<f32>, h: vec2<f32>, r: f32) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - r;
 }
 
+// "Squi-pillow" SDF: rounded rect whose edges bulge slightly outward at
+// their midpoints, corners staying put. Produces a pillow-on-a-couch
+// silhouette rather than a straight-edged rounded rect. `bulge` is the
+// extra outward reach at mid-edge in pixels.
+//
+// Mechanism: at a mid-edge point, abs(p.x/h.x) and abs(p.y/h.y) differ
+// sharply (one is ~1, the other is ~0). At a corner, both are ~1. The
+// `mid_weight` expression peaks at mid-edges and is zero at corners, so
+// subtracting `bulge * mid_weight` from the rounded-rect SDF pushes the
+// silhouette outward only at the sides, not the corners.
+fn sdf_pillow_box(p: vec2<f32>, h: vec2<f32>, r: f32, bulge: f32) -> f32 {
+    let d_rect = sdf_rounded_box(p, h, r);
+    let norm = abs(p) / max(h, vec2<f32>(1.0, 1.0));
+    let mid_weight = abs(norm.x - norm.y);  // 0 at corners, ~1 at mid-edge
+    return d_rect - bulge * mid_weight;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let d = sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius);
+    // Use the pillow SDF when this instance is domed; otherwise plain
+    // rounded box. Pillow bulge scales with the smaller half-size so it
+    // reads proportional regardless of chip dimensions.
+    let d = select(
+        sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius),
+        sdf_pillow_box(
+            in.rel_pos,
+            in.half_size,
+            in.corner_radius,
+            min(in.half_size.x, in.half_size.y) * 0.12,
+        ),
+        in.dome > 0.001
+    );
 
     // Anti-aliased fill: full inside, fade across ~1px of the edge.
     let fill_alpha = clamp(0.5 - d, 0.0, 1.0) * in.color.a;
@@ -402,40 +435,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // ---- Dome shading (M3.2 Pass 3) ----
-    // If this instance carries a `dome` amount, apply subtle lit/shadow
-    // modulation inside the rect so it reads as a convex button:
-    //   - Top-left of the rect: slightly brighter (facing light).
-    //   - Bottom-right:          slightly darker  (away from light).
-    //   - A small radial falloff (brightest near center, neutral at edge)
-    //     keeps the effect concentrated on the "dome" surface.
-    // All computed per pixel, no geometry change. Effect disabled entirely
-    // when `in.dome` is zero so regular shapes take zero extra cost.
+    // Per-pixel radial shading: brightest near the button's center, fading
+    // to neutral at the corners. Combined with a gentle diagonal tilt
+    // (top-left slightly brighter, bottom-right slightly darker) this
+    // produces a "bubble wrap" / "sat-on pillow" look — a visible bump in
+    // the middle of the chip, consistent with the pillowed outer silhouette
+    // produced by `sdf_pillow_box`.
+    //
+    // Disabled entirely when `in.dome` is zero so regular shapes take
+    // zero extra cost.
     var fill_rgb = in.color.rgb;
     if (in.dome > 0.001) {
-        // Normalized position within the rect: [-1, 1] on each axis.
         let np = in.rel_pos / max(in.half_size, vec2<f32>(1.0, 1.0));
-        // Diagonal from top-left (-1, -1) to bottom-right (+1, +1):
-        // dot with (1, 1)/√2 is +1 at bottom-right, -1 at top-left.
-        let diag = dot(np, vec2<f32>(0.7071, 0.7071));
-        // Brighter where diag is negative (top-left), darker where positive.
-        // Multiply by a radial falloff so the effect fades to zero at the
-        // rect corners rather than dropping off abruptly.
         let r = length(np);
-        let falloff = 1.0 - smoothstep(0.35, 1.0, r);
-        let tilt = -diag * falloff * in.dome;
-        // Overall brightness modulation. At small button sizes the dome
-        // needs strong contrast to read at all — ±40% gives clearly
-        // visible lit vs shadowed halves of a chip. (Still tunable: lower
-        // the multiplier if the chip starts to feel cartoonish.)
-        let shade = 1.0 + tilt * 0.40;
+        // Radial bump: strongest at center, tapers smoothly.
+        let bump = (1.0 - smoothstep(0.0, 0.95, r)) * in.dome;
+        // Diagonal tilt: normalised diagonal -1..+1 along top-left →
+        // bottom-right axis. Negative = top-left (lit side).
+        let diag = dot(np, vec2<f32>(0.7071, 0.7071));
+        let tilt = -diag * (1.0 - smoothstep(0.35, 1.0, r)) * in.dome;
+        // Overall brightness modulation: bump at center + diagonal tilt.
+        let shade = 1.0 + bump * 0.22 + tilt * 0.32;
         fill_rgb = fill_rgb * shade;
-        // Specular glint near the top-left quadrant's peak: a brighter
-        // spot where the dome's surface directly faces the light. Pushed
-        // up from a sub-pixel whisper to something readable at chip size.
-        let spec_center = vec2<f32>(-0.40, -0.40);
-        let spec_d = distance(np, spec_center);
-        let spec = exp(-spec_d * spec_d / 0.06) * falloff * in.dome * 0.28;
-        fill_rgb = fill_rgb + vec3<f32>(spec, spec, spec);
     }
 
     // Composite fill over glow, output premultiplied so the blend state
