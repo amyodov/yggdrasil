@@ -314,13 +314,56 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 //   - Top-edge rim light hugging the rounded corners — the strongest cue
 //     that the plate is lit, not printed.
 //   - Tinted-glass translucency so the nebula reads through behind.
+// Linen weave — rhythmic cross-hatch of horizontal + vertical threads with
+// tiny weave holes at their intersections. Output is a "material presence"
+// scalar: 1.0 where a thread crosses this pixel, 0.0 in a pure hole, smooth
+// transitions in between.
+//
+// Thread spacing is in physical pixels so the weave reads at consistent
+// scale regardless of viewport size. Slight per-thread noise adds a hint
+// of non-ideal handmade cloth: thread edges wobble, not perfectly straight.
+//
+// Unused by M3.3.1 Pass 1 but left here for future use: the decoupled-
+// opacity contract (diffuse light uniformly, point light through holes
+// only) will sample this same function to drive two different blend rules.
+fn linen_weave(p_px: vec2<f32>) -> f32 {
+    // One warp/weft cycle every N pixels. ~4px gives visible weave pattern
+    // on a typical 1x-DPI display; on Retina the weave looks finer but
+    // still clearly woven.
+    let thread_spacing = 4.2;
+
+    // Slight per-row noise to wobble thread edges — "non-ideal" cloth.
+    let row = floor(p_px.y / thread_spacing);
+    let col = floor(p_px.x / thread_spacing);
+    let row_jitter = (fract(sin(row * 12.989) * 43758.55) - 0.5) * 0.6;
+    let col_jitter = (fract(sin(col * 78.233) * 43758.55) - 0.5) * 0.6;
+
+    // Position within the thread cycle.
+    let h_phase = (p_px.y / thread_spacing + col_jitter * 0.05) * 6.28318;
+    let v_phase = (p_px.x / thread_spacing + row_jitter * 0.05) * 6.28318;
+    let h_wave = abs(sin(h_phase));
+    let v_wave = abs(sin(v_phase));
+
+    // Thread occupies the lower part of each cycle (near zero-crossing).
+    // Smoothstep gives the soft anti-aliased thread edge.
+    let thread_edge_inner = 0.20;
+    let thread_edge_outer = 0.42;
+    let h = smoothstep(thread_edge_outer, thread_edge_inner, h_wave);
+    let v = smoothstep(thread_edge_outer, thread_edge_inner, v_wave);
+
+    // Thread wherever either direction has a thread — union, not intersect.
+    // The holes are the small regions where NEITHER thread is present.
+    return max(h, v);
+}
+
 fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_intensity: f32) -> vec4<f32> {
     let uv = p / s;
 
-    // Vertical gradient — top slightly cooler/brighter, bottom slightly
-    // warmer/dimmer. Difference is small so the overall tint is consistent.
-    let base_top    = vec3<f32>(0.052, 0.062, 0.096);
-    let base_bottom = vec3<f32>(0.030, 0.040, 0.072);
+    // Vertical gradient — linen has natural warm-ivory; the plate picks up
+    // cooler blue at the top (lit from above) and warmer cream at the
+    // bottom. Difference is small so the overall tint stays consistent.
+    let base_top    = vec3<f32>(0.080, 0.085, 0.110);
+    let base_bottom = vec3<f32>(0.068, 0.060, 0.050);
     var rgb = mix(base_top, base_bottom, clamp(uv.y, 0.0, 1.0));
 
     // Radial gradient — brighter toward center, fades to the base by ~70%
@@ -328,7 +371,7 @@ fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_in
     let centered = uv - vec2<f32>(0.5, 0.5);
     let r = length(centered);
     let radial = smoothstep(0.70, 0.05, r);
-    rgb = rgb + vec3<f32>(0.022, 0.028, 0.040) * radial;
+    rgb = rgb + vec3<f32>(0.026, 0.030, 0.034) * radial;
 
     // Top-edge rim light. Uses SDF inside-depth (`-d`, positive inside) so
     // the rim follows the rounded corners naturally. Gated by a vertical
@@ -339,9 +382,15 @@ fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_in
     let rim = rim_falloff * upperness * rim_intensity;
     rgb = rgb + vec3<f32>(0.14, 0.18, 0.28) * rim;
 
-    // Tinted-glass translucency — lets nebula breathe through. Keeps the
-    // same overall opacity as the old solid PANEL_FILL (~0.58).
-    let alpha = 0.58;
+    // Linen weave: modulates per-pixel alpha. Threads mostly opaque; weave
+    // holes transparent so sky + lightnings read through them. A small
+    // baseline keeps the plate visible even in pure-hole pixels so it
+    // doesn't look like the material has been punched out.
+    let weave = linen_weave(p);
+    let thread_alpha = 0.82;
+    let hole_alpha   = 0.06;
+    let alpha = mix(hole_alpha, thread_alpha, weave);
+
     return vec4<f32>(rgb * alpha, alpha);
 }
 
