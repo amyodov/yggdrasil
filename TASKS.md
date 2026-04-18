@@ -91,6 +91,20 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 
 **Tests**: RT allocation/pooling/recycling, model-matrix → NDC projection (parameterized with identity / translated / rotated / scaled), dirty-flag invalidation logic.
 
+##### M3.1.1 — Taller-than-plate RT + UV-offset scrolling
+
+**Goal**: scroll becomes a UV-offset sample into a larger-than-plate RT, instead of re-rendering visible content each frame. Follow-up optimization on the M3.1 primitive.
+
+**What ships**:
+- RT is allocated at `plate_size × N` tall (N ~3 at normal zoom). Scroll = offset the sample UV by `scroll_y / rt_height`.
+- Streaming: when the scroll position approaches the edge of the cached RT window, re-render the next "slab" of content into the RT below/above the current view.
+- Manual mipmap chain on the RT so sampling at angles (for M3.7's cylinder curl, and future rotations) doesn't shimmer.
+- Dirty flag now actually skips re-renders when nothing changed.
+
+**Why not in M3.1**: the M3.1 keystone intentionally shipped the minimum viable architecture — plate-sized RT, re-render every frame. The taller-RT + UV-scroll + mipmaps is a separate optimization that doesn't change the primitive's public API. Slot it before M3.7 (scroll-winding really wants the cylinder curl sampling a pre-rendered texture) or whenever performance pressure shows up first.
+
+**Tests**: streaming threshold correctness (when does the next slab render?), mipmap coverage, UV-scroll accuracy.
+
 #### M3.2 — Icon system with Lucide + SDF atlas *(architectural)*
 
 **Goal**: a first-class icon primitive so every subsequent UI affordance (fold handles, bulk controls, timeline transport, hover cues) uses one rendering path.
@@ -138,6 +152,44 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 **Tests**: shadow offset + rim-light color presence in the instance stream (structural, not pixel-level), composite bloom shader math at known sample points.
 
 **Tests**: plate shader sampling at known positions produces expected luminance profiles (top-brighter than bottom; edge-rim > interior).
+
+##### M3.3.1 — Material textures and tinting *(cross-depends on M3.8.1)*
+
+**Goal**: Zone-3 objects (cards, planks, future `.pyi` blueprints) stop reading as "clean plastic with a gradient" and start reading as actual paper, cardboard, blueprint, graph paper, vellum. This is where the visual vocabulary's *paper* word stops being a metaphor in the doctrine and becomes visible in pixels.
+
+**Ship order note**: depends on M3.8.1 (stars) existing, because the plate's most distinctive material — **linen** — works as a *rhythmic-transparency* pattern that reveals the star layer through weave holes. The linen needs stars already in the backdrop to be meaningful.
+
+**What ships**:
+- Procedural material grain functions in the shapes / composite WGSL:
+  - `paper_grain` (for regular cards — subtle fiber texture)
+  - `cardboard_pulp` (heavier, larger-scale fleck, for planks / headers)
+  - `blueprint_rule` (straight grid + slight dither, for future `.pyi` plates)
+  - `graph_rule` (rule-lined grid, for test files)
+  - `vellum_wash` (very smooth low-frequency, for docstring bands)
+  - **`linen_weave` — the most distinctive.** A rhythmic cross-hatch of horizontal + vertical threads, with tiny single-pixel-ish weave holes at regular intervals. Non-ideal: slight thread wobble, occasional imperfections, gives a handmade not-CGI feel.
+- New `material` field on `RectInstance` (repurposes the existing padding bytes — no stride change). Fragment shader switches on it to pick a grain function.
+- **Decoupled-opacity model for linen**: two different pass-through rules, one per light type:
+  - Diffuse atmospheric light (nebula) passes through the whole plate at low alpha (~25%) — threads slightly, holes slightly more. Uniform tinted bleed.
+  - Sharp point light (stars, nova-pulses from M3.8.1) passes through *weave holes only*. Threads fully block. This gates the star field behind the plate's pattern, making stars textural rather than attention-grabbing.
+- Tinting via layered shapes: a card body gets a grain; an extra translucent colored shape drawn on top creates a "region tint" (e.g., a blue info chip on a cardboard header band). No new primitive — compositing already supports it.
+- Default material assignment: regular cards = paper, class cards = heavier paper, code-pane plate = **linen** (vocabulary refinement: was "parchment"; linen has visible weave structure, which is exactly what the shader produces). Future M3.6 plank = cardboard; future `.pyi` plate = blueprint.
+- Grain amplitudes conservatively tuned — visible but not "noisy material fighting the text." Users never consciously notice individual grain features; they notice the surface is *material*.
+
+**Why procedural, not sampled**: (a) our dialect is stylized, not photoreal — sampled paper textures push toward photoreal and clash. (b) No asset pipeline, no licensing, no tiling artifacts, DPI-independent by construction. (c) Tinting is trivial over procedural. (d) Scales to new materials in <30 lines of WGSL each. (e) Procedural weave can do the two-channel opacity math in the same shader.
+
+**Out of scope**: file-type → material dispatch (e.g., "opening `.pyi` gives a blueprint plate" — hooks exist, but file-type routing is M4+ work). Semantic-cue-driven tint regions (M3.4/M3.5 will drive these once header anatomy lands).
+
+**Tests**: material grain functions produce bounded, deterministic output for known UVs; material-id → grain-function dispatch; tinted overlay blend matches expected alpha composition; linen-weave pass-through math distinguishes diffuse from point-light channels.
+
+##### M3.3.2 — Card top-edge rim light
+
+**Goal**: apply the "lit from above" rim cue to individual cards, matching what the plate already does. Promised in the three-zone grammar; deferred from M3.3 proper for scoping.
+
+**What ships**:
+- A thin bright inner-edge line at each card's top, ~1px (DPI-scaled), fading to invisible within the first `card_inner_pad_y` pixels. Follows the card's rounded corners (same SDF approach as the plate's rim).
+- Public cards get the rim slightly brighter than private (adds to the "elevated vs. sitting lower" affordance already in the shadow scale).
+
+**Tests**: rim instance presence in shape output, intensity-by-visibility.
 
 #### M3.4 — Fold anatomy, two-button fold, nested cascade
 
@@ -209,6 +261,21 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 
 **Tests**: plate-size derivation (parameterized: tall file, short file, window resized), clip-mask correctness at rounded corners.
 
+##### M3.6.1 — Plank-on-rods skeuomorphic connector *(cross-depends on M3.7)*
+
+**Goal**: the filename plank (M3.6) visibly attaches to the scroll's upper rod (M3.7), so the eye reads the whole thing as one physical artifact — plank + rods + wound parchment — not three separate UI elements floating near each other.
+
+**Depends on**: both M3.6 (plank exists) and M3.7 (rods exist). Ships as part of M3.7 in practice; sits here conceptually as a *refinement of the plank*.
+
+**What ships**:
+- A thin skeuomorphic connector where the plank meets the upper rod — hairline seam, or a subtle bright rivet on each side, whichever reads as "this plank is bolted to the rods" without being a photoreal screw.
+- Plank shadow extends slightly over the top of the upper rod to reinforce "plank sits on top."
+- Herald-scroll asymmetry: top has plank + rod, bottom has only rod. The asymmetry is part of the affordance ("this is the top / title end").
+
+**Out of scope**: decorative rivets on other parts of the plate; bottom plank variants.
+
+**Tests**: connector geometry at plate edge (parameterized with/without upper rod materialized).
+
 #### M3.7 — Scroll-winding: pin zones with cylindrical curl
 
 **Goal**: content above/below the visible window appears "wound on a scroll" at top and bottom of the plate — the key tactile metaphor.
@@ -218,9 +285,9 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 - Pin zones only materialize when off-screen content exists in that direction (top-of-file → no top pin; bottom-of-file → no bottom pin). Fade in/out smoothly.
 - Content just past the visible window curls onto a cylinder in the pin zone — cylinder UV mapping sampled from the plate RT (M3.1). Foreshortened, faintly lit, not meant to be readable.
 - No prominent rod/dowel body — just faint luminous **cap-glow** at the left and right plate edges where the dowel would exit, cueing "something is wound here."
-- **The header plank (from M3.6) visibly sits on top of the upper rod.** Treat the scroll as one physical object: two dowels with parchment wound between them *and* a small plank mounted above the top dowel carrying the filename/title. A thin skeuomorphic connector (a hairline or subtle bright seam) may appear where the plank meets the upper rod, so the eye reads "this plank is bolted to the rods; together with the rods and the parchment this is one artifact." When there's no off-screen content above (no upper pin zone) the plank still sits there — it's part of the scroll, not just an adornment of the pin zone. The bottom of the scroll has no such plank, just the rod (asymmetric by design — herald-scrolls had a title header, not a title footer).
+- The header plank (M3.6) visibly attaches to the upper rod via the skeuomorphic connector detailed in **M3.6.1** — M3.7's rods make that connector meaningful.
 - Continuous transition as the scroll offset crosses integer line boundaries: a line gradually curves from flat to fully wound.
-- Works symmetrically top-rod-and-bottom-rod for the curl; plank is top-only.
+- Works symmetrically top-rod-and-bottom-rod for the curl; plank (from M3.6) is top-only — herald-scroll asymmetry.
 
 **Out of scope**: tree-aura link (M4.3), other plates getting the same treatment (future — the primitive is reusable), metadata chips in the plank beyond filename (M4+).
 
@@ -239,6 +306,22 @@ M3's first pass shipped cards as lit rectangles with binary fold. Review surface
 **Out of scope**: cloud shapes with parallax, weather metaphors, anything narrative.
 
 **Tests**: perceptual delta — not automated; verify by eye. (Consistent with "don't test rendering output" principle.)
+
+##### M3.8.1 — Stars and nova-pulses
+
+**Goal**: tiny bright pinpoints distributed across the void, modulated over time. Baseline dim-static stars with slow twinkle, plus rare nova-pulses (1 star briefly brightens 5–10×, fades over ~1.5s). Eventually gated by the linen-weave transparency (M3.3.1) so only stars behind weave holes come through the plate — until then, they appear everywhere against the nebula.
+
+**What ships**:
+- Hash-based sparse star field in `background.rs`: per-star center, phase, baseline brightness.
+- Twinkle: slow low-amplitude per-star brightness modulation.
+- Nova-pulse: rare, selected via hash + time, 5–10× peak, ~1.5s envelope, then full decay. Target frequency ~1 pulse every 20–40s somewhere in the viewport.
+- **Decoupled-opacity contract**: stars are emitted as a *separate output layer* (not blended into the nebula uniformly), so the plate shader (M3.3.1) can apply a different pass-through rule — stars blocked by linen threads, dimmed but let through weave holes.
+
+**Why ship before M3.3.1**: the linen's through-hole visibility is the *thing that contains* the stars. Building stars first means when linen lands, there's something for the holes to reveal. Building linen first means an empty weave pattern with nothing behind it — the payoff is in the pairing.
+
+**Alternative considered**: plasma arcs / transient filaments in the nebula instead of classic stars. Rejected for v1 — more shader complexity, less instantly-readable. Can add later as a second layer.
+
+**Tests**: brightness envelope math (pulse peak, decay), star count per unit area, hash-phase determinism.
 
 ---
 
