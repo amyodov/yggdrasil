@@ -202,76 +202,107 @@ fn fbm(p: vec2<f32>) -> f32 {
     return total;  // roughly 0..1 range
 }
 
-// ---- Star field (M3.8.1) --------------------------------------------------
+// ---- Nebula lightnings (M3.8.1) -------------------------------------------
 //
-// Sparse pinpoints distributed across the void on a hash-based grid. Each
-// grid cell gets zero or one star with a randomized center offset, baseline
-// brightness, and twinkle phase. Most cells are empty or very dim; a few
-// rare cells fire a nova-pulse (5–10× peak, ~1.5 s envelope) every ~30 s
-// within their own lifecycle.
+// Not stars. Brief electrical-looking arcs threading through the nebula —
+// think plasma discharges, curving energy flows along invisible magnetic
+// field lines. The ethos:
 //
-// Output: scalar brightness for this pixel. The fs_main composes it onto
-// the nebula with a starlight-blue tint. Future M3.3.1 (linen): when the
-// plate renders, its weave-hole alpha gates these pinpoints so only stars
-// behind holes punch through — that's the decoupled-opacity contract. For
-// now (no plate yet at swap-chain level), stars appear everywhere.
+//   - Only visible during their brief active window (~0.5 s per strike).
+//     No persistent pinpoints — persistence reads as "dirt on the screen."
+//   - Short arc (5–10 px total) — pinpoint-small, not sparkler.
+//   - Mostly tinted by the *local nebula colour* so each strike feels like
+//     a property of the cloud it lives in. Rare outliers (cyan, aurora
+//     green, magenta, electric lilac) for visual variety.
+//   - Bright near-white core, tinted halo — matches how any hot light
+//     source looks: the middle is always white-hot, the edges colour.
+//
+// Form: quadratic bezier approximated as a two-segment polyline (p0-p1-p2).
+// Subtle curvature — gentle arcs, not jagged terrestrial lightning (that
+// would clash with the calm cosmic-fairytale dialect).
+//
+// Output: premultiplied-ish (color * intensity, intensity). Caller adds
+// this additively to the sky.
+//
+// Future M3.3.1 (linen): the plate shader will gate this as a sharp
+// point-light layer — strikes behind linen threads are blocked, strikes
+// behind weave holes punch through.
 
-fn star_field(uv: vec2<f32>, t: f32) -> f32 {
-    // Grid density: ~90 cells wide across the viewport. Non-square cells
-    // (scaled by aspect) would distort twinkle timing, so uv is already
-    // aspect-corrected by the caller.
-    let grid = 90.0;
+fn dist_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    let t = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    return distance(p, a + ab * t);
+}
+
+fn nebula_lightning(uv: vec2<f32>, t: f32, local_tint: vec3<f32>) -> vec4<f32> {
+    // Coarse grid — strikes are sparse by design.
+    let grid = 45.0;
     let cell_uv = uv * grid;
     let cell = floor(cell_uv);
     let local = fract(cell_uv);
 
-    // Most cells are empty. Keep ~30% populated — higher density means more
-    // visual noise; lower, and there are long blank stretches.
-    let presence = hash12(cell + vec2<f32>(101.7, 37.1));
-    if (presence < 0.70) {
-        return 0.0;
+    // ~4% of cells are strike-capable. With 45×(45*aspect) cells you get
+    // roughly 130–180 lightning-capable sites; combined with 20–40 s cycles
+    // and a 0.5 s active window this gives ~1–2 strikes visible somewhere
+    // at any given moment — rare-feeling but not sparse.
+    let capable = hash12(cell + vec2<f32>(211.3, 77.7));
+    if (capable < 0.96) { return vec4<f32>(0.0); }
+
+    // Cycle length 20–40 s per cell, desynchronised.
+    let cycle = 20.0 + hash12(cell + vec2<f32>(3.7, 9.1)) * 20.0;
+    let offset = hash12(cell + vec2<f32>(47.1, 88.5)) * cycle;
+    let phase_t = (t + offset) - cycle * floor((t + offset) / cycle);
+
+    // Active window 0.5 s — short flash, not a lingering glow.
+    let strike_len = 0.5;
+    if (phase_t >= strike_len) { return vec4<f32>(0.0); }
+
+    // Envelope: quick rise, fast decay. Peaks around t = 0.25.
+    let nt = phase_t / strike_len;
+    let envelope = pow(nt, 0.35) * pow(1.0 - nt, 1.6) * 3.2;
+
+    // Strike geometry: two endpoints + a mid control point perpendicular to
+    // the line, giving a gentle curve. Arc length 0.18–0.32 of the cell →
+    // ~4–8 px on typical viewports.
+    let p0_x = hash12(cell + vec2<f32>(17.3, 42.1));
+    let p0_y = hash12(cell + vec2<f32>(81.9, 9.7));
+    let p0 = vec2<f32>(0.20 + p0_x * 0.25, 0.20 + p0_y * 0.25);
+    let angle = hash12(cell + vec2<f32>(55.7, 13.2)) * 6.28318;
+    let length = 0.18 + hash12(cell + vec2<f32>(11.1, 99.9)) * 0.14;
+    let dir = vec2<f32>(cos(angle), sin(angle));
+    let p2 = p0 + dir * length;
+    let perp = vec2<f32>(-dir.y, dir.x);
+    let bend = (hash12(cell + vec2<f32>(7.3, 3.9)) - 0.5) * length * 0.35;
+    let p1 = (p0 + p2) * 0.5 + perp * bend;
+
+    // Distance to the two-segment polyline approximation of the bezier.
+    let d = min(dist_to_segment(local, p0, p1), dist_to_segment(local, p1, p2));
+
+    // Core sigma ~1–2 px; halo sigma ~3 px.
+    let core_sigma = 0.012;
+    let halo_sigma = 0.028;
+    let core = exp(-(d * d) / (core_sigma * core_sigma));
+    let halo = exp(-(d * d) / (halo_sigma * halo_sigma));
+    let intensity = (core * 0.7 + halo * 0.30) * envelope;
+
+    // Colour: mostly the nebula's local tint; rare outliers pick from a
+    // small "electrical spectrum" for variety. The CORE is always pushed
+    // toward white — hot light, desaturated; the HALO carries the tint.
+    let outlier_roll = hash12(cell + vec2<f32>(91.1, 44.7));
+    var tint = local_tint * 2.2;  // boost the nebula tint so it reads vivid
+    if (outlier_roll > 0.80) {
+        let which = floor(hash12(cell + vec2<f32>(123.4, 56.7)) * 4.0);
+        if      (which < 1.0) { tint = vec3<f32>(0.35, 0.85, 1.00); }  // cyan
+        else if (which < 2.0) { tint = vec3<f32>(0.35, 0.95, 0.55); }  // aurora green
+        else if (which < 3.0) { tint = vec3<f32>(0.95, 0.40, 0.85); }  // magenta
+        else                  { tint = vec3<f32>(0.80, 0.72, 1.00); }  // electric lilac
     }
+    // Core weight: where the core gaussian dominates over halo → push white.
+    let core_weight = core / max(core + halo * 0.5 + 1e-4, 1e-4);
+    let color = mix(tint, vec3<f32>(1.0, 1.0, 1.0), core_weight * 0.75);
 
-    // Per-star center offset within the cell (keeps stars from lining up on
-    // the grid). Range [0.2, 0.8] so pinpoints sit away from cell edges.
-    let cx = hash12(cell + vec2<f32>(17.3, 42.1));
-    let cy = hash12(cell + vec2<f32>(81.9, 9.7));
-    let center = vec2<f32>(0.2 + cx * 0.6, 0.2 + cy * 0.6);
-    let d = distance(local, center);
-
-    // Gaussian falloff. Star size is a small fraction of the cell so each
-    // star is a pinpoint, not a disc.
-    let star_sigma = 0.035;
-    let glow = exp(-(d * d) / (star_sigma * star_sigma));
-
-    // Baseline brightness: most stars dim, a few moderately bright.
-    let bright_roll = hash12(cell + vec2<f32>(5.1, 23.9));
-    let baseline = 0.08 + pow(bright_roll, 3.0) * 0.22;
-
-    // Slow twinkle — per-star phase, modest amplitude. Shouldn't catch the
-    // eye on its own; it's "the stars feel alive."
-    let phase = hash12(cell + vec2<f32>(55.7, 13.2)) * 6.28318;
-    let twinkle = 0.75 + 0.25 * sin(t * 0.9 + phase);
-
-    // Nova-pulse. Rare cells (~0.5%) are potential novae. Each such cell
-    // cycles through a 32-second lifecycle with a ~1.5s active window; so
-    // across the viewport (thousands of cells, of which ~0.5% nova-capable)
-    // you see roughly one nova flash every 20–40 seconds somewhere.
-    let nova_roll = hash12(cell + vec2<f32>(211.3, 77.7));
-    var nova = 0.0;
-    if (nova_roll > 0.995) {
-        let offset = hash12(cell + vec2<f32>(3.3, 88.8)) * 32.0;
-        let cycle = 32.0;
-        let phase_t = (t + offset) - cycle * floor((t + offset) / cycle);
-        if (phase_t < 1.5) {
-            // Smooth bump centred on t = 0.75: quick rise, gentler decay.
-            let nt = phase_t / 1.5;
-            let envelope = 4.0 * nt * (1.0 - nt);
-            nova = envelope * 5.0;  // 5× baseline boost at peak
-        }
-    }
-
-    return glow * baseline * (twinkle + nova);
+    return vec4<f32>(color * intensity, intensity);
 }
 
 // --------------------------------------------------------------------------
@@ -361,13 +392,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                + near_color * near * 0.60
                + vec3<f32>(turb, turb, turb) * 0.25;
 
-    // ---- Star field (M3.8.1). Pinpoint starlight tinted blue-white; nova
-    // pulses inherit the same tint but spike through the cloud layers.
-    // Computed in aspect-corrected UV so stars are circular not stretched.
-    // When M3.3.1 lands, this same layer will be gated by the plate's
-    // linen-weave alpha so only stars behind holes punch through. ----
-    let star_tint = vec3<f32>(0.85, 0.92, 1.00);
-    let stars = star_field(auv, t) * star_tint;
+    // ---- Nebula lightnings (M3.8.1). Short curved arcs, bright white core
+    // with tinted halo. Mostly tinted by the local nebula colour so each
+    // strike feels atmospheric; ~20% are spectrum outliers for variety.
+    // Computed in aspect-corrected UV so arcs are circular not stretched.
+    // When M3.3.1 lands, this layer will be gated by the plate's linen-
+    // weave alpha so only strikes behind holes punch through. ----
+    let local_tint = mix(primary, accent, 0.5);
+    let lightning = nebula_lightning(auv, t, local_tint);
 
     // ---- Extremely faint pixel grain breaks up uniform regions. ----
     let grain = (hash12(floor(px / 2.0)) - 0.5) * 0.006;
@@ -379,7 +411,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // ---- Compose ----
     var color = (base + nebula) * vignette
-              + stars
+              + lightning.rgb
               + vec3<f32>(grain, grain, grain);
     return vec4<f32>(color, 1.0);
 }
