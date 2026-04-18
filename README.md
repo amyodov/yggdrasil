@@ -1,10 +1,10 @@
-# Ygg
+# Yggdrasil
 
 A spatial code viewer for the age of AI-generated code.
 
-Ygg is a code *reviewer*, not an editor. In 2026, humans write little of the code — agents do. The bottleneck has shifted from authoring to *understanding*: reading diffs produced by Claude Code, Codex, and others; verifying the silicon got it right; approving or rejecting. Existing review tools were built for 15-line hand-typed diffs and don't scale to 40-file, 2000-line agent PRs in 10 minutes.
+Yggdrasil is a code *reviewer*, not an editor. In 2026, humans write little of the code — agents do. The bottleneck has shifted from authoring to *understanding*: reading diffs produced by Claude Code, Codex, and others; verifying the silicon got it right; approving or rejecting. Existing review tools were built for 15-line hand-typed diffs and don't scale to 40-file, 2000-line agent PRs in 10 minutes.
 
-Ygg renders code as spatial objects — floating plates, structured cards, a luminous scroll under a cosmic void — so comprehension works at the speed of skimming, not the speed of reading. *Semantic over syntactic*: a class attribute and a dataclass field look different; a `@classmethod` attaches to the class armature rather than to `self`; a renamed symbol morphs between versions when you scrub the timeline.
+Yggdrasil renders code as spatial objects — floating plates, structured cards, a luminous scroll under a cosmic void — so comprehension works at the speed of skimming, not the speed of reading. *Semantic over syntactic*: a class attribute and a dataclass field look different; a `@classmethod` attaches to the class armature rather than to `self`; a renamed symbol morphs between versions when you scrub the timeline.
 
 ## Status
 
@@ -16,7 +16,7 @@ Ygg renders code as spatial objects — floating plates, structured cards, a lum
 cargo run --release -- path/to/file.py
 ```
 
-Requires Rust 1.85. Developed on macOS (Metal backend via `wgpu`); other platforms should work but haven't been smoke-tested.
+The CLI command is `ygg` (short form for the terminal). Requires Rust 1.85. Developed on macOS (Metal backend via `wgpu`); other platforms should work but haven't been smoke-tested.
 
 ## Design
 
@@ -26,4 +26,4 @@ Full design doctrine — canonical mode, three-zone visual grammar, vocabulary, 
 
 ## The name
 
-Ygg is short for **Yggdrasil**, the Norse world-tree. Odin hung on it for nine days to obtain knowledge of runes. A developer hangs on a PR for however long it takes to understand what the agent wrote. The metaphor is intentional.
+Yggdrasil is the Norse world-tree. Odin hung on it for nine days to obtain knowledge of runes. A developer hangs on a PR for however long it takes to understand what the agent wrote. The metaphor is intentional. `ygg` (the CLI binary) is just the short-form keystroke for invoking it from the terminal.

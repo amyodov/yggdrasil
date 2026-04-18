@@ -1,4 +1,4 @@
-# Ygg — Milestones
+# Yggdrasil — Milestones
 
 Sequential milestones from empty project to a working prototype. Read `CLAUDE.md` for philosophy, visual language, and architecture first — this document assumes you know *what* we're building and explains the *order*.
 
