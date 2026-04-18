@@ -105,10 +105,12 @@ const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
 const FOLD_HANDLE_ICON: [f32; 4] = [0.78, 0.86, 0.96, 0.95];
 /// Fold handle "chip" background — a subtle rounded tint behind the icon
 /// so the fold control reads as a clickable button, not a floating glyph.
-const FOLD_CHIP_BG: [f32; 4] = [0.20, 0.24, 0.32, 0.55];
+/// Alpha is high enough that the dome shading reads clearly over the card
+/// tint underneath.
+const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 0.85];
 /// Dome amount applied to the fold-handle chip (M3.2 Pass 3). 0.0 = flat;
-/// ~0.8 gives a visible but subtle physical-button feel.
-const FOLD_CHIP_DOME: f32 = 0.8;
+/// 1.0 = full effect. At small button sizes we need the full range.
+const FOLD_CHIP_DOME: f32 = 1.0;
 
 /// Rolling edge shown along the body's bottom during a fold animation.
 const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
@@ -157,7 +159,10 @@ const DEPTH_INDENT_PT: f32 = 22.0;
 /// Fold-handle icon size in logical points — fixed across all cards so
 /// every fold button reads as the same affordance, not a size-varies-by-
 /// card-kind puzzle. DPI-scaled at use-site.
-const FOLD_HANDLE_SIZE_PT: f32 = 12.0;
+const FOLD_HANDLE_SIZE_PT: f32 = 16.0;
+/// Chip padding around the icon, in logical points. Chip is
+/// (FOLD_HANDLE_SIZE_PT + 2 * FOLD_CHIP_PAD_PT) on each side.
+const FOLD_CHIP_PAD_PT: f32 = 4.0;
 const CARD_TEXT_INSET_PT: f32 = 12.0;
 /// Plate-local top padding above the first card.
 pub const SCENE_TOP_PAD_PT: f32 = 14.0;
@@ -898,9 +903,9 @@ fn push_card_shapes(
         let top_pad = CARD_INNER_PAD_Y_PT * sf;
         let handle_y = local_y + top_pad + (line_h - handle_size) * 0.5;
 
-        // Button chip: subtle rounded-rect backing. Slightly larger than
-        // the icon so the glyph doesn't fill it edge-to-edge.
-        let chip_pad = 2.0 * sf;
+        // Button chip: rounded-rect backing. Sized so the icon sits
+        // comfortably inside with breathing room.
+        let chip_pad = FOLD_CHIP_PAD_PT * sf;
         let chip_x = handle_x - chip_pad;
         let chip_y = handle_y - chip_pad;
         let chip_size = handle_size + chip_pad * 2.0;

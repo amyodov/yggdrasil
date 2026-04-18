@@ -423,15 +423,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let r = length(np);
         let falloff = 1.0 - smoothstep(0.35, 1.0, r);
         let tilt = -diag * falloff * in.dome;
-        // Overall brightness modulation ±12% at tilt = ±1.
-        let shade = 1.0 + tilt * 0.12;
+        // Overall brightness modulation. At small button sizes the dome
+        // needs strong contrast to read at all — ±40% gives clearly
+        // visible lit vs shadowed halves of a chip. (Still tunable: lower
+        // the multiplier if the chip starts to feel cartoonish.)
+        let shade = 1.0 + tilt * 0.40;
         fill_rgb = fill_rgb * shade;
-        // Tiny specular glint near the top-left quadrant's peak (a
-        // narrow bright spot where the dome's surface directly faces the
-        // light). Concentrated, low amplitude.
+        // Specular glint near the top-left quadrant's peak: a brighter
+        // spot where the dome's surface directly faces the light. Pushed
+        // up from a sub-pixel whisper to something readable at chip size.
         let spec_center = vec2<f32>(-0.40, -0.40);
         let spec_d = distance(np, spec_center);
-        let spec = exp(-spec_d * spec_d / 0.04) * falloff * in.dome * 0.10;
+        let spec = exp(-spec_d * spec_d / 0.06) * falloff * in.dome * 0.28;
         fill_rgb = fill_rgb + vec3<f32>(spec, spec, spec);
     }
 
