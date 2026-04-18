@@ -159,6 +159,21 @@ pub fn card_well_position(card: &Card, fold_progress: f32) -> f32 {
     fold_progress.clamp(0.0, 1.0) * (count - 1) as f32
 }
 
+/// A fold-switch press currently in progress. Captures the pre-press
+/// `fold_target` so a `cancel_press` can undo the preemptive slide when
+/// the user releases off-button.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivePress {
+    /// Which card's switch is being pressed.
+    pub card_id: CardId,
+    /// Which slot the user clicked down on (determines the finger-dent
+    /// position and, if committed, the new fold state).
+    pub clicked_state: FoldState,
+    /// The `fold_target` value that was active before the press began.
+    /// Restored on cancel; dropped on commit.
+    pub original_target: f32,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     /// The file currently shown on the right pane, with its highlight data.
@@ -179,13 +194,11 @@ pub struct AppState {
     pub scale_factor: f32,
     /// Last known cursor position in physical pixels. None if outside window.
     pub cursor_pos: Option<(f32, f32)>,
-    /// Which fold-switch button the user is currently pressing. Identified
-    /// by card + target state since a card renders one button per slot.
-    /// Drives the rubber-button press-state visual on the pressed chip. On
-    /// release *over the same button* the card's fold target is set to that
-    /// button's state (and the well begins sliding toward that slot); on
-    /// release elsewhere the press cancels.
-    pub pressing_button: Option<(CardId, FoldState)>,
+    /// The fold-switch press currently in progress, if any. Mousedown on a
+    /// slot *preempts* fold_target (so the well starts sliding toward the
+    /// clicked slot immediately); we remember the pre-press target here so
+    /// `cancel_press` can restore it when the user releases off-button.
+    pub press: Option<ActivePress>,
 }
 
 impl AppState {
@@ -199,7 +212,7 @@ impl AppState {
             window_size: WindowSize { width: 1280, height: 800 },
             scale_factor: 1.0,
             cursor_pos: None,
-            pressing_button: None,
+            press: None,
         }
     }
 
@@ -242,6 +255,36 @@ impl AppState {
     /// intent.
     pub fn set_fold_target(&mut self, card_id: CardId, target: FoldState) {
         self.fold_target.insert(card_id, target.target_progress());
+    }
+
+    /// Begin a fold-switch press. Captures the pre-press `fold_target` so
+    /// `cancel_press` can restore it, then preemptively sets `fold_target`
+    /// to the clicked slot — which makes the well start sliding toward the
+    /// clicked slot *immediately*, before the user even releases. That
+    /// sliding-during-press is the feedback that tells the user "I heard
+    /// you, the switch is moving."
+    pub fn begin_press(&mut self, card_id: CardId, clicked_state: FoldState) {
+        let original_target = self.fold_target.get(&card_id).copied().unwrap_or(1.0);
+        self.press =
+            Some(ActivePress { card_id, clicked_state, original_target });
+        self.set_fold_target(card_id, clicked_state);
+    }
+
+    /// Commit the press currently in progress. Leaves `fold_target` where
+    /// the press already pointed it; just clears the in-progress record.
+    /// No-op if no press is active.
+    pub fn commit_press(&mut self) {
+        self.press = None;
+    }
+
+    /// Cancel the press currently in progress (the user released off-button).
+    /// Restores `fold_target` to what it was before the press began — the
+    /// well will animate back to the original state on subsequent frames.
+    /// No-op if no press is active.
+    pub fn cancel_press(&mut self) {
+        if let Some(press) = self.press.take() {
+            self.fold_target.insert(press.card_id, press.original_target);
+        }
     }
 
     /// Width of the code pane in physical pixels.
@@ -341,6 +384,80 @@ mod tests {
         // Slot indices for the two states land at 0 and 1.
         assert_eq!(card_slot_index(&card, FoldState::Folded), Some(0));
         assert_eq!(card_slot_index(&card, FoldState::Unfolded), Some(1));
+    }
+
+    /// Press lifecycle: begin_press captures the pre-press fold_target and
+    /// preemptively redirects the target to the clicked slot. commit_press
+    /// keeps the new target; cancel_press restores the original.
+    #[test]
+    fn press_lifecycle_commit_keeps_target() {
+        use crate::analyzer::SourceFile;
+        use crate::cards::{Card, CardId, CardKind, MethodModifier, Visibility};
+        let card = Card {
+            id: CardId(0),
+            kind: CardKind::Function,
+            parent: None,
+            depth: 0,
+            name: "f".into(),
+            visibility: Visibility::Public,
+            modifier: MethodModifier::None,
+            decorators: vec![],
+            header_range: 0..0,
+            body_range: None,
+            full_range: 0..0,
+            header_lines: 0..0,
+            body_lines: None,
+            full_lines: 0..0,
+        };
+        let src = SourceFile {
+            path: std::path::PathBuf::from("/tmp/x.py"),
+            contents: String::new(),
+            lines: vec![],
+        };
+        let hl = HighlightedSource::from_parts(src, vec![], vec![0, 0]);
+        let mut state = AppState::new(hl, vec![card.clone()]);
+        // Start fully unfolded (target 1.0). Press the Folded slot.
+        state.set_fold_target(card.id, FoldState::Unfolded);
+        state.begin_press(card.id, FoldState::Folded);
+        assert_eq!(state.fold_target[&card.id], 0.0, "target redirected to clicked slot");
+        assert!(state.press.is_some());
+        state.commit_press();
+        assert!(state.press.is_none());
+        assert_eq!(state.fold_target[&card.id], 0.0, "commit keeps the new target");
+    }
+
+    #[test]
+    fn press_lifecycle_cancel_restores_target() {
+        use crate::analyzer::SourceFile;
+        use crate::cards::{Card, CardId, CardKind, MethodModifier, Visibility};
+        let card = Card {
+            id: CardId(0),
+            kind: CardKind::Function,
+            parent: None,
+            depth: 0,
+            name: "f".into(),
+            visibility: Visibility::Public,
+            modifier: MethodModifier::None,
+            decorators: vec![],
+            header_range: 0..0,
+            body_range: None,
+            full_range: 0..0,
+            header_lines: 0..0,
+            body_lines: None,
+            full_lines: 0..0,
+        };
+        let src = SourceFile {
+            path: std::path::PathBuf::from("/tmp/x.py"),
+            contents: String::new(),
+            lines: vec![],
+        };
+        let hl = HighlightedSource::from_parts(src, vec![], vec![0, 0]);
+        let mut state = AppState::new(hl, vec![card.clone()]);
+        state.set_fold_target(card.id, FoldState::Unfolded);
+        state.begin_press(card.id, FoldState::Folded);
+        state.cancel_press();
+        assert!(state.press.is_none());
+        assert_eq!(state.fold_target[&card.id], 1.0, "cancel restores original target");
     }
 
     /// Snippet cards have no fold-switch slots; `well_position` collapses to

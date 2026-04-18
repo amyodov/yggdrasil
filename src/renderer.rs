@@ -114,17 +114,16 @@ const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 0.85];
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
 
-/// Horizontal gap between slot chips on a card's fold-switch strip. Small
-/// enough that the buttons read as a coupled unit, large enough that
-/// individual chips are separable to the eye.
-const FOLD_SLOT_GAP_PT: f32 = 3.0;
+/// Per-slot horizontal stride inside the fold-switch widget body. Slots are
+/// equally spaced; the total widget width = `slot_count * FOLD_SLOT_STRIDE_PT`.
+/// Slot centers sit at `stride/2 + slot_index*stride`.
+const FOLD_SLOT_STRIDE_PT: f32 = 22.0;
 
-/// Well visual — the concave rectangle that slides between slots to
-/// indicate the card's current fold state. Slightly larger than a button
-/// chip on every side so a dark ring is visible around the at-rest button,
-/// and drawn behind the buttons so they appear to sit inside it.
-const FOLD_WELL_PAD_PT: f32 = 2.5;
-const FOLD_WELL_COLOR: [f32; 4] = [0.10, 0.12, 0.16, 0.90];
+/// Concave-dent size (both the state-well and the finger-press). Centered
+/// on a slot; smaller than the slot stride so the dent reads as a feature
+/// inside the widget rather than filling its whole slot.
+const FOLD_DENT_SIZE_PT: f32 = 17.0;
+const FOLD_DENT_COLOR: [f32; 4] = [0.08, 0.10, 0.14, 0.95];
 
 /// Icon for a given fold target. ChevronDown / ChevronRight are the only
 /// icons we have for now; M3.4's `HeaderOnly` will add a third.
@@ -906,104 +905,122 @@ fn push_card_shapes(
         ));
     }
 
-    // ---- Fold-switch strip — one raised button per reachable fold state,
-    //      plus a concave "well" that slides between slots to indicate the
-    //      card's current state. Three visuals per card:
-    //        (1) the well (concave, slightly larger than a button), drawn
-    //            first so the buttons sit on top;
-    //        (2) one button chip per slot (always convex — rubber-button
-    //            press-state inverts the chip's dome while the user holds
-    //            mouse-down on it);
-    //        (3) one icon per slot (permanent per target state).
+    // ---- Fold-switch widget — one wide stadium-shaped chip containing all
+    //      reachable fold states as semantic slots. Two concave "dents" can
+    //      appear on the surface:
+    //        (1) state-well — at the current `fold_progress` position,
+    //            tracks the fold animation so the well slides in lockstep
+    //            with the card body folding/unfolding;
+    //        (2) finger-press — at the slot the user is currently
+    //            mouse-down-ing, if any. Only visible during a press.
+    //      Icons sit at slot centers on top of everything.
     //      Skipped for snippets (no collapsible body → empty state list). ----
     let fold_states = card_fold_states(card);
     if !fold_states.is_empty() {
         let fold_progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
-
-        let handle_size = FOLD_HANDLE_SIZE_PT * sf;
-        let chip_pad = FOLD_CHIP_PAD_PT * sf;
-        let chip_size = handle_size + chip_pad * 2.0;
-        let slot_gap = FOLD_SLOT_GAP_PT * sf;
-        let slot_stride = chip_size + slot_gap;
+        let slot_stride = FOLD_SLOT_STRIDE_PT * sf;
         let slot_count = fold_states.len();
+        let widget_width = slot_stride * slot_count as f32;
 
-        // Right-align the whole strip inside the card header. Slot 0 (most-
-        // folded) is leftmost; slot N-1 (most-unfolded) is rightmost.
-        let strip_width = slot_stride * slot_count as f32 - slot_gap;
+        // Widget body height — a little taller than an icon so the stadium
+        // ends have room to curve without clipping the icon.
+        let icon_size = FOLD_HANDLE_SIZE_PT * sf;
+        let widget_height = icon_size + 2.0 * FOLD_CHIP_PAD_PT * sf;
+        // Corner radius = half height gives us a perfect stadium (flat
+        // middle top/bottom, semi-circular ends). That IS the "vertical
+        // pillowing" in the design — the ends *are* the bulge.
+        let widget_radius = widget_height * 0.5;
+
+        // Right-align the widget strip inside the card header.
         let strip_right = rect.x + rect.width - 10.0 * sf;
-        let strip_left = strip_right - strip_width;
+        let widget_x = strip_right - widget_width;
 
-        // Align vertically with the first text line of the card (not the
-        // geometric middle of header_h). Same rule as the single-handle
-        // design: line-one alignment anchors the control next to the
-        // card's identity line.
+        // Vertical alignment: center the widget on the first text line of
+        // the card header (not geometric middle of header_h). For tall
+        // decorated-function headers, line-one alignment anchors the
+        // control next to the card's identity line.
         let line_h = state.effective_line_height();
         let top_pad = CARD_INNER_PAD_Y_PT * sf;
-        let handle_y = local_y + top_pad + (line_h - handle_size) * 0.5;
-        let chip_y = handle_y - chip_pad;
+        let widget_y = local_y + top_pad + (line_h - widget_height) * 0.5;
 
-        // Well position: a floating-point slot index, interpolated from
-        // fold_progress. Integer values sit exactly over a slot; fractional
-        // values are mid-slide. The well animates in lockstep with the fold
-        // itself — both driven by the same `fold_progress`.
+        // ---- Widget body: a flat stadium. No dome (the dents are the only
+        //      depressed features — convex body shading would fight with
+        //      the concave dents visually). ----
+        let mut body_color = FOLD_CHIP_BG;
+        body_color[3] *= alpha;
+        out.push(RectInstance::solid(
+            widget_x,
+            widget_y,
+            widget_width,
+            widget_height,
+            body_color,
+            widget_radius,
+        ));
+
+        // Slot-center X for a given slot index.
+        let slot_center_x = |slot: usize| -> f32 {
+            widget_x + slot_stride * (slot as f32 + 0.5)
+        };
+
+        let dent_size = FOLD_DENT_SIZE_PT * sf;
+        let dent_corner = dent_size * 0.5;
+        let dent_y = widget_y + (widget_height - dent_size) * 0.5;
+        let mut dent_color = FOLD_DENT_COLOR;
+        dent_color[3] *= alpha;
+
+        // ---- Dent (1): state-well at the current fold_progress position.
+        //      Slides in lockstep with the fold animation. Always rendered. ----
         let well_slot = card_well_position(card, fold_progress);
-        let well_pad = FOLD_WELL_PAD_PT * sf;
-        let well_size = chip_size + well_pad * 2.0;
-        let well_x = strip_left + well_slot * slot_stride - well_pad;
-        let well_y = chip_y - well_pad;
-        let mut well_color = FOLD_WELL_COLOR;
-        well_color[3] *= alpha;
+        let well_center_x = widget_x + slot_stride * (well_slot + 0.5);
         out.push(
             RectInstance::solid(
-                well_x,
-                well_y,
-                well_size,
-                well_size,
-                well_color,
-                (4.0 * sf) + well_pad,
+                well_center_x - dent_size * 0.5,
+                dent_y,
+                dent_size,
+                dent_size,
+                dent_color,
+                dent_corner,
             )
             // Negative dome = concave shading: center valley, top-left in
-            // shadow, bottom-right rim-lit. Reads as a recess carved into
-            // the plate that a button can sit inside.
+            // shadow, bottom-right rim-lit. Reads as a recess in the
+            // widget surface.
             .with_dome(-FOLD_CHIP_DOME),
         );
 
-        // One button + icon per slot. Slot X = strip_left + slot_index*stride.
+        // ---- Dent (2): finger-press at the mousedown slot, if the user is
+        //      currently pressing *this* card. Drawn on top of the well so
+        //      a mid-slide overlap still shows the finger press clearly. ----
+        if let Some(press) = state.press {
+            if press.card_id == card.id {
+                if let Some(pressed_slot_idx) =
+                    fold_states.iter().position(|&s| s == press.clicked_state)
+                {
+                    let finger_x = slot_center_x(pressed_slot_idx);
+                    out.push(
+                        RectInstance::solid(
+                            finger_x - dent_size * 0.5,
+                            dent_y,
+                            dent_size,
+                            dent_size,
+                            dent_color,
+                            dent_corner,
+                        )
+                        .with_dome(-FOLD_CHIP_DOME),
+                    );
+                }
+            }
+        }
+
+        // ---- Icons: one per slot, centered on the slot. ----
+        let icon_y = widget_y + (widget_height - icon_size) * 0.5;
+        let mut icon_tint = FOLD_HANDLE_ICON;
+        icon_tint[3] *= alpha;
         for (slot, &target) in fold_states.iter().enumerate() {
-            let chip_x = strip_left + slot as f32 * slot_stride;
-            let handle_x = chip_x + chip_pad;
-
-            let mut chip_color = FOLD_CHIP_BG;
-            chip_color[3] *= alpha;
-
-            // Rubber-button press-state: only the button the user is
-            // actively holding down depresses; the rest stay convex. The
-            // current-state button is indicated by the well (behind it),
-            // not by its own dome.
-            let dome_amount = if state.pressing_button == Some((card.id, target)) {
-                -FOLD_CHIP_DOME
-            } else {
-                FOLD_CHIP_DOME
-            };
-
-            out.push(
-                RectInstance::solid(
-                    chip_x,
-                    chip_y,
-                    chip_size,
-                    chip_size,
-                    chip_color,
-                    4.0 * sf,
-                )
-                .with_dome(dome_amount),
-            );
-
-            let mut icon_tint = FOLD_HANDLE_ICON;
-            icon_tint[3] *= alpha;
+            let cx = slot_center_x(slot);
             icons_out.push(IconInstance::new(
-                handle_x,
-                handle_y,
-                handle_size,
+                cx - icon_size * 0.5,
+                icon_y,
+                icon_size,
                 icon_tint,
                 icon_for_fold_state(target).atlas_index(),
             ));
@@ -1031,12 +1048,13 @@ fn push_card_shapes(
     }
 }
 
-/// Return hit-test rects for every fold-switch button on `card`, paired
-/// with the `FoldState` that button commands. Empty for snippets (no
-/// collapsible body). Rects are plate-local physical pixels, NOT scrolled —
+/// Return hit-test rects for every slot on `card`'s fold-switch widget,
+/// paired with the `FoldState` that slot commands. Empty for snippets (no
+/// collapsible body). Each slot's hit rect is its stride-wide zone within
+/// the widget, widened vertically to the full card-header row for
+/// forgiving clicks. Rects are plate-local physical pixels, NOT scrolled —
 /// `app.rs` applies scroll + the scene-top offset before comparing against
-/// cursor position. Rects are widened vertically to the full header row so
-/// fold-clicks stay forgiving.
+/// cursor position.
 pub fn fold_buttons_scene(
     card: &Card,
     rect: &CardRect,
@@ -1047,21 +1065,17 @@ pub fn fold_buttons_scene(
         return Vec::new();
     }
     let sf = state.scale_factor;
-    let handle_size = FOLD_HANDLE_SIZE_PT * sf;
-    let chip_pad = FOLD_CHIP_PAD_PT * sf;
-    let chip_size = handle_size + chip_pad * 2.0;
-    let slot_gap = FOLD_SLOT_GAP_PT * sf;
-    let slot_stride = chip_size + slot_gap;
+    let slot_stride = FOLD_SLOT_STRIDE_PT * sf;
     let slot_count = fold_states.len();
+    let widget_width = slot_stride * slot_count as f32;
 
-    let strip_width = slot_stride * slot_count as f32 - slot_gap;
     let strip_right = rect.x + rect.width - 10.0 * sf;
-    let strip_left = strip_right - strip_width;
+    let widget_x = strip_right - widget_width;
 
     let mut out = Vec::with_capacity(slot_count);
     for (slot, &target) in fold_states.iter().enumerate() {
-        let chip_x = strip_left + slot as f32 * slot_stride;
-        out.push((target, (chip_x, rect.y, chip_size, rect.header_h)));
+        let slot_x = widget_x + slot as f32 * slot_stride;
+        out.push((target, (slot_x, rect.y, slot_stride, rect.header_h)));
     }
     out
 }

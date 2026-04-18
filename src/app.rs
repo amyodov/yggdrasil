@@ -128,31 +128,40 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
-                // Press-and-release semantics on a fold-switch button:
-                //   - Pressed over a button → remember which card + slot
-                //     (pressing_button) so that button's chip depresses.
-                //     Don't act yet; the user could still drag off it.
-                //   - Released over the same button → set the card's fold
-                //     target to that slot's state; the well will animate
-                //     to the new position on subsequent frames.
-                //   - Released elsewhere → cancel (no state change).
+                // Fold-switch press lifecycle:
+                //   - Pressed over a slot → `begin_press`. This captures
+                //     the pre-press fold_target AND redirects fold_target
+                //     to the clicked slot — the well starts sliding
+                //     toward the pressed slot immediately, before the
+                //     user even releases. That moving well IS the "I
+                //     heard you" feedback.
+                //   - Released over the same slot → commit. The well is
+                //     already (approaching) the target; just drop the
+                //     press record.
+                //   - Released elsewhere → cancel. Restore fold_target;
+                //     the well animates back.
                 let metrics = renderer.layout_metrics(&self.state);
                 match btn_state {
                     ElementState::Pressed => {
-                        let hit = hit_test_fold_button(&self.state, metrics);
-                        self.state.pressing_button = hit;
-                        if hit.is_some() {
+                        if let Some((card_id, target)) =
+                            hit_test_fold_button(&self.state, metrics)
+                        {
+                            self.state.begin_press(card_id, target);
                             renderer.window().request_redraw();
                         }
                     }
                     ElementState::Released => {
-                        if let Some(pressed) = self.state.pressing_button.take() {
-                            if hit_test_fold_button(&self.state, metrics) == Some(pressed) {
-                                let (card_id, target) = pressed;
-                                self.state.set_fold_target(card_id, target);
-                            }
-                            renderer.window().request_redraw();
+                        let Some(press) = self.state.press else {
+                            return;
+                        };
+                        let released_on =
+                            hit_test_fold_button(&self.state, metrics);
+                        if released_on == Some((press.card_id, press.clicked_state)) {
+                            self.state.commit_press();
+                        } else {
+                            self.state.cancel_press();
                         }
+                        renderer.window().request_redraw();
                     }
                 }
             }
