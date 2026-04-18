@@ -107,9 +107,11 @@ const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
 const FOLD_HANDLE_ICON: [f32; 4] = [0.78, 0.86, 0.96, 0.95];
 /// Fold handle "chip" background — a subtle rounded tint behind the icon
 /// so the fold control reads as a clickable button, not a floating glyph.
-/// Alpha is high enough that the dome shading reads clearly over the card
-/// tint underneath.
-const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 0.85];
+/// Fully opaque: the widget body and its overlaid dents share this color,
+/// and opaque compositing prevents alpha-compounding artifacts where the
+/// dent's translucent overdraw would otherwise tint the widget surface
+/// brighter under the dent than elsewhere.
+const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 1.0];
 /// Dome amount applied to the fold-handle chip (M3.2 Pass 3). 0.0 = flat;
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
@@ -945,28 +947,81 @@ fn push_card_shapes(
         let top_pad = CARD_INNER_PAD_Y_PT * sf;
         let widget_y = local_y + top_pad + (line_h - widget_height) * 0.5;
 
-        // ---- Widget body: same chip color, same corner radius, horizontal-
-        //      only pillow (1, 0) so the left/right sides bulge like a
-        //      single-button chip while the top/bottom stay flat. No dome
-        //      shading — the body is a flat raised surface; only the dents
-        //      carry depression. ----
+        // ---- Widget body: composed of three overlapping rects so the
+        //      outline reads as "single-button at each outer slot, flat
+        //      plateau between them" —
+        //
+        //        left cap         right cap
+        //        ╭──╮             ╭──╮
+        //        │  ├─────────────┤  │    ← plateau extends up/down
+        //        │  │   plateau   │  │       by `bulge_max` so its top
+        //        │  ├─────────────┤  │       matches each cap's pillow
+        //        ╰──╯             ╰──╯       peak (smooth join).
+        //
+        //      Each cap is a single-button pillow shape (mask = (1, 1));
+        //      the plateau is a sharp-cornered rect spanning slot-center-
+        //      first to slot-center-last. Where cap and plateau overlap,
+        //      both fill the same color with alpha=1 so there's no visible
+        //      seam. No dome shading on any of them — body is a flat
+        //      raised surface; dents carry the depression. ----
         let mut body_color = FOLD_CHIP_BG;
         body_color[3] *= alpha;
+
+        // Bulge amount used inside the shape shader for pillow caps
+        // (`min(half_w, half_h) * 0.12`). We duplicate the calc here so
+        // the plateau's vertical extension matches the cap's peak exactly,
+        // guaranteeing a seamless join at the slot-center transition.
+        let cap_half = chip_size * 0.5;
+        let bulge_max = cap_half * 0.12;
+
+        let slot_center_x =
+            |slot: usize| -> f32 { widget_x + slot_stride * (slot as f32 + 0.5) };
+
+        // Left cap: full single-button pillow at slot 0.
         out.push(
             RectInstance::solid(
                 widget_x,
                 widget_y,
-                widget_width,
+                slot_stride,
                 widget_height,
                 body_color,
                 widget_radius,
             )
-            .with_pillow_mask([1.0, 0.0]),
+            .with_pillow_mask([1.0, 1.0]),
         );
 
-        // Slot-center X for a given slot index.
-        let slot_center_x =
-            |slot: usize| -> f32 { widget_x + slot_stride * (slot as f32 + 0.5) };
+        // Right cap: same, at the last slot. Skipped when slot_count == 1
+        // (would coincide with the left cap).
+        if slot_count > 1 {
+            out.push(
+                RectInstance::solid(
+                    widget_x + (slot_count - 1) as f32 * slot_stride,
+                    widget_y,
+                    slot_stride,
+                    widget_height,
+                    body_color,
+                    widget_radius,
+                )
+                .with_pillow_mask([1.0, 1.0]),
+            );
+        }
+
+        // Plateau: flat rectangle from first slot center to last slot
+        // center, extended vertically by bulge_max so its top/bottom align
+        // with the caps' pillow peaks. Sharp corners (they're hidden
+        // underneath the caps' rounded corners at the join).
+        if slot_count >= 2 {
+            let first_cx = slot_center_x(0);
+            let last_cx = slot_center_x(slot_count - 1);
+            out.push(RectInstance::solid(
+                first_cx,
+                widget_y - bulge_max,
+                last_cx - first_cx,
+                widget_height + 2.0 * bulge_max,
+                body_color,
+                0.0,
+            ));
+        }
 
         // Dent geometry: IDENTICAL to a single-button chip — same size,
         // same color, same corner radius, same dome magnitude. The only
