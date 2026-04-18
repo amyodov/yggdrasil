@@ -114,12 +114,15 @@ const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 0.85];
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
 
-/// Icon for a given fold target. ChevronDown / ChevronRight are the only
-/// icons we have for now; M3.4's `HeaderOnly` will add a third.
+/// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
+/// an ordered visual progression — one bar for "just the header", two for
+/// "header + docstring" (M3.4), three for "fully unfolded body visible". At
+/// any card the widget reads left-to-right as less content → more content,
+/// teaching the state axis before the user learns what each slot does.
 fn icon_for_fold_state(state: FoldState) -> IconId {
     match state {
-        FoldState::Unfolded => IconId::ChevronDown,
-        FoldState::Folded => IconId::ChevronRight,
+        FoldState::Folded => IconId::Rows1,
+        FoldState::Unfolded => IconId::Rows3,
     }
 }
 

@@ -23,16 +23,31 @@ use wgpu::{
 /// we ever want bigger handles. Oversampling helps anti-aliasing.
 pub const ICON_PX: u32 = 48;
 
-/// Lucide icon catalogue. Order defines index in the atlas (chevron-down
-/// at index 0, chevron-right at index 1, ...).
+/// Lucide icon catalogue. Order defines index in the atlas.
+///
+/// The `Rows*` family is the fold-switch's visual vocabulary: each icon is
+/// a progressively denser stack of horizontal bars, matching how much
+/// content the card will show in that state (Rows1 = just the header;
+/// Rows2 = header + docstring; Rows3 = full body). They form an ordered
+/// visual series, so the switch reads left-to-right as "less content →
+/// more content" even before the user learns what each state does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // ChevronDown/Right are kept in the atlas for future UI
+// (tree expanders, breadcrumbs); Rows2 is reserved for M3.4's HeaderOnly
+// fold state. Cheap to keep — a few extra tiles in the atlas texture.
 pub enum IconId {
     ChevronDown = 0,
     ChevronRight = 1,
+    /// One horizontal bar — Lucide `minus`. Folded state (header only).
+    Rows1 = 2,
+    /// Two horizontal bars — Lucide `equal`. Header+docstring (M3.4).
+    Rows2 = 3,
+    /// Three horizontal bars — Lucide `menu`. Fully unfolded.
+    Rows3 = 4,
 }
 
 impl IconId {
-    pub const COUNT: u32 = 2;
+    pub const COUNT: u32 = 5;
 
     pub fn atlas_index(self) -> u32 {
         self as u32
@@ -148,6 +163,13 @@ fn rasterize_all(atlas_w: u32, atlas_h: u32) -> Pixmap {
 
     rasterize_chevron_down(&mut pixmap, 0, 0, ICON_PX);
     rasterize_chevron_right(&mut pixmap, ICON_PX, 0, ICON_PX);
+    // `rows-N`: N horizontal bars. Bars are spaced to match Lucide's
+    // `minus` / `equal` / `menu` — 1 bar at y=12; 2 bars at y=9,15;
+    // 3 bars at y=6,12,18. The three icons look like a clear ordered
+    // progression even at small render sizes.
+    rasterize_rows(&mut pixmap, 2 * ICON_PX, 0, ICON_PX, &[12.0]);
+    rasterize_rows(&mut pixmap, 3 * ICON_PX, 0, ICON_PX, &[9.0, 15.0]);
+    rasterize_rows(&mut pixmap, 4 * ICON_PX, 0, ICON_PX, &[6.0, 12.0, 18.0]);
 
     pixmap
 }
@@ -164,6 +186,16 @@ fn rasterize_chevron_down(pixmap: &mut Pixmap, ox: u32, oy: u32, size: u32) {
 fn rasterize_chevron_right(pixmap: &mut Pixmap, ox: u32, oy: u32, size: u32) {
     let pts = [(9.0, 6.0), (15.0, 12.0), (9.0, 18.0)];
     stroke_polyline(pixmap, ox, oy, size, &pts);
+}
+
+/// Rasterize N horizontal bars at the given y coordinates (in Lucide's
+/// 24-unit viewbox). Each bar spans x=4 to x=20 with rounded caps, matching
+/// the stroke width / cap style of Lucide's `minus` / `equal` / `menu`.
+fn rasterize_rows(pixmap: &mut Pixmap, ox: u32, oy: u32, size: u32, ys: &[f32]) {
+    for &y in ys {
+        let bar = [(4.0, y), (20.0, y)];
+        stroke_polyline(pixmap, ox, oy, size, &bar);
+    }
 }
 
 /// Stroke a polyline matching Lucide's default stroke settings:
