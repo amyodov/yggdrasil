@@ -10,8 +10,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
 use crate::cards::{layout_cards, CardId};
-use crate::renderer::{fold_handle_rect_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
-use crate::state::{AppState, WindowSize, LINES_PER_WHEEL_NOTCH};
+use crate::renderer::{fold_buttons_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
+use crate::state::{AppState, FoldState, WindowSize, LINES_PER_WHEEL_NOTCH};
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
@@ -128,25 +128,28 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
-                // Press-and-release semantics on the fold handle:
-                //   - Pressed over a handle → remember which one
-                //     (pressing_card) so the button renders depressed.
-                //     Don't toggle yet; user could still drag off it.
-                //   - Released over the same handle → toggle the fold.
-                //   - Released elsewhere → cancel (no toggle).
+                // Press-and-release semantics on a fold-switch button:
+                //   - Pressed over a button → remember which card + slot
+                //     (pressing_button) so that button's chip depresses.
+                //     Don't act yet; the user could still drag off it.
+                //   - Released over the same button → set the card's fold
+                //     target to that slot's state; the well will animate
+                //     to the new position on subsequent frames.
+                //   - Released elsewhere → cancel (no state change).
                 let metrics = renderer.layout_metrics(&self.state);
                 match btn_state {
                     ElementState::Pressed => {
-                        let hit = hit_test_fold_handle(&self.state, metrics);
-                        self.state.pressing_card = hit;
+                        let hit = hit_test_fold_button(&self.state, metrics);
+                        self.state.pressing_button = hit;
                         if hit.is_some() {
                             renderer.window().request_redraw();
                         }
                     }
                     ElementState::Released => {
-                        if let Some(pressed_id) = self.state.pressing_card.take() {
-                            if hit_test_fold_handle(&self.state, metrics) == Some(pressed_id) {
-                                self.state.toggle_fold(pressed_id);
+                        if let Some(pressed) = self.state.pressing_button.take() {
+                            if hit_test_fold_button(&self.state, metrics) == Some(pressed) {
+                                let (card_id, target) = pressed;
+                                self.state.set_fold_target(card_id, target);
                             }
                             renderer.window().request_redraw();
                         }
@@ -206,14 +209,19 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Is the cursor (from `state.cursor_pos`) over a fold handle? Free function
-/// so it doesn't alias with the `&mut renderer` borrow in the event loop.
+/// Is the cursor (from `state.cursor_pos`) over a fold-switch button?
+/// Returns the card + target FoldState of the hit button, or `None` if the
+/// cursor isn't over any. Free function so it doesn't alias with the `&mut
+/// renderer` borrow in the event loop.
 ///
-/// Coordinate systems (M3.1): `fold_handle_rect_scene` returns **plate-local**
-/// coordinates (x, y relative to the plate's top-left). The cursor comes in
-/// **window-space**. We convert cursor → plate-local using `plate_rect`, then
-/// compare.
-fn hit_test_fold_handle(state: &AppState, metrics: crate::cards::LayoutMetrics) -> Option<CardId> {
+/// Coordinate systems (M3.1): `fold_buttons_scene` returns **plate-local**
+/// coordinates (x, y relative to the plate's top-left). The cursor comes
+/// in **window-space**. We convert cursor → plate-local using `plate_rect`,
+/// then compare.
+fn hit_test_fold_button(
+    state: &AppState,
+    metrics: crate::cards::LayoutMetrics,
+) -> Option<(CardId, FoldState)> {
     let (cx, cy) = state.cursor_pos?;
     let (plate_pos, _) = plate_rect(state);
     let local_cx = cx - plate_pos[0];
@@ -222,11 +230,15 @@ fn hit_test_fold_handle(state: &AppState, metrics: crate::cards::LayoutMetrics) 
     let layout = layout_cards(&state.cards, &state.fold_progress, metrics);
     for card in &state.cards {
         let Some(rect) = layout.rects.get(&card.id) else { continue };
-        let (hx, hy, hw, hh) = fold_handle_rect_scene(card, rect, state);
-        // `hy` is plate-local, pre-scroll. Apply scroll + scene-top offset.
-        let local_hy = hy - state.scroll_y + scene_top_local;
-        if local_cx >= hx && local_cx <= hx + hw && local_cy >= local_hy && local_cy <= local_hy + hh {
-            return Some(card.id);
+        for (target, (hx, hy, hw, hh)) in fold_buttons_scene(card, rect, state) {
+            let local_hy = hy - state.scroll_y + scene_top_local;
+            if local_cx >= hx
+                && local_cx <= hx + hw
+                && local_cy >= local_hy
+                && local_cy <= local_hy + hh
+            {
+                return Some((card.id, target));
+            }
         }
     }
     None

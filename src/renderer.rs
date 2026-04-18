@@ -24,7 +24,7 @@
 //!
 //! - **Plate-local**, origin at plate's top-left, used by: layout, card
 //!   rects, text areas, shape positions inside the plate pass, and
-//!   `fold_handle_rect_scene`. Physical pixels.
+//!   `fold_buttons_scene`. Physical pixels.
 //! - **Window / screen**, origin at window's top-left, used by: cursor events,
 //!   plate position, composite output, background, egui. Physical pixels.
 //!
@@ -32,7 +32,7 @@
 //! model (today), `screen = plate.pos + plate_local`.
 //!
 //! Hit-testing in `app.rs` converts cursor from screen to plate-local before
-//! comparing against `fold_handle_rect_scene` output.
+//! comparing against `fold_buttons_scene` output.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,7 +61,9 @@ use crate::icon_pipeline::{IconInstance, IconRenderer};
 use crate::icons::IconId;
 use crate::plate::Plate;
 use crate::shapes::{RectInstance, ShapeRenderer};
-use crate::state::{AppState, HighlightedSource, WindowSize};
+use crate::state::{
+    card_fold_states, card_well_position, AppState, FoldState, HighlightedSource, WindowSize,
+};
 use crate::syntax::TokenKind;
 
 // ----------------------------------------------------------------------------
@@ -111,6 +113,27 @@ const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 0.85];
 /// Dome amount applied to the fold-handle chip (M3.2 Pass 3). 0.0 = flat;
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
+
+/// Horizontal gap between slot chips on a card's fold-switch strip. Small
+/// enough that the buttons read as a coupled unit, large enough that
+/// individual chips are separable to the eye.
+const FOLD_SLOT_GAP_PT: f32 = 3.0;
+
+/// Well visual — the concave rectangle that slides between slots to
+/// indicate the card's current fold state. Slightly larger than a button
+/// chip on every side so a dark ring is visible around the at-rest button,
+/// and drawn behind the buttons so they appear to sit inside it.
+const FOLD_WELL_PAD_PT: f32 = 2.5;
+const FOLD_WELL_COLOR: [f32; 4] = [0.10, 0.12, 0.16, 0.90];
+
+/// Icon for a given fold target. ChevronDown / ChevronRight are the only
+/// icons we have for now; M3.4's `HeaderOnly` will add a third.
+fn icon_for_fold_state(state: FoldState) -> IconId {
+    match state {
+        FoldState::Unfolded => IconId::ChevronDown,
+        FoldState::Folded => IconId::ChevronRight,
+    }
+}
 
 /// Rolling edge shown along the body's bottom during a fold animation.
 const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
@@ -883,64 +906,108 @@ fn push_card_shapes(
         ));
     }
 
-    // ---- Fold handle — Lucide chevron on a subtle button chip.
-    //      The chip (tinted rounded rect) reads as "clickable target"; the
-    //      chevron on top signals direction. Orientation: chevron-down (∨)
-    //      when body will be shown, chevron-right (>) when body will be
-    //      collapsed. Skipped for snippets (no collapsible body). ----
-    if card.kind != CardKind::Snippet {
-        let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
-        let icon_id = if target < 0.5 { IconId::ChevronRight } else { IconId::ChevronDown };
+    // ---- Fold-switch strip — one raised button per reachable fold state,
+    //      plus a concave "well" that slides between slots to indicate the
+    //      card's current state. Three visuals per card:
+    //        (1) the well (concave, slightly larger than a button), drawn
+    //            first so the buttons sit on top;
+    //        (2) one button chip per slot (always convex — rubber-button
+    //            press-state inverts the chip's dome while the user holds
+    //            mouse-down on it);
+    //        (3) one icon per slot (permanent per target state).
+    //      Skipped for snippets (no collapsible body → empty state list). ----
+    let fold_states = card_fold_states(card);
+    if !fold_states.is_empty() {
+        let fold_progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
 
         let handle_size = FOLD_HANDLE_SIZE_PT * sf;
-        let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
+        let chip_pad = FOLD_CHIP_PAD_PT * sf;
+        let chip_size = handle_size + chip_pad * 2.0;
+        let slot_gap = FOLD_SLOT_GAP_PT * sf;
+        let slot_stride = chip_size + slot_gap;
+        let slot_count = fold_states.len();
+
+        // Right-align the whole strip inside the card header. Slot 0 (most-
+        // folded) is leftmost; slot N-1 (most-unfolded) is rightmost.
+        let strip_width = slot_stride * slot_count as f32 - slot_gap;
+        let strip_right = rect.x + rect.width - 10.0 * sf;
+        let strip_left = strip_right - strip_width;
+
         // Align vertically with the first text line of the card (not the
-        // geometric middle of header_h). For a tall decorated-function
-        // header, center-of-header puts the chevron adrift in the middle
-        // of the decorator stack — unintuitive. Line-one alignment
-        // anchors the chevron next to the card's identity line.
+        // geometric middle of header_h). Same rule as the single-handle
+        // design: line-one alignment anchors the control next to the
+        // card's identity line.
         let line_h = state.effective_line_height();
         let top_pad = CARD_INNER_PAD_Y_PT * sf;
         let handle_y = local_y + top_pad + (line_h - handle_size) * 0.5;
-
-        // Button chip: rounded-rect backing. Sized so the icon sits
-        // comfortably inside with breathing room.
-        let chip_pad = FOLD_CHIP_PAD_PT * sf;
-        let chip_x = handle_x - chip_pad;
         let chip_y = handle_y - chip_pad;
-        let chip_size = handle_size + chip_pad * 2.0;
-        let mut chip_color = FOLD_CHIP_BG;
-        chip_color[3] *= alpha;
-        // Pressed state: negate the dome so both the pillow silhouette and
-        // the radial/diagonal shading invert — the button visibly depresses
-        // while the user holds the mouse down.
-        let dome_amount = if state.pressing_card == Some(card.id) {
-            -FOLD_CHIP_DOME
-        } else {
-            FOLD_CHIP_DOME
-        };
+
+        // Well position: a floating-point slot index, interpolated from
+        // fold_progress. Integer values sit exactly over a slot; fractional
+        // values are mid-slide. The well animates in lockstep with the fold
+        // itself — both driven by the same `fold_progress`.
+        let well_slot = card_well_position(card, fold_progress);
+        let well_pad = FOLD_WELL_PAD_PT * sf;
+        let well_size = chip_size + well_pad * 2.0;
+        let well_x = strip_left + well_slot * slot_stride - well_pad;
+        let well_y = chip_y - well_pad;
+        let mut well_color = FOLD_WELL_COLOR;
+        well_color[3] *= alpha;
         out.push(
             RectInstance::solid(
-                chip_x,
-                chip_y,
-                chip_size,
-                chip_size,
-                chip_color,
-                4.0 * sf,
+                well_x,
+                well_y,
+                well_size,
+                well_size,
+                well_color,
+                (4.0 * sf) + well_pad,
             )
-            .with_dome(dome_amount),
+            // Negative dome = concave shading: center valley, top-left in
+            // shadow, bottom-right rim-lit. Reads as a recess carved into
+            // the plate that a button can sit inside.
+            .with_dome(-FOLD_CHIP_DOME),
         );
 
-        // Icon itself.
-        let mut icon_tint = FOLD_HANDLE_ICON;
-        icon_tint[3] *= alpha;
-        icons_out.push(IconInstance::new(
-            handle_x,
-            handle_y,
-            handle_size,
-            icon_tint,
-            icon_id.atlas_index(),
-        ));
+        // One button + icon per slot. Slot X = strip_left + slot_index*stride.
+        for (slot, &target) in fold_states.iter().enumerate() {
+            let chip_x = strip_left + slot as f32 * slot_stride;
+            let handle_x = chip_x + chip_pad;
+
+            let mut chip_color = FOLD_CHIP_BG;
+            chip_color[3] *= alpha;
+
+            // Rubber-button press-state: only the button the user is
+            // actively holding down depresses; the rest stay convex. The
+            // current-state button is indicated by the well (behind it),
+            // not by its own dome.
+            let dome_amount = if state.pressing_button == Some((card.id, target)) {
+                -FOLD_CHIP_DOME
+            } else {
+                FOLD_CHIP_DOME
+            };
+
+            out.push(
+                RectInstance::solid(
+                    chip_x,
+                    chip_y,
+                    chip_size,
+                    chip_size,
+                    chip_color,
+                    4.0 * sf,
+                )
+                .with_dome(dome_amount),
+            );
+
+            let mut icon_tint = FOLD_HANDLE_ICON;
+            icon_tint[3] *= alpha;
+            icons_out.push(IconInstance::new(
+                handle_x,
+                handle_y,
+                handle_size,
+                icon_tint,
+                icon_for_fold_state(target).atlas_index(),
+            ));
+        }
     }
 
     // ---- Rolling edge during fold animation. ----
@@ -964,18 +1031,39 @@ fn push_card_shapes(
     }
 }
 
-/// Return a rectangle (plate-local physical pixels, NOT scrolled) for the
-/// fold-handle hit region of card `card`. Widened vertically to the full
-/// header row so fold-click is forgiving.
-///
-/// Coordinates are plate-local; `app.rs` converts cursor position from
-/// window-space to plate-local (via `plate_rect`) before comparing.
-pub fn fold_handle_rect_scene(_card: &Card, rect: &CardRect, state: &AppState) -> (f32, f32, f32, f32) {
+/// Return hit-test rects for every fold-switch button on `card`, paired
+/// with the `FoldState` that button commands. Empty for snippets (no
+/// collapsible body). Rects are plate-local physical pixels, NOT scrolled —
+/// `app.rs` applies scroll + the scene-top offset before comparing against
+/// cursor position. Rects are widened vertically to the full header row so
+/// fold-clicks stay forgiving.
+pub fn fold_buttons_scene(
+    card: &Card,
+    rect: &CardRect,
+    state: &AppState,
+) -> Vec<(FoldState, (f32, f32, f32, f32))> {
+    let fold_states = card_fold_states(card);
+    if fold_states.is_empty() {
+        return Vec::new();
+    }
     let sf = state.scale_factor;
     let handle_size = FOLD_HANDLE_SIZE_PT * sf;
-    let x = rect.x + rect.width - handle_size - 6.0 * sf;
-    let pad = 4.0 * sf;
-    (x - pad, rect.y, handle_size + pad * 2.0, rect.header_h)
+    let chip_pad = FOLD_CHIP_PAD_PT * sf;
+    let chip_size = handle_size + chip_pad * 2.0;
+    let slot_gap = FOLD_SLOT_GAP_PT * sf;
+    let slot_stride = chip_size + slot_gap;
+    let slot_count = fold_states.len();
+
+    let strip_width = slot_stride * slot_count as f32 - slot_gap;
+    let strip_right = rect.x + rect.width - 10.0 * sf;
+    let strip_left = strip_right - strip_width;
+
+    let mut out = Vec::with_capacity(slot_count);
+    for (slot, &target) in fold_states.iter().enumerate() {
+        let chip_x = strip_left + slot as f32 * slot_stride;
+        out.push((target, (chip_x, rect.y, chip_size, rect.header_h)));
+    }
+    out
 }
 
 // ----------------------------------------------------------------------------
@@ -1169,9 +1257,11 @@ mod tests {
         (state, cards)
     }
 
-    /// fold_handle_rect_scene returns a rect inside the card's header row.
+    /// `fold_buttons_scene` emits one rect per slot for a non-snippet card,
+    /// all inside the card's header row; the rectangles are non-overlapping
+    /// and left-to-right-ordered by slot index (Folded before Unfolded).
     #[test]
-    fn fold_handle_lives_inside_header() {
+    fn fold_buttons_live_inside_header() {
         let (state, cards) = test_state("def f():\n    pass\n");
         let m = LayoutMetrics {
             line_height: 20.0,
@@ -1183,9 +1273,36 @@ mod tests {
         };
         let layout = layout_cards(&cards, &state.fold_progress, m);
         let r = layout.rects[&cards[0].id];
-        let (_x, y, _w, h) = fold_handle_rect_scene(&cards[0], &r, &state);
-        assert!(y >= r.y);
-        assert!((y + h) <= (r.y + r.header_h + 0.01));
+        let buttons = fold_buttons_scene(&cards[0], &r, &state);
+        assert_eq!(buttons.len(), 2, "two-slot switch: Folded + Unfolded");
+        assert_eq!(buttons[0].0, FoldState::Folded);
+        assert_eq!(buttons[1].0, FoldState::Unfolded);
+        for (_, (_x, y, _w, h)) in &buttons {
+            assert!(*y >= r.y);
+            assert!((*y + *h) <= (r.y + r.header_h + 0.01));
+        }
+        // Slots don't overlap and Folded sits to the left of Unfolded.
+        let (_, (x0, _, w0, _)) = buttons[0];
+        let (_, (x1, _, _, _)) = buttons[1];
+        assert!(x0 + w0 <= x1 + 0.01);
+    }
+
+    /// Snippet cards have no fold-switch slots — `fold_buttons_scene`
+    /// returns empty so hit-testing never fires on them.
+    #[test]
+    fn fold_buttons_empty_for_snippets() {
+        let (state, cards) = test_state("import os\n");
+        let m = LayoutMetrics {
+            line_height: 20.0,
+            left: 0.0,
+            width: 400.0,
+            depth_indent: 0.0,
+            top_level_gap: 0.0,
+            card_inner_pad_y: 4.0,
+        };
+        let layout = layout_cards(&cards, &state.fold_progress, m);
+        let r = layout.rects[&cards[0].id];
+        assert!(fold_buttons_scene(&cards[0], &r, &state).is_empty());
     }
 
     /// A class card has a Class kind and gets the CLASS_BG palette. This
