@@ -98,9 +98,27 @@ const ACCENT_PROPERTY: [f32; 4] = [0.65, 0.98, 0.82, 1.0];
 /// Neutral slate for top-level orphan code (imports, constants, `if __name__`).
 const ACCENT_SNIPPET: [f32; 4] = [0.52, 0.58, 0.68, 0.85];
 
-/// Class spine (armature) — luminous cyan rail.
-const SPINE_COLOR: [f32; 4] = [0.72, 0.90, 1.00, 0.92];
-const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
+/// Class spine (armature) — foil inlay in the linen. Three visuals:
+/// (1) the foil **base**, a warm brass stripe that lies flush with the
+/// linen (no outer glow into the void, per YGG-33 "flush with the
+/// surface, no drop shadow");
+/// (2) the luminous **seam**, a hairline bright channel at the foil's
+/// center that reads as "light through an etched crack in the metal" —
+/// this is the Zone-3 semantic light the spine is permitted;
+/// (3) a **glint** — a small bright spot that drifts along the spine as
+/// the SkyLight direction changes and picks up the sky's color.
+const SPINE_FOIL_COLOR: [f32; 4] = [0.58, 0.42, 0.20, 1.00]; // burnished brass
+const SPINE_SEAM_COLOR: [f32; 4] = [1.00, 0.90, 0.60, 0.95]; // hot warm seam
+const SPINE_SEAM_GLOW: [f32; 4] = [0.95, 0.75, 0.35, 0.55]; // warm halo from the seam
+const SPINE_SEAM_WIDTH_PT: f32 = 1.0;
+const SPINE_SEAM_GLOW_RADIUS_PT: f32 = 4.0;
+/// Foil glint — the SkyLight-driven specular spot riding on the spine.
+/// Base color blends with SkyLight.color (60% sky / 40% base); much more
+/// sky-dominant than the lens specular because metal reflection takes
+/// more of the environment color than glass does.
+const SPINE_GLINT_BASE: [f32; 4] = [1.00, 0.95, 0.82, 0.95];
+const SPINE_GLINT_SIZE_PT: f32 = 4.0;
+const SPINE_GLINT_SKY_MIX: f32 = 0.55;
 
 /// Fold handle chevron icon tint (M3.2). Single colour; direction comes
 /// from the chevron orientation, not a palette flip.
@@ -196,10 +214,6 @@ pub const PANEL_INSET_PT: f32 = 14.0;
 const PANEL_CORNER_RADIUS_PT: f32 = 14.0;
 const CARD_CORNER_RADIUS_PT: f32 = 6.0;
 const ACCENT_CORNER_RADIUS_PT: f32 = 1.0;
-
-/// Spine (class armature) glow radius — the one card-zone element that is
-/// truly emissive, because it's a semantic light (the class's identity rail).
-const SPINE_GLOW_RADIUS_PT: f32 = 6.0;
 
 /// Plate outer bloom (Zone-2 halo into the void). Baked into the composite
 /// shader so it doesn't consume extra RT space and follows the plate's
@@ -913,7 +927,7 @@ fn push_card_shapes(
 
     // ---- Left-side accent strip ----
     let (mut accent_color, accent_width_pt) = match (card.kind, card.modifier, card.visibility) {
-        (CardKind::Class, _, _) => (SPINE_COLOR, SPINE_WIDTH_PT),
+        (CardKind::Class, _, _) => (SPINE_FOIL_COLOR, SPINE_WIDTH_PT),
         (CardKind::Snippet, _, _) => (ACCENT_SNIPPET, ACCENT_WIDTH_PT_PRIVATE),
         (_, MethodModifier::Classmethod, _) => (ACCENT_CLASSMETHOD, ACCENT_WIDTH_PT),
         (_, MethodModifier::Staticmethod, _) => (ACCENT_STATICMETHOD, ACCENT_WIDTH_PT),
@@ -931,21 +945,79 @@ fn push_card_shapes(
         ACCENT_CORNER_RADIUS_PT * sf,
     ));
 
-    // ---- Class spine (armature): a glowing rail on the left edge. ----
+    // ---- Class spine (armature) as foil inlay.
+    //      Three layered visuals: (1) brass foil base, flush with linen
+    //      (no halo into the void); (2) luminous hairline seam at the
+    //      foil's center — the semantic light that says "this class
+    //      emits energy"; (3) SkyLight-driven glint — a small bright spot
+    //      whose position on the spine tracks the unseen star and whose
+    //      color is sky-tinted, so the armature visibly reflects the
+    //      weather.  Matches YGG-33 foil-inlay doctrine and wires the
+    //      YGG-34 SkyLight consumer for metal. ----
     if card.kind == CardKind::Class {
-        let mut spine_color = SPINE_COLOR;
-        let mut spine_glow = SPINE_GLOW;
-        spine_color[3] *= alpha;
-        spine_glow[3] *= alpha;
+        let spine_top = local_y + 4.0 * sf;
+        let spine_height = rect.total_h() - 8.0 * sf;
+        let spine_left = rect.x;
+        let spine_width = SPINE_WIDTH_PT * sf;
+        let sky = state.sky_light();
+
+        // (1) Foil base — brass, flush, no outer glow.
+        let mut foil_color = SPINE_FOIL_COLOR;
+        foil_color[3] *= alpha;
+        out.push(RectInstance::solid(
+            spine_left,
+            spine_top,
+            spine_width,
+            spine_height,
+            foil_color,
+            spine_width * 0.5,
+        ));
+
+        // (2) Seam — hairline bright channel through the foil's center,
+        //     with a warm halo. This is the armature's emissive light
+        //     (Zone-3 semantic-light exception; permitted per CLAUDE.md).
+        let seam_width = SPINE_SEAM_WIDTH_PT * sf;
+        let seam_left = spine_left + (spine_width - seam_width) * 0.5;
+        let mut seam_color = SPINE_SEAM_COLOR;
+        let mut seam_glow = SPINE_SEAM_GLOW;
+        seam_color[3] *= alpha;
+        seam_glow[3] *= alpha;
         out.push(RectInstance::glowing(
-            rect.x,
-            local_y + 4.0 * sf,
-            SPINE_WIDTH_PT * sf,
-            rect.total_h() - 8.0 * sf,
-            spine_color,
-            SPINE_WIDTH_PT * sf * 0.5,
-            spine_glow,
-            SPINE_GLOW_RADIUS_PT * sf,
+            seam_left,
+            spine_top,
+            seam_width,
+            spine_height,
+            seam_color,
+            seam_width * 0.5,
+            seam_glow,
+            SPINE_SEAM_GLOW_RADIUS_PT * sf,
+        ));
+
+        // (3) Glint — sky-positioned specular on the metal. Vertical
+        //     position on the spine maps from SkyLight.direction.y
+        //     ([-1 = top, +1 = bottom] in our convention → clamped to
+        //     the spine's visible range). Color blends 55% sky into a
+        //     bright base so the glint picks up warmth / coolness from
+        //     whatever mood the sky is in. Alpha scales with intensity
+        //     so dim skies produce faint glints and peak skies shine.
+        let glint_size = SPINE_GLINT_SIZE_PT * sf;
+        let glint_pos_fraction = ((sky.direction.y + 1.0) * 0.5).clamp(0.0, 1.0);
+        let glint_cy = spine_top + spine_height * glint_pos_fraction;
+        let glint_cx = spine_left + spine_width * 0.5;
+        let mix = SPINE_GLINT_SKY_MIX;
+        let glint_color = [
+            SPINE_GLINT_BASE[0] * (1.0 - mix) + sky.color.x * mix,
+            SPINE_GLINT_BASE[1] * (1.0 - mix) + sky.color.y * mix,
+            SPINE_GLINT_BASE[2] * (1.0 - mix) + sky.color.z * mix,
+            SPINE_GLINT_BASE[3] * alpha * (0.3 + 0.7 * sky.intensity),
+        ];
+        out.push(RectInstance::solid(
+            glint_cx - glint_size * 0.5,
+            glint_cy - glint_size * 0.5,
+            glint_size,
+            glint_size,
+            glint_color,
+            glint_size * 0.5,
         ));
     }
 
