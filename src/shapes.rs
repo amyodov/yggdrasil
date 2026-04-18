@@ -33,17 +33,21 @@ pub struct RectInstance {
     pub corner_radius: f32,
     /// Halo falloff radius in physical pixels. 0 = no glow.
     pub glow_radius: f32,
-    /// Dome amount (M3.2 Pass 3): 0.0 = flat; >0.0 applies a subtle
+    /// Dome amount (M3.2 Pass 3): 0.0 = flat shading; >0.0 applies a subtle
     /// convex-lens shading to the rect's interior — lit on the top-left,
     /// shadowed on the bottom-right, matching the plate's implicit above-
     /// light. Makes rounded "chips" read as physical buttons without any
     /// geometry change. Typical values around 0.5–1.0; above that is
-    /// cartoonish. Negative values invert the *shading* only (center valley,
-    /// top-left shadow, bottom-right rim-lit) for a pressed-in concave read;
-    /// the outer pillow silhouette stays convex regardless of sign.
+    /// cartoonish. Negative values invert the shading (center valley,
+    /// top-left shadow, bottom-right rim-lit) for a pressed-in concave read.
     pub dome: f32,
-    /// Padding to keep the struct size a multiple of 16 bytes.
-    pub _pad: f32,
+    /// Per-axis pillow bulge scale. `pillow_mask[0]` scales horizontal
+    /// (left/right mid-edge) bulge; `pillow_mask[1]` scales vertical
+    /// (top/bottom mid-edge) bulge. Decoupled from `dome` so wider widgets
+    /// can pillow their short axes only (1.0, 0.0) while narrow chips
+    /// pillow all four edges (1.0, 1.0). (0.0, 0.0) = plain rounded-rect
+    /// silhouette — no pillow.
+    pub pillow_mask: [f32; 2],
 }
 
 impl RectInstance {
@@ -58,15 +62,30 @@ impl RectInstance {
             corner_radius,
             glow_radius: 0.0,
             dome: 0.0,
-            _pad: 0.0,
+            pillow_mask: [0.0, 0.0],
         }
     }
 
     /// Builder-style override: domed shading on an already-constructed rect.
-    /// `amount` 0.0 disables the effect; values around 0.6–1.0 read as a
-    /// subtle physical button.
+    /// `amount` 0.0 disables the shading; values around 0.6–1.0 read as a
+    /// subtle physical button. Also enables all-axis pillow bulge by default
+    /// so small chips (the common single-button case) keep their rubber-
+    /// button silhouette. Call `.with_pillow_mask` afterward to override the
+    /// per-axis bulge independently (e.g. horizontal-only for a wide strip).
     pub fn with_dome(mut self, amount: f32) -> Self {
         self.dome = amount;
+        if amount.abs() > 0.001 {
+            self.pillow_mask = [1.0, 1.0];
+        }
+        self
+    }
+
+    /// Builder-style override: per-axis pillow bulge scale. `mask[0]` scales
+    /// horizontal bulge (mid-left/right), `mask[1]` scales vertical bulge
+    /// (mid-top/bottom). (1.0, 0.0) = horizontal only; (0.0, 0.0) = plain
+    /// rounded-rect silhouette.
+    pub fn with_pillow_mask(mut self, mask: [f32; 2]) -> Self {
+        self.pillow_mask = mask;
         self
     }
 
@@ -90,7 +109,7 @@ impl RectInstance {
             corner_radius,
             glow_radius,
             dome: 0.0,
-            _pad: 0.0,
+            pillow_mask: [0.0, 0.0],
         }
     }
 }
@@ -200,6 +219,11 @@ impl ShapeRenderer {
                             offset: 56,
                             shader_location: 6,
                             format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 60,
+                            shader_location: 7,
+                            format: wgpu::VertexFormat::Float32x2,
                         },
                     ],
                 }],
@@ -327,6 +351,7 @@ struct Instance {
     @location(4) corner_radius: f32,
     @location(5) glow_radius:   f32,
     @location(6) dome:          f32,
+    @location(7) pillow_mask:   vec2<f32>,
 };
 
 struct VsOut {
@@ -338,6 +363,7 @@ struct VsOut {
     @location(4) corner_radius:  f32,
     @location(5) glow_radius:    f32,
     @location(6) dome:           f32,
+    @location(7) pillow_mask:    vec2<f32>,
 };
 
 fn corner_for(vi: u32) -> vec2<f32> {
@@ -354,10 +380,11 @@ fn corner_for(vi: u32) -> vec2<f32> {
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     // Expand the quad by glow_radius on each side so the halo fits. Also
-    // add a small pad when the dome is active so the pillowed outer edge
-    // (which pushes slightly outward at mid-edges) doesn't clip.
+    // add a small pad when the pillow is active on either axis, so the
+    // outward mid-edge bulge doesn't clip the quad.
     let g = inst.glow_radius;
-    let dome_pad = select(0.0, 2.0, abs(inst.dome) > 0.001);
+    let pillow_on = (inst.pillow_mask.x > 0.001) || (inst.pillow_mask.y > 0.001);
+    let dome_pad = select(0.0, 2.0, pillow_on);
     let pad = g + dome_pad;
     let expanded_pos  = inst.pos  - vec2<f32>(pad, pad);
     let expanded_size = inst.size + vec2<f32>(pad * 2.0, pad * 2.0);
@@ -382,6 +409,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.corner_radius = inst.corner_radius;
     out.glow_radius = inst.glow_radius;
     out.dome = inst.dome;
+    out.pillow_mask = inst.pillow_mask;
     return out;
 }
 
@@ -393,19 +421,22 @@ fn sdf_rounded_box(p: vec2<f32>, h: vec2<f32>, r: f32) -> f32 {
 }
 
 // "Squi-pillow" SDF: rounded rect whose edges bulge slightly outward at
-// their midpoints, corners staying put. Produces a pillow-on-a-couch
-// silhouette rather than a straight-edged rounded rect. `bulge` is the
-// extra outward reach at mid-edge in pixels.
+// their midpoints, corners staying put. `bulge` is the extra outward reach
+// at mid-edge in pixels; `mask.x` scales the horizontal bulge (mid-
+// left/right), `mask.y` scales the vertical bulge (mid-top/bottom). Setting
+// mask = (1, 0) gives a wide strip whose left/right sides arc out like a
+// single button but whose top/bottom stay flat — matches the fold-switch
+// widget. mask = (1, 1) is the classic pillow silhouette.
 //
-// Mechanism: at a mid-edge point, abs(p.x/h.x) and abs(p.y/h.y) differ
-// sharply (one is ~1, the other is ~0). At a corner, both are ~1. The
-// `mid_weight` expression peaks at mid-edges and is zero at corners, so
-// subtracting `bulge * mid_weight` from the rounded-rect SDF pushes the
-// silhouette outward only at the sides, not the corners.
-fn sdf_pillow_box(p: vec2<f32>, h: vec2<f32>, r: f32, bulge: f32) -> f32 {
+// Mechanism: at mid-right, norm.x > norm.y, so `max(0, norm.x - norm.y)`
+// is positive — the horizontal weight. At mid-top, the reverse. At
+// corners, both are ~1 so both weights are 0 — corners never bulge.
+fn sdf_pillow_box(p: vec2<f32>, h: vec2<f32>, r: f32, bulge: f32, mask: vec2<f32>) -> f32 {
     let d_rect = sdf_rounded_box(p, h, r);
     let norm = abs(p) / max(h, vec2<f32>(1.0, 1.0));
-    let mid_weight = abs(norm.x - norm.y);  // 0 at corners, ~1 at mid-edge
+    let h_weight = max(0.0, norm.x - norm.y); // peaks at mid-left/right
+    let v_weight = max(0.0, norm.y - norm.x); // peaks at mid-top/bottom
+    let mid_weight = mask.x * h_weight + mask.y * v_weight;
     return d_rect - bulge * mid_weight;
 }
 
@@ -414,10 +445,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Use the pillow SDF when this instance is domed; otherwise plain
     // rounded box. Pillow bulge scales with the smaller half-size so it
     // reads proportional regardless of chip dimensions.
-    // When dome is active we use the pillow SDF. The silhouette is always
-    // convex (outward bulge) regardless of dome sign — a real rubber button
-    // doesn't visibly change its outline when pressed, only its shading. The
-    // press-state reading comes entirely from the inner-shading flip below.
+    // Pillow silhouette activates when any mask component is nonzero —
+    // decoupled from dome shading so a wide widget body can pillow only
+    // its left/right edges (mask = (1, 0)) without any dome, while a
+    // single-button chip pillows all four edges (mask = (1, 1)).
+    let pillow_on = (in.pillow_mask.x > 0.001) || (in.pillow_mask.y > 0.001);
     let d = select(
         sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius),
         sdf_pillow_box(
@@ -425,8 +457,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             in.half_size,
             in.corner_radius,
             min(in.half_size.x, in.half_size.y) * 0.12,
+            in.pillow_mask,
         ),
-        abs(in.dome) > 0.001
+        pillow_on
     );
 
     // Anti-aliased fill: full inside, fade across ~1px of the edge.
