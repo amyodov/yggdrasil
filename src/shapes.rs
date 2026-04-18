@@ -33,8 +33,17 @@ pub struct RectInstance {
     pub corner_radius: f32,
     /// Halo falloff radius in physical pixels. 0 = no glow.
     pub glow_radius: f32,
+    /// Icon identifier (M3.2). Values:
+    /// - `0.0` → no icon; render the rounded-rect SDF (default).
+    /// - `1.0` → chevron-down (∨) — fold-handle, expanded state.
+    /// - `2.0` → chevron-right (>) — fold-handle, collapsed state.
+    ///
+    /// New kinds append upward; the fragment shader dispatches on rounded
+    /// integer ranges. Using f32 keeps the vertex-buffer layout simple —
+    /// no integer attribute rework required.
+    pub icon_kind: f32,
     /// Padding to keep the struct size a multiple of 16 bytes.
-    pub _pad: [f32; 2],
+    pub _pad: f32,
 }
 
 impl RectInstance {
@@ -48,7 +57,8 @@ impl RectInstance {
             glow_color: [0.0; 4],
             corner_radius,
             glow_radius: 0.0,
-            _pad: [0.0; 2],
+            icon_kind: 0.0,
+            _pad: 0.0,
         }
     }
 
@@ -71,9 +81,37 @@ impl RectInstance {
             glow_color,
             corner_radius,
             glow_radius,
-            _pad: [0.0; 2],
+            icon_kind: 0.0,
+            _pad: 0.0,
         }
     }
+
+    /// Build an icon instance — reuses the rect primitive but the fragment
+    /// shader dispatches to an icon SDF (parametric, no texture) based on
+    /// `kind`. Icons fit into `size × size`; color has the same premultiplied
+    /// semantics as `solid`. Pass `kind = IconKind::*` (see shapes.rs).
+    pub fn icon(x: f32, y: f32, size_px: f32, color: [f32; 4], kind: f32) -> Self {
+        Self {
+            pos: [x, y],
+            size: [size_px, size_px],
+            color,
+            glow_color: [0.0; 4],
+            corner_radius: 0.0,
+            glow_radius: 0.0,
+            icon_kind: kind,
+            _pad: 0.0,
+        }
+    }
+}
+
+/// Icon kind identifiers. The numeric values ride through to the WGSL shader
+/// where a dispatch chooses the right SDF. Keep them as `f32` constants to
+/// avoid integer/float conversions at the call site.
+pub mod icon_kind {
+    /// `0.0` is the default icon_kind for non-icon rects; no constant export
+    /// needed because `RectInstance::solid`/`glowing` set it implicitly.
+    pub const CHEVRON_DOWN: f32 = 1.0;
+    pub const CHEVRON_RIGHT: f32 = 2.0;
 }
 
 #[repr(C)]
@@ -175,6 +213,11 @@ impl ShapeRenderer {
                         wgpu::VertexAttribute {
                             offset: 52,
                             shader_location: 5,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 56,
+                            shader_location: 6,
                             format: wgpu::VertexFormat::Float32,
                         },
                     ],
@@ -302,6 +345,7 @@ struct Instance {
     @location(3) glow_color:    vec4<f32>,
     @location(4) corner_radius: f32,
     @location(5) glow_radius:   f32,
+    @location(6) icon_kind:     f32,
 };
 
 struct VsOut {
@@ -312,6 +356,7 @@ struct VsOut {
     @location(3) glow_color:     vec4<f32>,
     @location(4) corner_radius:  f32,
     @location(5) glow_radius:    f32,
+    @location(6) icon_kind:      f32,
 };
 
 fn corner_for(vi: u32) -> vec2<f32> {
@@ -351,6 +396,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.glow_color = inst.glow_color;
     out.corner_radius = inst.corner_radius;
     out.glow_radius = inst.glow_radius;
+    out.icon_kind = inst.icon_kind;
     return out;
 }
 
@@ -361,8 +407,60 @@ fn sdf_rounded_box(p: vec2<f32>, h: vec2<f32>, r: f32) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - r;
 }
 
+// Signed distance from `p` to the line segment a–b. Output is strictly
+// positive (distance to a 1D segment has no interior).
+fn sdf_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let t = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * t);
+}
+
+// Icon SDFs — parametric, no texture needed. Inputs are in NORMALIZED
+// space (position in [-1, 1]² mapped from the icon's bounding box).
+// Output is the normalized signed distance; the caller scales it into
+// pixel units for anti-aliasing.
+//
+// Thickness `th` is the half-width of the stroke in normalized units.
+
+// Chevron-down: ∨ with the tip at normalized y = +0.35 (screen-down).
+fn sdf_chevron_down(p: vec2<f32>, th: f32) -> f32 {
+    let d1 = sdf_segment(p, vec2<f32>(-0.55, -0.35), vec2<f32>(0.0, 0.35));
+    let d2 = sdf_segment(p, vec2<f32>( 0.0,  0.35), vec2<f32>(0.55, -0.35));
+    return min(d1, d2) - th;
+}
+
+// Chevron-right: > with the tip at normalized x = +0.35.
+fn sdf_chevron_right(p: vec2<f32>, th: f32) -> f32 {
+    let d1 = sdf_segment(p, vec2<f32>(-0.35, -0.55), vec2<f32>(0.35,  0.0));
+    let d2 = sdf_segment(p, vec2<f32>( 0.35,  0.0),  vec2<f32>(-0.35, 0.55));
+    return min(d1, d2) - th;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Icon dispatch. If this instance carries a non-zero icon_kind, compute
+    // the icon's SDF in normalized space, convert back to pixel units for
+    // anti-aliasing, and skip the rounded-rect + glow path entirely.
+    if (in.icon_kind > 0.5) {
+        // Normalize `rel_pos` to [-1, 1] using the smaller half-size
+        // dimension so icons stay square in non-square rects.
+        let s = min(in.half_size.x, in.half_size.y);
+        let np = in.rel_pos / max(s, 1e-4);
+        let th = 0.16;  // stroke half-width in normalized units
+        var d_norm: f32;
+        if (in.icon_kind < 1.5) {
+            d_norm = sdf_chevron_down(np, th);
+        } else {
+            d_norm = sdf_chevron_right(np, th);
+        }
+        // Convert normalized SDF to pixel-space distance.
+        let d_px = d_norm * s;
+        let a = clamp(0.5 - d_px, 0.0, 1.0) * in.color.a;
+        let rgb = in.color.rgb * a;
+        return vec4<f32>(rgb, a);
+    }
+
     let d = sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius);
 
     // Anti-aliased fill: full inside, fade across ~1px of the edge.

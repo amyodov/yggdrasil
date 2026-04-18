@@ -58,7 +58,7 @@ use crate::cards::{
 };
 use crate::composite::CompositeRenderer;
 use crate::plate::Plate;
-use crate::shapes::{RectInstance, ShapeRenderer};
+use crate::shapes::{icon_kind, RectInstance, ShapeRenderer};
 use crate::state::{AppState, HighlightedSource, WindowSize};
 use crate::syntax::TokenKind;
 
@@ -98,9 +98,9 @@ const ACCENT_SNIPPET: [f32; 4] = [0.52, 0.58, 0.68, 0.85];
 const SPINE_COLOR: [f32; 4] = [0.72, 0.90, 1.00, 0.92];
 const SPINE_GLOW: [f32; 4] = [0.55, 0.85, 1.00, 0.55];
 
-/// Fold handle block — color flips on target state.
-const FOLD_HANDLE_OPEN: [f32; 4] = [0.35, 0.46, 0.62, 0.95];
-const FOLD_HANDLE_CLOSED: [f32; 4] = [0.62, 0.36, 0.44, 0.95];
+/// Fold handle chevron icon tint (M3.2). Single colour; direction comes
+/// from the chevron orientation, not a palette flip.
+const FOLD_HANDLE_ICON: [f32; 4] = [0.72, 0.80, 0.92, 0.85];
 
 /// Rolling edge shown along the body's bottom during a fold animation.
 const ROLL_EDGE_COLOR: [f32; 4] = [0.85, 0.92, 1.00, 0.85];
@@ -120,7 +120,6 @@ pub const PANEL_INSET_PT: f32 = 14.0;
 const PANEL_CORNER_RADIUS_PT: f32 = 14.0;
 const CARD_CORNER_RADIUS_PT: f32 = 6.0;
 const ACCENT_CORNER_RADIUS_PT: f32 = 1.0;
-const HANDLE_CORNER_RADIUS_PT: f32 = 2.5;
 
 /// Spine (class armature) glow radius — the one card-zone element that is
 /// truly emissive, because it's a semantic light (the class's identity rail).
@@ -837,22 +836,26 @@ fn push_card_shapes(
         ));
     }
 
-    // ---- Fold handle — small rounded block, recolors on target fold state.
-    //      Skipped for snippets (they have no collapsible body). ----
+    // ---- Fold handle — chevron icon (M3.2). Orientation signals the
+    //      *current* fold target: chevron-down (∨) when body will be shown,
+    //      chevron-right (>) when body will be collapsed. Colour is a single
+    //      pale tint for both states — directional meaning comes from the
+    //      glyph shape, not from a colour flip. Skipped for snippets (no
+    //      collapsible body). ----
     if card.kind != CardKind::Snippet {
         let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
-        let mut handle_color = if target < 0.5 { FOLD_HANDLE_CLOSED } else { FOLD_HANDLE_OPEN };
+        let kind = if target < 0.5 { icon_kind::CHEVRON_RIGHT } else { icon_kind::CHEVRON_DOWN };
+        let mut handle_color = FOLD_HANDLE_ICON;
         handle_color[3] *= alpha;
         let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
         let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
         let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
-        out.push(RectInstance::solid(
+        out.push(RectInstance::icon(
             handle_x,
             handle_y,
             handle_size,
-            handle_size,
             handle_color,
-            HANDLE_CORNER_RADIUS_PT * sf,
+            kind,
         ));
     }
 
