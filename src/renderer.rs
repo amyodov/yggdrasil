@@ -116,6 +116,25 @@ const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 1.0];
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
 
+/// Which selected-state metaphor the fold widget uses.
+///
+/// `false` (default): **Lens.** The selected slot's icon is rendered at
+/// `FOLD_LENS_ICON_SIZE_PT`, floating slightly above the widget outline —
+/// reads as looking through a magnifying glass. No lens frame; the
+/// oversized icon itself *is* the lens.
+///
+/// `true`: **Dent.** A concave chip inside the widget, same size as the
+/// old single-button chip, drawn with inverted dome shading. Kept as a
+/// toggle because it was aesthetically refined but too low-contrast to
+/// reliably communicate state — some monitors / eyes couldn't see it.
+#[allow(dead_code)]
+const USE_DENT_METAPHOR: bool = false;
+
+/// Size of the magnified icon inside the lens. ~1.75x the regular handle
+/// size so the lens distinctly stands apart from the small slot icons
+/// and extends a pixel or two above the widget's pillow-peak silhouette.
+const FOLD_LENS_ICON_SIZE_PT: f32 = 28.0;
+
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
 /// "header + docstring" (M3.4), three for "fully unfolded body visible". At
@@ -1028,63 +1047,68 @@ fn push_card_shapes(
             ));
         }
 
-        // Dent geometry: IDENTICAL to a single-button chip — same size,
-        // same color, same corner radius, same dome magnitude. The only
-        // difference from the single button is that dome is negative
-        // (concave shading) because dents are always pressed-in.
-        let dent_size = chip_size;
-        let dent_corner = 4.0 * sf;
-        let dent_y = widget_y;
-        let mut dent_color = FOLD_CHIP_BG;
-        dent_color[3] *= alpha;
+        // ---- Dormant: concave-dent selected-state metaphor.
+        //      Kept behind `USE_DENT_METAPHOR` so the rubber-button dent
+        //      can be toggled back without rewriting anything. The lens
+        //      (below) won for visibility; the dent stays as a one-line
+        //      flip for comparison/polish. ----
+        if USE_DENT_METAPHOR {
+            // Dent geometry: IDENTICAL to a single-button chip — same size,
+            // same color, same corner radius, same dome magnitude. The only
+            // difference from the single button is that dome is negative
+            // (concave shading) because dents are always pressed-in.
+            let dent_size = chip_size;
+            let dent_corner = 4.0 * sf;
+            let dent_y = widget_y;
+            let mut dent_color = FOLD_CHIP_BG;
+            dent_color[3] *= alpha;
 
-        // ---- Dent (1): state-well at the current fold_progress position.
-        //      Concave shading only — no pillow bulge. A dent is an interior
-        //      feature of the widget; it should share the widget's outline,
-        //      not carry its own. `with_pillow_mask([0,0])` overrides the
-        //      default `with_dome` pillow enablement (which was built for
-        //      standalone single-button chips, not interior dents). ----
-        let well_slot = card_well_position(card, fold_progress);
-        let well_center_x = widget_x + slot_stride * (well_slot + 0.5);
-        out.push(
-            RectInstance::solid(
-                well_center_x - dent_size * 0.5,
-                dent_y,
-                dent_size,
-                dent_size,
-                dent_color,
-                dent_corner,
-            )
-            .with_dome(-FOLD_CHIP_DOME)
-            .with_pillow_mask([0.0, 0.0]),
-        );
+            // Dent (1): state-well at the current fold_progress position.
+            let well_slot = card_well_position(card, fold_progress);
+            let well_center_x = widget_x + slot_stride * (well_slot + 0.5);
+            out.push(
+                RectInstance::solid(
+                    well_center_x - dent_size * 0.5,
+                    dent_y,
+                    dent_size,
+                    dent_size,
+                    dent_color,
+                    dent_corner,
+                )
+                .with_dome(-FOLD_CHIP_DOME)
+                .with_pillow_mask([0.0, 0.0]),
+            );
 
-        // ---- Dent (2): finger-press at the mousedown slot, if the user
-        //      is currently pressing this card. Same "shading only, plain
-        //      rounded-rect silhouette" treatment as the state-well. ----
-        if let Some(press) = state.press {
-            if press.card_id == card.id {
-                if let Some(pressed_slot_idx) =
-                    fold_states.iter().position(|&s| s == press.clicked_state)
-                {
-                    let finger_x = slot_center_x(pressed_slot_idx);
-                    out.push(
-                        RectInstance::solid(
-                            finger_x - dent_size * 0.5,
-                            dent_y,
-                            dent_size,
-                            dent_size,
-                            dent_color,
-                            dent_corner,
-                        )
-                        .with_dome(-FOLD_CHIP_DOME)
-                        .with_pillow_mask([0.0, 0.0]),
-                    );
+            // Dent (2): finger-press at the mousedown slot, if pressing.
+            if let Some(press) = state.press {
+                if press.card_id == card.id {
+                    if let Some(pressed_slot_idx) = fold_states
+                        .iter()
+                        .position(|&s| s == press.clicked_state)
+                    {
+                        let finger_x = slot_center_x(pressed_slot_idx);
+                        out.push(
+                            RectInstance::solid(
+                                finger_x - dent_size * 0.5,
+                                dent_y,
+                                dent_size,
+                                dent_size,
+                                dent_color,
+                                dent_corner,
+                            )
+                            .with_dome(-FOLD_CHIP_DOME)
+                            .with_pillow_mask([0.0, 0.0]),
+                        );
+                    }
                 }
             }
         }
 
-        // ---- Icons: one per slot, centered on the slot. ----
+        // ---- Small icons at every slot, always visible.
+        //      These are the state signatures — reading left-to-right they
+        //      form the "less content → more content" progression. Always
+        //      drawn at full opacity; the lens (below) overdraws the
+        //      selected one with a magnified version. ----
         let icon_y = widget_y + (widget_height - handle_size) * 0.5;
         let mut icon_tint = FOLD_HANDLE_ICON;
         icon_tint[3] *= alpha;
@@ -1096,6 +1120,36 @@ fn push_card_shapes(
                 handle_size,
                 icon_tint,
                 icon_for_fold_state(target).atlas_index(),
+            ));
+        }
+
+        // ---- Lens: the magnified icon floating over the current-state
+        //      slot. No visible frame — the oversized icon IS the lens;
+        //      you see the magnification itself. Icon size exceeds the
+        //      widget's pillow-peak silhouette by a pixel or two, so the
+        //      lens visibly pokes above the widget body. Position slides
+        //      continuously with fold_progress; during a transition the
+        //      lens passes between slots, and its icon_id swaps at the
+        //      midpoint to whichever slot is nearest — the quick slide
+        //      makes the swap imperceptible in practice. ----
+        if !USE_DENT_METAPHOR {
+            let lens_slot_pos = card_well_position(card, fold_progress);
+            let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
+
+            let nearest_slot_f = lens_slot_pos.round();
+            let nearest_slot_idx = nearest_slot_f
+                .clamp(0.0, (slot_count - 1) as f32) as usize;
+            let lens_state = fold_states[nearest_slot_idx];
+
+            let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
+            let lens_icon_y = widget_y + (widget_height - lens_icon_size) * 0.5;
+
+            icons_out.push(IconInstance::new(
+                lens_x - lens_icon_size * 0.5,
+                lens_icon_y,
+                lens_icon_size,
+                icon_tint,
+                icon_for_fold_state(lens_state).atlas_index(),
             ));
         }
     }
