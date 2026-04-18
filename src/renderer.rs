@@ -886,7 +886,14 @@ fn push_card_shapes(
 
         let handle_size = FOLD_HANDLE_SIZE_PT * sf;
         let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
-        let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
+        // Align vertically with the first text line of the card (not the
+        // geometric middle of header_h). For a tall decorated-function
+        // header, center-of-header puts the chevron adrift in the middle
+        // of the decorator stack — unintuitive. Line-one alignment
+        // anchors the chevron next to the card's identity line.
+        let line_h = state.effective_line_height();
+        let top_pad = CARD_INNER_PAD_Y_PT * sf;
+        let handle_y = local_y + top_pad + (line_h - handle_size) * 0.5;
 
         // Button chip: subtle rounded-rect backing. Slightly larger than
         // the icon so the glyph doesn't fill it edge-to-edge.
