@@ -151,7 +151,10 @@ const CODE_PAD_RIGHT_PT: f32 = 20.0;
 const CARD_INNER_PAD_Y_PT: f32 = 7.0;
 const TOP_LEVEL_GAP_PT: f32 = 10.0;
 const DEPTH_INDENT_PT: f32 = 22.0;
-const FOLD_HANDLE_SIZE_FRAC: f32 = 0.5;
+/// Fold-handle icon size in logical points — fixed across all cards so
+/// every fold button reads as the same affordance, not a size-varies-by-
+/// card-kind puzzle. DPI-scaled at use-site.
+const FOLD_HANDLE_SIZE_PT: f32 = 12.0;
 const CARD_TEXT_INSET_PT: f32 = 12.0;
 /// Plate-local top padding above the first card.
 pub const SCENE_TOP_PAD_PT: f32 = 14.0;
@@ -881,7 +884,7 @@ fn push_card_shapes(
         let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
         let icon_id = if target < 0.5 { IconId::ChevronRight } else { IconId::ChevronDown };
 
-        let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
+        let handle_size = FOLD_HANDLE_SIZE_PT * sf;
         let handle_x = rect.x + rect.width - handle_size - 10.0 * sf;
         let handle_y = local_y + (rect.header_h - handle_size) * 0.5;
 
@@ -943,7 +946,7 @@ fn push_card_shapes(
 /// window-space to plate-local (via `plate_rect`) before comparing.
 pub fn fold_handle_rect_scene(_card: &Card, rect: &CardRect, state: &AppState) -> (f32, f32, f32, f32) {
     let sf = state.scale_factor;
-    let handle_size = rect.header_h * FOLD_HANDLE_SIZE_FRAC;
+    let handle_size = FOLD_HANDLE_SIZE_PT * sf;
     let x = rect.x + rect.width - handle_size - 6.0 * sf;
     let pad = 4.0 * sf;
     (x - pad, rect.y, handle_size + pad * 2.0, rect.header_h)
