@@ -135,6 +135,34 @@ const USE_DENT_METAPHOR: bool = false;
 /// and extends a pixel or two above the widget's pillow-peak silhouette.
 const FOLD_LENS_ICON_SIZE_PT: f32 = 28.0;
 
+/// Lens disc — the visible glass circle the magnified icon sits inside.
+/// Slightly larger than the magnified icon so its rim sits clear of the
+/// icon strokes. Corner radius is set to half the side at render time,
+/// which yields a perfect circle.
+const FOLD_LENS_DISC_SIZE_PT: f32 = 30.0;
+/// Glass tint — slightly lighter than the widget body so the disc reads
+/// as "collected light through glass" rather than as the same flat fill.
+/// Fully opaque so it covers the small icon in the slot it overlays.
+const FOLD_LENS_DISC_COLOR: [f32; 4] = [0.34, 0.40, 0.50, 1.0];
+
+/// Lens drop shadow — dark glow, slightly offset, creating the "floating
+/// above the widget" cue. Offset is small; the lens doesn't hover high.
+const FOLD_LENS_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.35];
+const FOLD_LENS_SHADOW_OFFSET_X_PT: f32 = 0.5;
+const FOLD_LENS_SHADOW_OFFSET_Y_PT: f32 = 1.5;
+const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
+
+/// Lens specular highlight — a tiny bright spot in the upper-left quadrant
+/// of the disc. One of the single strongest "this is glass" cues, barely
+/// costs anything (one small rect). Ships with a fixed position today; will
+/// move with SkyLight once that state lands.
+const FOLD_LENS_SPECULAR_COLOR: [f32; 4] = [0.95, 0.97, 1.00, 0.70];
+const FOLD_LENS_SPECULAR_SIZE_PT: f32 = 4.5;
+/// Specular offset from disc center, as a fraction of the disc radius.
+/// (-0.35, -0.35) puts the highlight in the upper-left — consistent with
+/// the plate's implicit above-left light direction.
+const FOLD_LENS_SPECULAR_OFFSET: [f32; 2] = [-0.35, -0.35];
+
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
 /// "header + docstring" (M3.4), three for "fully unfolded body visible". At
@@ -1104,46 +1132,122 @@ fn push_card_shapes(
             }
         }
 
-        // ---- Small icons at every slot, always visible.
-        //      These are the state signatures — reading left-to-right they
-        //      form the "less content → more content" progression. Always
-        //      drawn at full opacity; the lens (below) overdraws the
-        //      selected one with a magnified version. ----
+        // Compute lens position up-front: used both for the shape-pass
+        // lens visuals (drop shadow, disc, specular) and for hiding the
+        // small icon the lens is currently covering.
+        let lens_slot_pos = card_well_position(card, fold_progress);
+        let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
+
+        // ---- Lens glass: drop shadow + disc + specular. Drawn in the
+        //      shape pass, before icons. The disc's fill is opaque so
+        //      anything rendered in the shape pass underneath it is
+        //      hidden; the magnified icon sits on top in the icon pass
+        //      and reads as "seen through glass." ----
+        if !USE_DENT_METAPHOR {
+            let lens_disc_size = FOLD_LENS_DISC_SIZE_PT * sf;
+            let lens_disc_x = lens_x - lens_disc_size * 0.5;
+            let lens_disc_y = widget_y + (widget_height - lens_disc_size) * 0.5;
+            let lens_corner = lens_disc_size * 0.5; // perfect circle
+
+            // Drop shadow: transparent fill with a dark glow halo — the
+            // glow appears around the offset disc, giving the lens a
+            // subtle shadow on the widget below.
+            let mut lens_shadow_color = FOLD_LENS_SHADOW_COLOR;
+            lens_shadow_color[3] *= alpha;
+            out.push(RectInstance::glowing(
+                lens_disc_x + FOLD_LENS_SHADOW_OFFSET_X_PT * sf,
+                lens_disc_y + FOLD_LENS_SHADOW_OFFSET_Y_PT * sf,
+                lens_disc_size,
+                lens_disc_size,
+                [0.0, 0.0, 0.0, 0.0], // transparent fill — only the glow renders
+                lens_corner,
+                lens_shadow_color,
+                FOLD_LENS_SHADOW_GLOW_PT * sf,
+            ));
+
+            // Disc body: glass-tint fill + positive dome shading so the
+            // center reads brighter than the rim (convex-lens lighting
+            // cue — light gathers toward the center of a real magnifier).
+            let mut lens_disc_color = FOLD_LENS_DISC_COLOR;
+            lens_disc_color[3] *= alpha;
+            out.push(
+                RectInstance::solid(
+                    lens_disc_x,
+                    lens_disc_y,
+                    lens_disc_size,
+                    lens_disc_size,
+                    lens_disc_color,
+                    lens_corner,
+                )
+                .with_dome(FOLD_CHIP_DOME)
+                // No pillow on a round disc — a circle doesn't have mid-
+                // edge bulges; pillow here would look weird.
+                .with_pillow_mask([0.0, 0.0]),
+            );
+
+            // Specular highlight: a tiny bright circle in the upper-left
+            // quadrant of the disc. This single rect sells "glass" harder
+            // than any other element of the lens.
+            let spec_size = FOLD_LENS_SPECULAR_SIZE_PT * sf;
+            let spec_cx =
+                lens_x + FOLD_LENS_SPECULAR_OFFSET[0] * lens_disc_size * 0.5;
+            let spec_cy = lens_disc_y
+                + lens_disc_size * 0.5
+                + FOLD_LENS_SPECULAR_OFFSET[1] * lens_disc_size * 0.5;
+            let mut spec_color = FOLD_LENS_SPECULAR_COLOR;
+            spec_color[3] *= alpha;
+            out.push(RectInstance::solid(
+                spec_cx - spec_size * 0.5,
+                spec_cy - spec_size * 0.5,
+                spec_size,
+                spec_size,
+                spec_color,
+                spec_size * 0.5,
+            ));
+        }
+
+        // ---- Small icons at every slot except the one the lens is
+        //      currently covering. Skipped slots reappear as the lens
+        //      slides away (distance > threshold). Without this skip,
+        //      the small icon renders above the lens disc in the icon
+        //      pass and peeks through the magnified icon's transparent
+        //      stroke gaps. ----
         let icon_y = widget_y + (widget_height - handle_size) * 0.5;
         let mut icon_tint = FOLD_HANDLE_ICON;
         icon_tint[3] *= alpha;
         for (slot, &target) in fold_states.iter().enumerate() {
+            let distance = (lens_slot_pos - slot as f32).abs();
+            // Fade-out band: fully hidden within 0.45 slot-units of the
+            // lens, fully visible past 0.55. Narrow transition avoids a
+            // pop when the lens crosses a slot boundary.
+            let small_alpha = ((distance - 0.45) / 0.1).clamp(0.0, 1.0);
+            if small_alpha < 0.001 {
+                continue;
+            }
             let cx = slot_center_x(slot);
+            let mut small_tint = icon_tint;
+            small_tint[3] *= small_alpha;
             icons_out.push(IconInstance::new(
                 cx - handle_size * 0.5,
                 icon_y,
                 handle_size,
-                icon_tint,
+                small_tint,
                 icon_for_fold_state(target).atlas_index(),
             ));
         }
 
-        // ---- Lens: the magnified icon floating over the current-state
-        //      slot. No visible frame — the oversized icon IS the lens;
-        //      you see the magnification itself. Icon size exceeds the
-        //      widget's pillow-peak silhouette by a pixel or two, so the
-        //      lens visibly pokes above the widget body. Position slides
-        //      continuously with fold_progress; during a transition the
-        //      lens passes between slots, and its icon_id swaps at the
-        //      midpoint to whichever slot is nearest — the quick slide
-        //      makes the swap imperceptible in practice. ----
+        // ---- Magnified icon inside the lens. Drawn in the icon pass
+        //      after the small icons, so it sits on top of everything.
+        //      Icon_id picks the nearest slot's target; during the short
+        //      slide between slots the icon_id swaps at the midpoint. ----
         if !USE_DENT_METAPHOR {
-            let lens_slot_pos = card_well_position(card, fold_progress);
-            let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
-
-            let nearest_slot_f = lens_slot_pos.round();
-            let nearest_slot_idx = nearest_slot_f
-                .clamp(0.0, (slot_count - 1) as f32) as usize;
+            let nearest_slot_idx = lens_slot_pos
+                .round()
+                .clamp(0.0, (slot_count - 1) as f32)
+                as usize;
             let lens_state = fold_states[nearest_slot_idx];
-
             let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
             let lens_icon_y = widget_y + (widget_height - lens_icon_size) * 0.5;
-
             icons_out.push(IconInstance::new(
                 lens_x - lens_icon_size * 0.5,
                 lens_icon_y,
