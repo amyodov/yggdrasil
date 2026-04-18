@@ -50,6 +50,7 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 - [`YGG-7`](https://linear.app/laerad/issue/YGG-7) **M3.3 — Three-zone physicality: lit plate, physical cards** *(shipped)*. Plate = luminous surface; cards = drop-shadowed paper objects; semantic lights stay emissive.
   - [`YGG-20`](https://linear.app/laerad/issue/YGG-20) **M3.3.1 — Material textures and tinting (linen, paper, cardboard, blueprint, graph, vellum)** *(cross-depends on M3.8.1)*. Procedural grain + two-channel linen opacity (nebula diffuse + stars through weave holes).
   - [`YGG-19`](https://linear.app/laerad/issue/YGG-19) **M3.3.2 — Card top-edge rim light**. Matches the plate's lit-from-above cue.
+  - [`YGG-33`](https://linear.app/laerad/issue/YGG-33) **M3.3.x — Foil inlay for class armature**. Spine as flat-on-linen tinted metal (brass/bronze/silver/gunmetal) with a 1–2 px bevel; "rod" only legitimate at scroll-wound zones.
 - [`YGG-8`](https://linear.app/laerad/issue/YGG-8) **M3.4 — Fold anatomy, two-button fold, nested cascade**. Header / docstring / body bands; independent toggles; class-fold propagates to children.
 - [`YGG-9`](https://linear.app/laerad/issue/YGG-9) **M3.5a — `HeaderModel` ADT + Python builder, single-row layout** *(architectural)*. Language-agnostic header representation.
 - [`YGG-10`](https://linear.app/laerad/issue/YGG-10) **M3.5b — Block-flow reflow engine**. Multi-row header layout when width shrinks.
@@ -58,6 +59,7 @@ Each milestone is a stable checkpoint: the app runs, does something observable, 
 - [`YGG-12`](https://linear.app/laerad/issue/YGG-12) **M3.7 — Scroll-winding: pin zones with cylindrical curl**. Content wound onto cylinders at top/bottom; cap-glow at rod ends.
 - [`YGG-13`](https://linear.app/laerad/issue/YGG-13) **M3.8 — Background visibly alive** *(shipped)*. Volumetric nebula (far / mid / near cloud layers + turbulence), wide-diapason epoch, vignette, always-Poll event loop.
   - [`YGG-18`](https://linear.app/laerad/issue/YGG-18) **M3.8.1 — Stars and nova-pulses**. Point-light layer gated by linen weave holes (M3.3.1). Ships before M3.3.1.
+  - [`YGG-34`](https://linear.app/laerad/issue/YGG-34) **M3.8.x — SkyLight state: shared stellar tint across nebula and foil**. Single `SkyLight` (direction, color, intensity) evolves over ~10 min; per-layer `star_response` gates how much each cloud layer reacts; foil specular borrows the star's white balance. State half is remote-control-safe; shader wiring waits for eyes.
 
 ---
 
