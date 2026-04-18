@@ -93,6 +93,16 @@ The history axis is real time, not commit count. Twenty commits in a refactoring
 ### One state, derived rendering
 There is one global state: `timeline_position: f32`, plus camera transform, plus selections. Every visual element computes itself as a pure function of that state. No event-driven animation orchestration. This is the architectural principle that makes scrubbing trivial and reverse-playback free.
 
+### Scrubbing is a first-class concern at every step
+M7's scrubbing/diff-animation is not M7's problem alone. Every sub-milestone must answer "how does this work when the user scrubs between versions?" before it's considered done. State that can't be derived purely from `(timeline_position, scene_description)` is a bug.
+
+The rule applies at every granularity:
+- **Card** — stable identity across versions. A `CardId` that's tied to source-order in the current file (as we have today) will break under scrubbing; plan for a `LogicalCardId` derived from AST-matching.
+- **Line** — per-line animation state (added/removed flash, position offset, opacity). Glyphon's "one buffer per card" can't support per-line animation as-is; the rendering primitives must be laid down architecturally before the diff/animation features arrive (M6.0).
+- **Character** — only needed for rename morph. A narrow M7 special-case (spawn a micro-buffer for the animating token); do not pre-architect arbitrary per-glyph animation.
+
+Don't build structures that make any of these harder to bolt on later. Scrub-breaking identity / opacity / position is the common failure mode.
+
 ## Visual language
 
 ### The world: three zones, three visual rules
@@ -324,4 +334,14 @@ When Claude Code (or similar) works on this codebase:
 - When in doubt about state, re-read the **One state, derived rendering** principle. Avoid event-driven animation code.
 - Write the smallest parameterized test that covers a logical unit. Don't pad tests for coverage metrics.
 
-Milestones and concrete tasks live in `TASKS.md`.
+## Task tracking
+
+High-level roadmap (milestones M1–M8 and their sub-milestones at one-line granularity) lives in `TASKS.md`. The `TASKS.md` document is the git-visible story of *where this project is going and in what order*.
+
+Per-sub-milestone specs, status, and claiming live in **Linear** — project `Yggdrasil`, team `Yggdrasil`. Each sub-milestone has a `YGG-<n>` issue with the full description, parent links, and `blockedBy` relationships.
+
+When adding a new sub-milestone:
+1. Create it in Linear (full description, status, parent/blocks as appropriate).
+2. Add a one-line pointer in `TASKS.md` under the right milestone, referencing the Linear ID.
+
+This split keeps the git history coherent (roadmap decisions are diffable) without duplicating detailed descriptions.
