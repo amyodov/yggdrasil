@@ -327,32 +327,31 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 // opacity contract (diffuse light uniformly, point light through holes
 // only) will sample this same function to drive two different blend rules.
 fn linen_weave(p_px: vec2<f32>) -> f32 {
-    // One warp/weft cycle every N pixels. ~4px gives visible weave pattern
-    // on a typical 1x-DPI display; on Retina the weave looks finer but
-    // still clearly woven.
-    let thread_spacing = 4.2;
+    // Fine thread spacing — one warp/weft cycle every ~2.5 pixels. On a
+    // Retina display that's roughly one thread per logical pixel; on 1x
+    // the weave is a faint texture rather than a dominant grid.
+    let thread_spacing = 2.5;
 
-    // Slight per-row noise to wobble thread edges — "non-ideal" cloth.
+    // Microscopic per-row/col jitter so thread edges wobble. Overdoing
+    // this makes the weave look staticky.
     let row = floor(p_px.y / thread_spacing);
     let col = floor(p_px.x / thread_spacing);
-    let row_jitter = (fract(sin(row * 12.989) * 43758.55) - 0.5) * 0.6;
-    let col_jitter = (fract(sin(col * 78.233) * 43758.55) - 0.5) * 0.6;
+    let row_jitter = (fract(sin(row * 12.989) * 43758.55) - 0.5) * 0.15;
+    let col_jitter = (fract(sin(col * 78.233) * 43758.55) - 0.5) * 0.15;
 
-    // Position within the thread cycle.
-    let h_phase = (p_px.y / thread_spacing + col_jitter * 0.05) * 6.28318;
-    let v_phase = (p_px.x / thread_spacing + row_jitter * 0.05) * 6.28318;
+    let h_phase = (p_px.y / thread_spacing + col_jitter) * 6.28318;
+    let v_phase = (p_px.x / thread_spacing + row_jitter) * 6.28318;
     let h_wave = abs(sin(h_phase));
     let v_wave = abs(sin(v_phase));
 
-    // Thread occupies the lower part of each cycle (near zero-crossing).
-    // Smoothstep gives the soft anti-aliased thread edge.
-    let thread_edge_inner = 0.20;
-    let thread_edge_outer = 0.42;
+    // Wide, soft thread edges: thread alpha ramps gradually across the
+    // cycle. The result reads as a soft rhythmic texture rather than a
+    // high-contrast grid.
+    let thread_edge_inner = 0.15;
+    let thread_edge_outer = 0.80;
     let h = smoothstep(thread_edge_outer, thread_edge_inner, h_wave);
     let v = smoothstep(thread_edge_outer, thread_edge_inner, v_wave);
 
-    // Thread wherever either direction has a thread — union, not intersect.
-    // The holes are the small regions where NEITHER thread is present.
     return max(h, v);
 }
 
@@ -382,13 +381,16 @@ fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_in
     let rim = rim_falloff * upperness * rim_intensity;
     rgb = rgb + vec3<f32>(0.14, 0.18, 0.28) * rim;
 
-    // Linen weave: modulates per-pixel alpha. Threads mostly opaque; weave
-    // holes transparent so sky + lightnings read through them. A small
-    // baseline keeps the plate visible even in pure-hole pixels so it
-    // doesn't look like the material has been punched out.
+    // Linen weave: modulates per-pixel alpha by a rhythmic pattern. The
+    // contrast is intentionally narrow — the weave should be *felt* as
+    // texture, not seen as a prison grid. Baseline opacity stays around
+    // 0.55 so the plate holds its shape; threads add ~0.1 on top, holes
+    // subtract ~0.1. The nebula + lightnings show through the holes
+    // slightly more strongly than through threads, but the overall
+    // appearance is a woven material, not a transparent mesh.
     let weave = linen_weave(p);
-    let thread_alpha = 0.82;
-    let hole_alpha   = 0.06;
+    let thread_alpha = 0.62;
+    let hole_alpha   = 0.42;
     let alpha = mix(hole_alpha, thread_alpha, weave);
 
     return vec4<f32>(rgb * alpha, alpha);
