@@ -127,13 +127,12 @@ const SPINE_GLINT_SKY_MIX: f32 = 0.55;
 /// Fold handle chevron icon tint (M3.2). Single colour; direction comes
 /// from the chevron orientation, not a palette flip.
 const FOLD_HANDLE_ICON: [f32; 4] = [0.78, 0.86, 0.96, 0.95];
-/// Fold handle "chip" background — a subtle rounded tint behind the icon
-/// so the fold control reads as a clickable button, not a floating glyph.
-/// Fully opaque: the widget body and its overlaid dents share this color,
-/// and opaque compositing prevents alpha-compounding artifacts where the
-/// dent's translucent overdraw would otherwise tint the widget surface
-/// brighter under the dent than elsewhere.
-const FOLD_CHIP_BG: [f32; 4] = [0.22, 0.27, 0.36, 1.0];
+/// Fold handle "chip" background — the widget body's fill. Deliberately
+/// dark and low-saturation so the specular highlight and glint on top can
+/// land near full white and read as HDR-shiny (light gathered through
+/// glass / reflected off metal, against a restrained surface). If this
+/// color creeps up in lightness, the bright spots stop popping.
+const FOLD_CHIP_BG: [f32; 4] = [0.13, 0.16, 0.21, 1.0];
 /// Dome amount applied to the fold-handle chip (M3.2 Pass 3). 0.0 = flat;
 /// 1.0 = full effect. At small button sizes we need the full range.
 const FOLD_CHIP_DOME: f32 = 1.0;
@@ -164,35 +163,50 @@ const FOLD_LENS_ICON_SIZE_PT: f32 = 28.0;
 const FOLD_LENS_DISC_SIZE_PT: f32 = 30.0;
 /// Glass tint — slightly lighter than the widget body so the disc reads
 /// as "collected light through glass" rather than as the same flat fill.
-/// Fully opaque so it covers the small icon in the slot it overlays.
-const FOLD_LENS_DISC_COLOR: [f32; 4] = [0.34, 0.40, 0.50, 1.0];
+/// Kept dark (like the widget body) so the specular highlight on top
+/// reads as HDR-bright. Fully opaque so it covers the small icon in
+/// the slot it overlays.
+const FOLD_LENS_DISC_COLOR: [f32; 4] = [0.20, 0.24, 0.32, 1.0];
 
 /// Lens drop shadow — dark-gray glow (not pure black), slightly offset,
-/// creating the "floating above the widget" cue. Offset is small; the
-/// lens doesn't hover high.
-const FOLD_LENS_SHADOW_COLOR: [f32; 4] = [0.04, 0.05, 0.08, 0.35];
+/// creating the "floating above the widget" cue.
+const FOLD_LENS_SHADOW_COLOR: [f32; 4] = [0.03, 0.04, 0.06, 0.40];
 const FOLD_LENS_SHADOW_OFFSET_X_PT: f32 = 0.5;
 const FOLD_LENS_SHADOW_OFFSET_Y_PT: f32 = 1.5;
 const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
 
-/// Lens specular highlight — a tiny bright spot on the glass, positioned
-/// by the current `SkyLight` direction (the unseen star's reflection on
-/// the lens surface). Tinted by `SkyLight.color` so the glint borrows the
-/// sky's color temperature. Deliberately not pure white so the spot reads
-/// as "a bit lighter than the disc" rather than a white pixel-hole.
-const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [0.82, 0.85, 0.90, 0.75];
-const FOLD_LENS_SPECULAR_SIZE_PT: f32 = 4.5;
-/// Radius at which the specular sits on the disc, as a fraction of the
-/// disc radius. 0.80 puts it near the rim — the highlight visibly traces
-/// a circle as the sky's direction rotates (sun arcing across the sky →
-/// glint arcing around the lens edge).
-const FOLD_LENS_SPECULAR_RIM_RADIUS: f32 = 0.80;
+/// Lens specular highlight — an HDR-bright spot on the glass, positioned
+/// by the current `SkyLight` direction. Now near-full white: against the
+/// dark widget/disc it reads as the "lighter than anything else on
+/// screen" spot. Tinted slightly by `SkyLight.color` so it still warms
+/// with the sky.
+const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [1.00, 1.00, 1.00, 0.98];
+/// Three-dot tangent arc approximates a crescent-moon specular on the
+/// lens rim: one main bright dot at the reflection angle, two dimmer
+/// flanks at ±`FOLD_LENS_SPECULAR_ARC_SPREAD` radians tangentially
+/// along the rim. Together they form a thin highlight instead of a
+/// single "fat point." Flank alpha drops so the arc fades out smoothly
+/// away from its peak.
+const FOLD_LENS_SPECULAR_CENTER_SIZE_PT: f32 = 2.5;
+const FOLD_LENS_SPECULAR_FLANK_SIZE_PT: f32 = 2.0;
+const FOLD_LENS_SPECULAR_ARC_SPREAD: f32 = 0.28; // radians
+const FOLD_LENS_SPECULAR_FLANK_ALPHA: f32 = 0.45;
+/// Radius at which the specular arc sits on the disc, as a fraction of
+/// the disc radius. 0.82 puts it right on the visible rim.
+const FOLD_LENS_SPECULAR_RIM_RADIUS: f32 = 0.82;
 /// Blend weight of SkyLight.color into the specular highlight color.
-const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.35;
+/// 0.22 keeps the core bright-white while letting dawns warm it and
+/// noons leave it near-neutral.
+const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.22;
 /// Intensity threshold below which the specular disappears entirely.
 /// Matches "night" moods (intensity ~0.04–0.12) so the sun's reflection
 /// vanishes when the star is below the horizon.
 const FOLD_LENS_SPECULAR_NIGHT_THRESHOLD: f32 = 0.15;
+/// Per-lens angular perturbation range (radians). Each lens's card_id
+/// seeds a small offset so a grid of lenses doesn't glint in perfect
+/// lockstep — reads more like "many pieces of real glass, each slightly
+/// differently oriented" than "cloned lens objects."
+const FOLD_LENS_PER_CARD_JITTER: f32 = 0.22;
 
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
@@ -1283,42 +1297,72 @@ fn push_card_shapes(
                 .with_pillow_mask([0.0, 0.0]),
             );
 
-            // Specular highlight: sky-positioned, sky-tinted, hidden at
-            // night. Position is atan2-based — we take the angle of
-            // SkyLight.direction's xy-projection and place the spot on a
-            // fixed-radius circle near the disc rim, so the spot traces
-            // a circular arc around the lens as the sun rotates (morning
-            // spot on the right, noon on top, evening on the left).
-            // Hidden when intensity is below the night threshold —
-            // classic "sun below horizon, no glint" behavior.
+            // Specular: a three-dot tangent arc along the disc rim.
+            // One bright center dot at the sky-driven reflection angle
+            // plus two dimmer flanks at ±ARC_SPREAD tangentially around
+            // the rim — together they read as a thin crescent of light,
+            // not a fat point. Hidden at night (sun below horizon).
+            //
+            // Per-card jitter: each card's id contributes a small
+            // angular offset so a stack of class cards doesn't glint in
+            // lockstep — the plate reads as "many real glass lenses"
+            // rather than "N identical clones rendered N times."
             let spec_intensity = ((sky.intensity - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
                 / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
                 .clamp(0.0, 1.0);
             if spec_intensity > 0.001 {
-                let spec_size = FOLD_LENS_SPECULAR_SIZE_PT * sf;
+                let base_angle = sky.direction.y.atan2(sky.direction.x);
+                // Deterministic per-card jitter: sin of a prime multiplier
+                // gives a fractal-looking spread across card ids without
+                // any allocations.
+                let card_seed = card.id.0 as f32 * 2.3998;
+                let jitter = card_seed.sin() * FOLD_LENS_PER_CARD_JITTER;
+                let angle = base_angle + jitter;
+
                 let spec_rim = lens_disc_size * 0.5 * FOLD_LENS_SPECULAR_RIM_RADIUS;
-                // angle in sky's xy-plane; |dir.xy| may be small but angle
-                // remains well-defined except at the pole (dir.xy == 0),
-                // where atan2 returns 0 — fine for our purposes.
-                let angle = sky.direction.y.atan2(sky.direction.x);
-                let spec_cx = lens_x + angle.cos() * spec_rim;
-                let spec_cy =
-                    lens_disc_y + lens_disc_size * 0.5 + angle.sin() * spec_rim;
                 let mix = FOLD_LENS_SPECULAR_SKY_MIX;
-                let spec_color = [
+                let spec_base = [
                     FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
                     FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
                     FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
-                    FOLD_LENS_SPECULAR_BASE[3] * alpha * spec_intensity,
                 ];
-                out.push(RectInstance::solid(
-                    spec_cx - spec_size * 0.5,
-                    spec_cy - spec_size * 0.5,
-                    spec_size,
-                    spec_size,
-                    spec_color,
-                    spec_size * 0.5,
-                ));
+                let alpha_full =
+                    FOLD_LENS_SPECULAR_BASE[3] * alpha * spec_intensity;
+
+                // One emit per dot: (angular offset, size, alpha scale).
+                let dots: [(f32, f32, f32); 3] = [
+                    (-FOLD_LENS_SPECULAR_ARC_SPREAD,
+                     FOLD_LENS_SPECULAR_FLANK_SIZE_PT,
+                     FOLD_LENS_SPECULAR_FLANK_ALPHA),
+                    (0.0,
+                     FOLD_LENS_SPECULAR_CENTER_SIZE_PT,
+                     1.0),
+                    (FOLD_LENS_SPECULAR_ARC_SPREAD,
+                     FOLD_LENS_SPECULAR_FLANK_SIZE_PT,
+                     FOLD_LENS_SPECULAR_FLANK_ALPHA),
+                ];
+                for (ang_off, size_pt, a_scale) in dots {
+                    let a = angle + ang_off;
+                    let dot_size = size_pt * sf;
+                    let dot_cx = lens_x + a.cos() * spec_rim;
+                    let dot_cy = lens_disc_y
+                        + lens_disc_size * 0.5
+                        + a.sin() * spec_rim;
+                    let dot_color = [
+                        spec_base[0],
+                        spec_base[1],
+                        spec_base[2],
+                        alpha_full * a_scale,
+                    ];
+                    out.push(RectInstance::solid(
+                        dot_cx - dot_size * 0.5,
+                        dot_cy - dot_size * 0.5,
+                        dot_size,
+                        dot_size,
+                        dot_color,
+                        dot_size * 0.5,
+                    ));
+                }
             }
         }
 
@@ -1352,31 +1396,42 @@ fn push_card_shapes(
             ));
         }
 
-        // ---- Magnified icon inside the lens. Drawn in the icon pass
-        //      after the small icons, so it sits on top of everything.
-        //      `with_distort(1.0)` switches this instance onto the
-        //      aberration shader path: barrel distortion (convex-lens
-        //      outward curvature) + chromatic fringing (red/blue split
-        //      near the rim). The magnified icon reads as "seen through
-        //      real glass" rather than "just scaled up." ----
+        // ---- Magnified icon inside the lens.  `with_distort(1.0)`
+        //      switches this onto the aberration shader path (barrel
+        //      + chromatic fringing). The icon's *alpha* fades to 0 at
+        //      slide midpoints so the icon_id swap happens while the
+        //      glyph is invisible — the lens becomes a pure piece of
+        //      empty glass for the fraction of a second that its
+        //      identity is in transit, then fades back in carrying the
+        //      new state's icon. Matches how a real magnifier reads
+        //      when it passes between two distinct objects on a desk. ----
         if !USE_DENT_METAPHOR {
             let nearest_slot_idx = lens_slot_pos
                 .round()
                 .clamp(0.0, (slot_count - 1) as f32)
                 as usize;
             let lens_state = fold_states[nearest_slot_idx];
-            let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
-            let lens_icon_y = widget_y + (widget_height - lens_icon_size) * 0.5;
-            icons_out.push(
-                IconInstance::new(
-                    lens_x - lens_icon_size * 0.5,
-                    lens_icon_y,
-                    lens_icon_size,
-                    icon_tint,
-                    icon_for_fold_state(lens_state).atlas_index(),
-                )
-                .with_distort(1.0),
-            );
+            // Distance-to-nearest-slot in slot units (0 at slot, 0.5 at
+            // midpoint). Alpha = 1 at slot, 0 at midpoint.
+            let dist_to_nearest = (lens_slot_pos - nearest_slot_idx as f32).abs();
+            let lens_icon_alpha = (1.0 - 2.0 * dist_to_nearest).clamp(0.0, 1.0);
+            if lens_icon_alpha > 0.001 {
+                let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
+                let lens_icon_y =
+                    widget_y + (widget_height - lens_icon_size) * 0.5;
+                let mut lens_tint = icon_tint;
+                lens_tint[3] *= lens_icon_alpha;
+                icons_out.push(
+                    IconInstance::new(
+                        lens_x - lens_icon_size * 0.5,
+                        lens_icon_y,
+                        lens_icon_size,
+                        lens_tint,
+                        icon_for_fold_state(lens_state).atlas_index(),
+                    )
+                    .with_distort(1.0),
+                );
+            }
         }
     }
 

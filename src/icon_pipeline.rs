@@ -346,18 +346,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dist = sqrt(r2);
 
     // Barrel distortion: convex lens bulges outward — points farther
-    // from center get pushed further still. For our glyph icons at the
-    // lens's size, 0.35 × r² gives visible curvature on the stroke
-    // ends without turning the icon into a blob.
-    let barrel_k = in.distort * 0.35;
+    // from center get pushed further still. Bumped to 0.95 × r² so the
+    // curvature on the stroke ends is actually readable at icon scale
+    // (previously 0.35 was sub-pixel on most renders).
+    let barrel_k = in.distort * 0.95;
     let distorted_p = p * (1.0 + barrel_k * r2);
     let distorted_uv = distorted_p + vec2<f32>(0.5, 0.5);
 
     // Chromatic aberration: R shifts outward, B inward radially.
     // `radial_dir` is the unit vector toward the rim from center;
-    // `ca_amount` ramps from 0 at center to max near the edge.
+    // `ca_amount` ramps from 0 at center to max near the edge. Bumped
+    // to 0.075 × dist so the R/B fringing at stroke edges is clearly
+    // visible (previously 0.020 was sub-pixel).
     let radial_dir = select(vec2<f32>(0.0, 0.0), p / max(dist, 1e-5), dist > 1e-5);
-    let ca_amount = in.distort * 0.020 * dist;
+    let ca_amount = in.distort * 0.075 * dist;
 
     let r_mask = sample_mask(distorted_uv + radial_dir * ca_amount, in.icon_index);
     let g_mask = sample_mask(distorted_uv, in.icon_index);
