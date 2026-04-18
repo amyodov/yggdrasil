@@ -38,8 +38,9 @@ pub struct RectInstance {
     /// shadowed on the bottom-right, matching the plate's implicit above-
     /// light. Makes rounded "chips" read as physical buttons without any
     /// geometry change. Typical values around 0.5–1.0; above that is
-    /// cartoonish. Negative values invert the effect — concave, pressed-in
-    /// (center darker, bottom-right lit, pillow mid-edges bulge inward).
+    /// cartoonish. Negative values invert the *shading* only (center valley,
+    /// top-left shadow, bottom-right rim-lit) for a pressed-in concave read;
+    /// the outer pillow silhouette stays convex regardless of sign.
     pub dome: f32,
     /// Padding to keep the struct size a multiple of 16 bytes.
     pub _pad: f32,
@@ -413,16 +414,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Use the pillow SDF when this instance is domed; otherwise plain
     // rounded box. Pillow bulge scales with the smaller half-size so it
     // reads proportional regardless of chip dimensions.
-    // When dome is active we use the pillow SDF. Sign of `dome` controls
-    // whether the mid-edge bulge reaches outward (convex, unpressed) or
-    // inward (concave, pressed-in).
+    // When dome is active we use the pillow SDF. The silhouette is always
+    // convex (outward bulge) regardless of dome sign — a real rubber button
+    // doesn't visibly change its outline when pressed, only its shading. The
+    // press-state reading comes entirely from the inner-shading flip below.
     let d = select(
         sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius),
         sdf_pillow_box(
             in.rel_pos,
             in.half_size,
             in.corner_radius,
-            sign(in.dome) * min(in.half_size.x, in.half_size.y) * 0.12,
+            min(in.half_size.x, in.half_size.y) * 0.12,
         ),
         abs(in.dome) > 0.001
     );
