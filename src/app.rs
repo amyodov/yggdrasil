@@ -127,11 +127,30 @@ impl ApplicationHandler for App {
                 self.state.cursor_pos = None;
             }
 
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
+                // Press-and-release semantics on the fold handle:
+                //   - Pressed over a handle → remember which one
+                //     (pressing_card) so the button renders depressed.
+                //     Don't toggle yet; user could still drag off it.
+                //   - Released over the same handle → toggle the fold.
+                //   - Released elsewhere → cancel (no toggle).
                 let metrics = renderer.layout_metrics(&self.state);
-                if let Some(card_id) = hit_test_fold_handle(&self.state, metrics) {
-                    self.state.toggle_fold(card_id);
-                    renderer.window().request_redraw();
+                match btn_state {
+                    ElementState::Pressed => {
+                        let hit = hit_test_fold_handle(&self.state, metrics);
+                        self.state.pressing_card = hit;
+                        if hit.is_some() {
+                            renderer.window().request_redraw();
+                        }
+                    }
+                    ElementState::Released => {
+                        if let Some(pressed_id) = self.state.pressing_card.take() {
+                            if hit_test_fold_handle(&self.state, metrics) == Some(pressed_id) {
+                                self.state.toggle_fold(pressed_id);
+                            }
+                            renderer.window().request_redraw();
+                        }
+                    }
                 }
             }
 

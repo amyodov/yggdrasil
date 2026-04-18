@@ -38,7 +38,8 @@ pub struct RectInstance {
     /// shadowed on the bottom-right, matching the plate's implicit above-
     /// light. Makes rounded "chips" read as physical buttons without any
     /// geometry change. Typical values around 0.5–1.0; above that is
-    /// cartoonish.
+    /// cartoonish. Negative values invert the effect — concave, pressed-in
+    /// (center darker, bottom-right lit, pillow mid-edges bulge inward).
     pub dome: f32,
     /// Padding to keep the struct size a multiple of 16 bytes.
     pub _pad: f32,
@@ -355,7 +356,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     // add a small pad when the dome is active so the pillowed outer edge
     // (which pushes slightly outward at mid-edges) doesn't clip.
     let g = inst.glow_radius;
-    let dome_pad = select(0.0, 2.0, inst.dome > 0.001);
+    let dome_pad = select(0.0, 2.0, abs(inst.dome) > 0.001);
     let pad = g + dome_pad;
     let expanded_pos  = inst.pos  - vec2<f32>(pad, pad);
     let expanded_size = inst.size + vec2<f32>(pad * 2.0, pad * 2.0);
@@ -412,15 +413,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Use the pillow SDF when this instance is domed; otherwise plain
     // rounded box. Pillow bulge scales with the smaller half-size so it
     // reads proportional regardless of chip dimensions.
+    // When dome is active we use the pillow SDF. Sign of `dome` controls
+    // whether the mid-edge bulge reaches outward (convex, unpressed) or
+    // inward (concave, pressed-in).
     let d = select(
         sdf_rounded_box(in.rel_pos, in.half_size, in.corner_radius),
         sdf_pillow_box(
             in.rel_pos,
             in.half_size,
             in.corner_radius,
-            min(in.half_size.x, in.half_size.y) * 0.12,
+            sign(in.dome) * min(in.half_size.x, in.half_size.y) * 0.12,
         ),
-        in.dome > 0.001
+        abs(in.dome) > 0.001
     );
 
     // Anti-aliased fill: full inside, fade across ~1px of the edge.
@@ -442,13 +446,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // the middle of the chip, consistent with the pillowed outer silhouette
     // produced by `sdf_pillow_box`.
     //
+    // When `in.dome` is negative the effect inverts: the bump becomes a
+    // valley (center darker), and the diagonal tilt flips (top-left shadow,
+    // bottom-right rim-lit) — the standard cue set for a concave surface
+    // under a top-left key light. This is how the pressed-in state reads.
+    //
     // Disabled entirely when `in.dome` is zero so regular shapes take
     // zero extra cost.
     var fill_rgb = in.color.rgb;
-    if (in.dome > 0.001) {
+    if (abs(in.dome) > 0.001) {
         let np = in.rel_pos / max(in.half_size, vec2<f32>(1.0, 1.0));
         let r = length(np);
-        // Radial bump: strongest at center, tapers smoothly.
+        // Radial bump: strongest at center, tapers smoothly. Sign rides
+        // with `in.dome` so negative dome dents the center.
         let bump = (1.0 - smoothstep(0.0, 0.95, r)) * in.dome;
         // Diagonal tilt: normalised diagonal -1..+1 along top-left →
         // bottom-right axis. Negative = top-left (lit side).

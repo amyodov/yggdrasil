@@ -105,6 +105,12 @@ pub struct AppState {
     pub scale_factor: f32,
     /// Last known cursor position in physical pixels. None if outside window.
     pub cursor_pos: Option<(f32, f32)>,
+    /// Which fold handle the user is currently pressing (left mouse button
+    /// held down over the handle). Drives the pressed-in visual state —
+    /// the handle's chip inverts its dome shading + pillow silhouette to
+    /// read as depressed. On release *over the same handle* the fold
+    /// toggles; release elsewhere cancels.
+    pub pressing_card: Option<CardId>,
 }
 
 impl AppState {
@@ -118,6 +124,7 @@ impl AppState {
             window_size: WindowSize { width: 1280, height: 800 },
             scale_factor: 1.0,
             cursor_pos: None,
+            pressing_card: None,
         }
     }
 

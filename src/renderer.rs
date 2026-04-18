@@ -911,6 +911,14 @@ fn push_card_shapes(
         let chip_size = handle_size + chip_pad * 2.0;
         let mut chip_color = FOLD_CHIP_BG;
         chip_color[3] *= alpha;
+        // Pressed state: negate the dome so both the pillow silhouette and
+        // the radial/diagonal shading invert — the button visibly depresses
+        // while the user holds the mouse down.
+        let dome_amount = if state.pressing_card == Some(card.id) {
+            -FOLD_CHIP_DOME
+        } else {
+            FOLD_CHIP_DOME
+        };
         out.push(
             RectInstance::solid(
                 chip_x,
@@ -920,7 +928,7 @@ fn push_card_shapes(
                 chip_color,
                 4.0 * sf,
             )
-            .with_dome(FOLD_CHIP_DOME),
+            .with_dome(dome_amount),
         );
 
         // Icon itself.
