@@ -167,6 +167,11 @@ const FOLD_LENS_ICON_SIZE_PT: f32 = 28.0;
 /// recognizable"; pushed higher (>2.5) tends toward funhouse-mirror.
 const FOLD_LENS_MAGNIFICATION: f32 = 1.75;
 
+/// Horizontal gap between sub-button caps in logical points. Gives the
+/// lens a little breathing room at the rim so it doesn't clip a couple
+/// of pixels of the neighbouring slot.
+const FOLD_SLOT_GAP_PT: f32 = 2.0;
+
 /// Lens disc — the visible glass circle the magnified icon sits inside.
 /// Slightly larger than the magnified icon so its rim sits clear of the
 /// icon strokes. Corner radius is set to half the side at render time,
@@ -1152,15 +1157,19 @@ fn push_card_shapes(
     if !fold_states.is_empty() {
         let fold_progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
 
-        // A "slot" is exactly the same size as a single-button chip — so
-        // each dent fits inside its slot the way the old button fit inside
-        // its chip. slot_stride therefore = chip_size.
+        // A "slot" is a single-button cap of size `chip_size`. Slots are
+        // laid out left-to-right with `slot_gap` between them, so the
+        // lens sitting over one slot never touches the neighbour's cap.
+        // `slot_stride` = cap-to-cap distance = `chip_size + slot_gap`.
         let handle_size = FOLD_HANDLE_SIZE_PT * sf;
         let chip_pad = FOLD_CHIP_PAD_PT * sf;
         let chip_size = handle_size + chip_pad * 2.0;
-        let slot_stride = chip_size;
+        let slot_gap = FOLD_SLOT_GAP_PT * sf;
+        let slot_stride = chip_size + slot_gap;
         let slot_count = fold_states.len();
-        let widget_width = slot_stride * slot_count as f32;
+        // Widget width: N caps + (N-1) gaps.
+        let widget_width =
+            slot_count as f32 * chip_size + (slot_count.saturating_sub(1)) as f32 * slot_gap;
         let widget_height = chip_size;
         // Corner radius matches a single-button chip exactly — 4pt at 1x.
         // The widget's "rounded rectangle" identity is the same as the
@@ -1211,8 +1220,12 @@ fn push_card_shapes(
         let bulge_raw = cap_half * 0.12;
         let peak_extent = bulge_raw / 0.88;
 
+        // Slot center is at the cap's midpoint, not at the stride's mid.
+        // With `slot_stride = chip_size + gap` these are no longer the
+        // same: the cap is `chip_size` wide and lives at the stride's
+        // left, so its center is at `slot * stride + chip_size/2`.
         let slot_center_x =
-            |slot: usize| -> f32 { widget_x + slot_stride * (slot as f32 + 0.5) };
+            |slot: usize| -> f32 { widget_x + slot as f32 * slot_stride + chip_size * 0.5 };
 
         // Left cap: full single-button pillow at slot 0.
         out.push(
@@ -1317,11 +1330,13 @@ fn push_card_shapes(
             }
         }
 
-        // Compute lens position up-front: used both for the shape-pass
-        // lens visuals (drop shadow, disc, specular) and for hiding the
-        // small icon the lens is currently covering.
+        // Compute lens position up-front. The lens center is interpolated
+        // between adjacent cap centers via `lens_slot_pos` (fractional
+        // slot index). Explicitly using `slot * stride + chip_size/2`
+        // for cap centers ensures the lens sits on the cap, not on the
+        // gap-inclusive stride midpoint.
         let lens_slot_pos = card_well_position(card, fold_progress);
-        let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
+        let lens_x = widget_x + lens_slot_pos * slot_stride + chip_size * 0.5;
 
         // ---- Lens: drop shadow into the plate RT, plus a LensInstance
         //      emitted for the pixel-space lens pass. The disc body, rim
@@ -1458,9 +1473,11 @@ pub fn fold_buttons_scene(
     }
     let sf = state.scale_factor;
     let chip_size = FOLD_HANDLE_SIZE_PT * sf + 2.0 * FOLD_CHIP_PAD_PT * sf;
-    let slot_stride = chip_size;
+    let slot_gap = FOLD_SLOT_GAP_PT * sf;
+    let slot_stride = chip_size + slot_gap;
     let slot_count = fold_states.len();
-    let widget_width = slot_stride * slot_count as f32;
+    let widget_width =
+        slot_count as f32 * chip_size + (slot_count.saturating_sub(1)) as f32 * slot_gap;
 
     let strip_right = rect.x + rect.width - 10.0 * sf;
     let widget_x = strip_right - widget_width;
@@ -1468,7 +1485,10 @@ pub fn fold_buttons_scene(
     let mut out = Vec::with_capacity(slot_count);
     for (slot, &target) in fold_states.iter().enumerate() {
         let slot_x = widget_x + slot as f32 * slot_stride;
-        out.push((target, (slot_x, rect.y, slot_stride, rect.header_h)));
+        // Hit-rect is chip-wide only: the gap between caps is non-
+        // interactive (a click there does nothing), matching the
+        // visual that the gap isn't part of any sub-button.
+        out.push((target, (slot_x, rect.y, chip_size, rect.header_h)));
     }
     out
 }

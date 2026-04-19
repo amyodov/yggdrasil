@@ -410,8 +410,10 @@ fn corner_for(vi: u32) -> vec2<f32> {
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     let corner = corner_for(vi);
-    // Expand the quad a hair past the disc radius so AA at the rim fits.
-    let half = inst.radius + 1.0;
+    // Expand the quad past the disc radius so the 2.5px AA transition
+    // at the rim renders without clipping. 3px pad covers the fade
+    // plus a margin.
+    let half = inst.radius + 3.0;
     let rel = (corner * 2.0 - vec2<f32>(1.0, 1.0)) * half;
     let px = inst.center + rel;
 
@@ -436,8 +438,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r = length(in.rel);
     // SDF distance to disc boundary.
     let d = r - in.radius;
-    let disc_alpha = clamp(0.5 - d, 0.0, 1.0);
-    if (disc_alpha <= 0.0) {
+    // Wider AA transition (2.5px) than the usual 1px clamp. Smooths the
+    // circle's stair-step against the background without supersampling.
+    let disc_alpha = smoothstep(1.25, -1.25, d);
+    if (disc_alpha <= 0.001) {
         discard;
     }
 
@@ -459,12 +463,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let base_uv = sample_plate / u.plate_size;
 
     // Chromatic aberration: red sample shifts outward, blue inward
-    // (radially). Peak is in the mid-zone, not at the rim — the rim
-    // is reserved for light play (darkening + specular), and overlapping
-    // CA there just turns it into color mush. `ca_fade` ramps the
-    // aberration back down in the outer 30% of the disc.
-    let ca_fade = 1.0 - smoothstep(0.70, 1.0, norm_r);
-    let ca_amount_px = in.distort * 4.0 * norm_r * ca_fade;
+    // (radially). Fades fully to zero by `norm_r = 0.75` — well before
+    // the rim transparency fade (0.70..1.0) takes over. Otherwise the
+    // blue-shifted channel shows as a bluish fringe right where the
+    // disc is dissolving into the widget, and the eye reads that as
+    // "chromatic halo at the lens boundary" rather than "aberration in
+    // the mid-zone."
+    let ca_fade = 1.0 - smoothstep(0.40, 0.75, norm_r);
+    let ca_amount_px = in.distort * 4.5 * norm_r * ca_fade;
     let ca_offset_uv = dir * ca_amount_px / u.plate_size;
     let r_uv = base_uv + ca_offset_uv;
     let g_uv = base_uv;
@@ -480,22 +486,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var out_rgb = vec3<f32>(rs.r, gs.g, bs.b);
     let plate_a = max(max(rs.a, gs.a), bs.a);
 
-    // Fade the magnified content into a solid dark glass tint near the
-    // rim. Below ~0.70 normalized radius the lens shows clean
-    // magnification; past 0.95 it's uniform glass. The outer ring is
-    // reserved for the specular arc and a thin rim line — the sampled
-    // plate content would otherwise show through as noisy colored
-    // variation, which is what made the outline feel messy.
-    let glass_tint = vec3<f32>(0.07, 0.09, 0.14);
-    let content_fade = 1.0 - smoothstep(0.70, 0.95, norm_r);
-    out_rgb = mix(glass_tint, out_rgb, content_fade);
-
-    // Thin rim line at the very edge — light catching the outer
-    // curvature of the glass. Softens the AA boundary into something
-    // the eye reads as a deliberate object outline, not a rough fade.
-    let rim_line = smoothstep(0.93, 0.97, norm_r) * (1.0 - smoothstep(0.98, 1.0, norm_r));
-    let rim_line_color = vec3<f32>(0.55, 0.62, 0.72);
-    out_rgb = mix(out_rgb, rim_line_color, rim_line * 0.55);
+    // Rim fades to transparent — no dark ring, no explicit outline.
+    // At the edge of the disc the lens becomes see-through and the
+    // widget underneath bleeds through, dithering the circular
+    // boundary into the surroundings rather than presenting a hard
+    // aliased circle. `rim_alpha` multiplies the final output alpha
+    // so the fade composes correctly with the disc's SDF AA.
+    let rim_alpha = 1.0 - smoothstep(0.70, 1.0, norm_r);
 
     // Three-dot specular arc: one center dot at `spec_angle`, two
     // flanks at ±0.28 rad, all at radius 0.82. Each dot is a small
@@ -532,10 +529,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     spec_strength = spec_strength * in.spec_intensity * in.spec_color.a;
     out_rgb = mix(out_rgb, in.spec_color.rgb, spec_strength);
 
-    // Final alpha: disc AA × plate coverage. If plate_a is small, the
-    // lens over an empty area is transparent — but in practice the lens
-    // sits on opaque cards so plate_a ≈ 1.
-    let final_a = disc_alpha * max(plate_a, 0.25);
+    // Final alpha: disc AA × rim transparency × plate coverage.
+    // `rim_alpha` reaches 0 at the disc boundary, so the circular
+    // outline is soft and dithers into the widget underneath instead
+    // of presenting a hard aliased ring.
+    let final_a = disc_alpha * rim_alpha * max(plate_a, 0.25);
     return vec4<f32>(out_rgb * final_a, final_a);
 }
 "#;
