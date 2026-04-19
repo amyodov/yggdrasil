@@ -124,6 +124,11 @@ const SPINE_SEAM_GLOW_RADIUS_PT: f32 = 4.0;
 const SPINE_GLINT_BASE: [f32; 4] = [0.88, 0.84, 0.74, 0.90];
 const SPINE_GLINT_SIZE_PT: f32 = 4.0;
 const SPINE_GLINT_SKY_MIX: f32 = 0.55;
+/// Faint sky-tint on the foil body itself, so the whole rail — not just
+/// the travelling glint — breathes with the sky. Kept subtle so the brass
+/// identity survives; the foil shifts hue across the cycle rather than
+/// pretending to be a mirror.
+const SPINE_FOIL_SKY_MIX: f32 = 0.12;
 
 /// Fold handle chevron icon tint (M3.2). Single colour; direction comes
 /// from the chevron orientation, not a palette flip.
@@ -213,27 +218,16 @@ const FOLD_LENS_SPECULAR_RIM_RADIUS: f32 = 0.82;
 /// Blend weight of SkyLight.color into the specular highlight color.
 /// 0.22 keeps the core bright-white while letting dawns warm it and
 /// noons leave it near-neutral.
-const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.22;
+const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.40;
 /// Intensity threshold below which the specular disappears entirely.
 /// Matches "night" moods (intensity ~0.04–0.12) so the sun's reflection
 /// vanishes when the star is below the horizon.
 const FOLD_LENS_SPECULAR_NIGHT_THRESHOLD: f32 = 0.15;
-/// Virtual sun distance from the plate, in logical points. The sun is
-/// anchored at a point in plate-local coords and each lens computes its
-/// own "vector to sun" using its own position — so lenses at different
-/// positions on the plate see the glint at different angles. Large
-/// enough that the effect is subtle-realistic rather than dramatic-
-/// funhouse-mirror; small enough that scrolling visibly changes where
-/// each lens's specular sits.
-const SUN_VIRTUAL_DISTANCE_PT: f32 = 400.0;
-/// Plate-local anchor the sun's direction is applied to. Picked near the
-/// plate's expected horizontal mid so lenses to either side get
-/// symmetric angular spread.
-const SUN_ANCHOR_X_PT: f32 = 280.0;
-const SUN_ANCHOR_Y_PT: f32 = 0.0;
-/// Tiny per-card angular jitter (radians) on top of the position-driven
-/// angle. Keeps lenses that happen to sit at near-identical plate-local
-/// positions from glinting identically.
+/// Tiny per-card angular jitter (radians) on top of the sky-direction
+/// angle. The virtual sun is treated as infinitely far in a given
+/// direction, so every lens would otherwise glint at identical angles —
+/// jitter breaks that lock-step without introducing a physics-violating
+/// position bias.
 const FOLD_LENS_PER_CARD_JITTER: f32 = 0.08;
 
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
@@ -1077,8 +1071,16 @@ fn push_card_shapes(
         let spine_width = SPINE_WIDTH_PT * sf;
         let sky = state.sky_light();
 
-        // (1) Foil base — brass, flush, no outer glow.
-        let mut foil_color = SPINE_FOIL_COLOR;
+        // (1) Foil base — brass, flush, no outer glow. Body takes a faint
+        //     sky tint so the whole rail breathes with the cycle, not just
+        //     the travelling glint spot.
+        let body_mix = SPINE_FOIL_SKY_MIX;
+        let mut foil_color = [
+            SPINE_FOIL_COLOR[0] * (1.0 - body_mix) + sky.color.x * body_mix,
+            SPINE_FOIL_COLOR[1] * (1.0 - body_mix) + sky.color.y * body_mix,
+            SPINE_FOIL_COLOR[2] * (1.0 - body_mix) + sky.color.z * body_mix,
+            SPINE_FOIL_COLOR[3],
+        ];
         foil_color[3] *= alpha;
         out.push(RectInstance::solid(
             spine_left,
@@ -1372,22 +1374,21 @@ fn push_card_shapes(
                 FOLD_LENS_SHADOW_GLOW_PT * sf,
             ));
 
-            // Specular angle: position-dependent, per-card jittered.
+            // Specular angle: the star is at infinity in a direction,
+            // so every lens sees it at the same underlying angle. We
+            // anchor a virtual sun relative to *each* lens and take the
+            // vector from the lens to it — this way a lens anywhere on
+            // the plate traces the same symmetric east-rise → overhead →
+            // west-set arc. Per-card jitter keeps identically-placed
+            // lenses from glinting in lock-step.
+            //
             // Hidden at night via spec_intensity = 0.
             let spec_intensity = ((sky.intensity
                 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
                 / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
                 .clamp(0.0, 1.0);
-            let sun_x = (SUN_ANCHOR_X_PT
-                + SUN_VIRTUAL_DISTANCE_PT * sky.direction.x)
-                * sf;
-            let sun_y = (SUN_ANCHOR_Y_PT
-                + SUN_VIRTUAL_DISTANCE_PT * sky.direction.y)
-                * sf;
             let lens_center_y_abs = lens_disc_y + lens_disc_size * 0.5;
-            let to_sun_dx = sun_x - lens_x;
-            let to_sun_dy = sun_y - lens_center_y_abs;
-            let base_angle = to_sun_dy.atan2(to_sun_dx);
+            let base_angle = sky.direction.y.atan2(sky.direction.x);
             let card_seed = card.id.0 as f32 * 2.3998;
             let jitter = card_seed.sin() * FOLD_LENS_PER_CARD_JITTER;
             let spec_angle = base_angle + jitter;
