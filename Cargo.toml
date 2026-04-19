@@ -28,6 +28,8 @@ glyphon = "0.6"
 # Parsing / syntax
 tree-sitter = "0.25"
 tree-sitter-python = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-md = "0.5"
 
 # Icon rasterization (M3.2). tiny-skia rasterizes stroked vector paths to
 # RGBA8 at init time; we ship Lucide icons as hand-transcribed polylines

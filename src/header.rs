@@ -63,10 +63,25 @@ pub enum KeywordBadge {
     AsyncDef,
     /// Python `class`.
     Class,
-    /// Rust `fn` (stub — first emitter lands in M8.1).
+    /// Rust `fn` — both `fn` and `pub fn` use this badge; visibility
+    /// is tracked separately (Visibility on Card) to keep this axis
+    /// orthogonal to item kind.
     Fn,
-    /// Rust `pub fn` (stub).
+    /// Rust `pub fn` — reserved for future when the renderer wants a
+    /// distinct chip for public fns. Builders may emit `Fn` today.
     PubFn,
+    /// Rust `struct`.
+    Struct,
+    /// Rust `enum`.
+    Enum,
+    /// Rust `trait` — renders on blueprint paper (contracts).
+    Trait,
+    /// Rust `impl` block.
+    Impl,
+    /// Rust `mod` — hierarchical container, like a Python package.
+    Mod,
+    /// Markdown heading at a given depth (1–6, ATX levels).
+    Heading(u8),
 }
 
 /// One parameter column. Per YGG-9 the kind variant covers the four
@@ -130,5 +145,7 @@ pub struct Docstring {
     pub text: String,
 }
 
+pub mod markdown;
 pub mod python;
 pub mod reflow;
+pub mod rust;
