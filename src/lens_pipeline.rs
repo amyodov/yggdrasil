@@ -499,7 +499,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // bright circle drawn additively on top of the magnified content.
     // Gated by spec_intensity so night produces no glint.
     let spec_rim = 0.82;
-    let spec_dot_size = 0.08; // in normalized disc radii
+    let spec_dot_size = 0.10; // in normalized disc radii
     let frag_norm = in.rel / max(in.radius, 1.0);
     var spec_strength = 0.0;
     // Center dot:
@@ -529,11 +529,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     spec_strength = spec_strength * in.spec_intensity * in.spec_color.a;
     out_rgb = mix(out_rgb, in.spec_color.rgb, spec_strength);
 
-    // Final alpha: disc AA × rim transparency × plate coverage.
-    // `rim_alpha` reaches 0 at the disc boundary, so the circular
-    // outline is soft and dithers into the widget underneath instead
-    // of presenting a hard aliased ring.
-    let final_a = disc_alpha * rim_alpha * max(plate_a, 0.25);
+    // Final alpha: disc AA × (rim transparency OR glint strength) ×
+    // plate coverage. `rim_alpha` reaches 0 at the disc boundary so
+    // the circular outline dithers into the widget underneath. The
+    // glint sits at normalized radius 0.82 — deep in the fade zone —
+    // so without the `max(..., spec_strength)` boost its sky-tinted
+    // colour would be dimmed into the background. Taking the max
+    // means bright glint pixels stay opaque enough for their colour
+    // to read, while the rest of the rim keeps its soft dissolve.
+    let coverage_alpha = max(rim_alpha, spec_strength * 0.9);
+    let final_a = disc_alpha * coverage_alpha * max(plate_a, 0.25);
     return vec4<f32>(out_rgb * final_a, final_a);
 }
 "#;

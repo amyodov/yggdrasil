@@ -356,6 +356,40 @@ fn process_statement(
     // Nested functions inside functions are out of scope for M3.
 }
 
+/// Emit a single Snippet card covering the entire file. Used by
+/// language modules whose real `extract_cards` isn't written yet, so
+/// opening e.g. a `.rs` or `.md` still shows the source on the plate
+/// as one long read-only card instead of a blank plate. Replace with
+/// a language-specific extraction once the tagged-CardKind rework
+/// (YGG-27 Part 2) lands.
+pub fn whole_file_snippet(source: &str, line_offsets: &[usize]) -> Vec<Card> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let full_range = 0..source.len();
+    let full_lines = byte_range_to_line_range(&full_range, line_offsets);
+    let lines = build_logical_lines(&full_range, &full_lines, line_offsets);
+    vec![Card {
+        id: CardId(0),
+        kind: CardKind::Snippet,
+        parent: None,
+        depth: 0,
+        name: String::new(),
+        visibility: Visibility::Public,
+        modifier: MethodModifier::None,
+        decorators: Vec::new(),
+        header_range: full_range.clone(),
+        body_range: None,
+        full_range: full_range.clone(),
+        header_lines: full_lines.clone(),
+        body_lines: None,
+        full_lines,
+        docstring_range: None,
+        docstring_lines: None,
+        lines,
+    }]
+}
+
 /// Emit a `Snippet` card for a top-level orphan statement. No body / no
 /// fold — snippets always render fully.
 fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id: &mut u32) {

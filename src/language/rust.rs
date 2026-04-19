@@ -12,7 +12,7 @@
 use tree_sitter::{Language, Node, Tree};
 
 use super::LanguageModule;
-use crate::cards::Card;
+use crate::cards::{whole_file_snippet, Card};
 use crate::header::{rust, HeaderModel};
 
 pub struct RustModule;
@@ -34,8 +34,11 @@ impl LanguageModule for RustModule {
         tree_sitter_rust::HIGHLIGHTS_QUERY
     }
 
-    fn extract_cards(&self, _tree: &Tree, _source: &str, _line_offsets: &[usize]) -> Vec<Card> {
-        Vec::new()
+    fn extract_cards(&self, _tree: &Tree, source: &str, line_offsets: &[usize]) -> Vec<Card> {
+        // Placeholder: show the whole file as one Snippet card until
+        // the Rust-specific extractor (function_item / struct_item /
+        // impl_item walk) lands with YGG-27 Part 2.
+        whole_file_snippet(source, line_offsets)
     }
 
     fn build_header(&self, node: Node, source: &str) -> Option<HeaderModel> {

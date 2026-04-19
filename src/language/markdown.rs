@@ -16,7 +16,7 @@
 use tree_sitter::{Language, Node, Tree};
 
 use super::LanguageModule;
-use crate::cards::Card;
+use crate::cards::{whole_file_snippet, Card};
 use crate::header::{markdown, HeaderModel};
 
 pub struct MarkdownModule;
@@ -38,8 +38,11 @@ impl LanguageModule for MarkdownModule {
         ""
     }
 
-    fn extract_cards(&self, _tree: &Tree, _source: &str, _line_offsets: &[usize]) -> Vec<Card> {
-        Vec::new()
+    fn extract_cards(&self, _tree: &Tree, source: &str, line_offsets: &[usize]) -> Vec<Card> {
+        // Placeholder: show the whole file as one Snippet until the
+        // Markdown-specific extractor (section walk, heading depth →
+        // Card depth) lands with YGG-27 Part 2.
+        whole_file_snippet(source, line_offsets)
     }
 
     fn build_header(&self, node: Node, source: &str) -> Option<HeaderModel> {
