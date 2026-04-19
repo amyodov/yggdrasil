@@ -135,16 +135,15 @@ const SKY_MOODS: &[SkyMood] = &[
     },
 ];
 
-/// Seconds to cross between two adjacent moods.
-///
-/// **Debug value:** 15s × 8 moods = 2 min full day cycle — fast enough
-/// to see the cycle visibly during a single sitting. The motion-
-/// diapason target (10–15 min cycle) lands when we set this back to
-/// ~90–110s for release. Keeping it fast during debug so mood
-/// transitions, glints, and dawn colors can be verified without
-/// waiting.
-#[allow(dead_code)]
-const MOOD_TRANSITION_SECS: f32 = 15.0;
+/// Default full day cycle length, in seconds. 8 moods × 15s = 2 min —
+/// fast enough to see the cycle during a single sitting, slow enough
+/// that the sky doesn't look like a strobe. Release target is 10–15
+/// min; runtime overridable via `--debug-day-loop-length`.
+pub const DEFAULT_DAY_CYCLE_SECS: f32 = 120.0;
+
+/// Minimum cycle length accepted at runtime. Guards against a zero or
+/// near-zero cycle producing a NaN when we divide `elapsed` by it.
+pub const MIN_DAY_CYCLE_SECS: f32 = 1.0;
 
 /// The shared stellar-illumination state.
 ///
@@ -175,9 +174,17 @@ impl SkyLight {
     /// Uses smoothstep-eased interpolation between adjacent moods so
     /// transitions don't have visible linear-joint seams.
     pub fn at_elapsed(elapsed_secs: f32) -> Self {
-        let cycle_len = SKY_MOODS.len() as f32 * MOOD_TRANSITION_SECS;
+        Self::at_elapsed_with_cycle(elapsed_secs, DEFAULT_DAY_CYCLE_SECS)
+    }
+
+    /// Sample the sky at `elapsed_secs`, but with a caller-supplied full
+    /// day cycle length. Used by `--debug-day-loop-length` to speed the
+    /// cycle up during tuning; the per-mood duration scales linearly.
+    pub fn at_elapsed_with_cycle(elapsed_secs: f32, cycle_len_secs: f32) -> Self {
+        let cycle_len = cycle_len_secs.max(MIN_DAY_CYCLE_SECS);
+        let mood_span = cycle_len / SKY_MOODS.len() as f32;
         let t = elapsed_secs.rem_euclid(cycle_len).max(0.0);
-        let slot = t / MOOD_TRANSITION_SECS;
+        let slot = t / mood_span;
         let idx_a = (slot.floor() as usize) % SKY_MOODS.len();
         let idx_b = (idx_a + 1) % SKY_MOODS.len();
         let frac = slot - slot.floor();
@@ -248,15 +255,30 @@ mod tests {
         assert!((s.direction.x - n.x).abs() < 1e-5);
     }
 
-    /// Sampling at a future time lands at the next mood exactly when
-    /// `elapsed == n * MOOD_TRANSITION_SECS`.
+    /// Sampling at a future time lands at the next mood exactly at
+    /// each mood-boundary — i.e. `elapsed = i * (cycle_len / N)`.
     #[test]
     fn at_elapsed_lands_on_successive_moods() {
+        let mood_span = DEFAULT_DAY_CYCLE_SECS / SKY_MOODS.len() as f32;
         for (i, m) in SKY_MOODS.iter().enumerate() {
-            let t = i as f32 * MOOD_TRANSITION_SECS;
+            let t = i as f32 * mood_span;
             let s = SkyLight::at_elapsed(t);
             assert!((s.intensity - m.intensity).abs() < 1e-4, "mood {i}");
         }
+    }
+
+    /// Shortening the cycle uniformly compresses time: the mood you'd
+    /// see at `t` under the default cycle is the one you see at
+    /// `t * (short / default)` under a shorter cycle.
+    #[test]
+    fn at_elapsed_with_cycle_scales_linearly() {
+        let default_cycle = DEFAULT_DAY_CYCLE_SECS;
+        let short_cycle = 30.0;
+        let t_default = 45.0;
+        let t_short = t_default * (short_cycle / default_cycle);
+        let s_a = SkyLight::at_elapsed_with_cycle(t_default, default_cycle);
+        let s_b = SkyLight::at_elapsed_with_cycle(t_short, short_cycle);
+        assert!((s_a.intensity - s_b.intensity).abs() < 1e-4);
     }
 
     /// `direction` is always unit-length — any consumer doing a dot

@@ -43,6 +43,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let day_cycle_override = cli.debug_day_loop_length;
     let mode = cli.resolve(&RealFs).context("invalid command-line arguments")?;
 
     match mode {
@@ -61,7 +62,10 @@ fn run() -> Result<()> {
             drop(tree);
 
             let highlighted = HighlightedSource::from_parts(source, kinds, line_offsets);
-            let state = AppState::new(highlighted, cards);
+            let mut state = AppState::new(highlighted, cards);
+            if let Some(secs) = day_cycle_override {
+                state.day_cycle_secs = secs.max(crate::sky::MIN_DAY_CYCLE_SECS);
+            }
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::analyzer::SourceFile;
 use crate::cards::{Card, CardId};
-use crate::sky::SkyLight;
+use crate::sky::{SkyLight, DEFAULT_DAY_CYCLE_SECS};
 use crate::syntax::TokenKind;
 
 /// Window size in physical pixels.
@@ -221,6 +221,10 @@ pub struct AppState {
     /// environmental-light-dependent visual derives from this scalar via
     /// `sky_light()`.
     pub elapsed_secs: f32,
+    /// Full day cycle length fed to `SkyLight::at_elapsed_with_cycle`.
+    /// Overridable via `--debug-day-loop-length`; defaults to
+    /// `DEFAULT_DAY_CYCLE_SECS`.
+    pub day_cycle_secs: f32,
 }
 
 impl AppState {
@@ -236,6 +240,7 @@ impl AppState {
             cursor_pos: None,
             press: None,
             elapsed_secs: 0.0,
+            day_cycle_secs: DEFAULT_DAY_CYCLE_SECS,
         }
     }
 
@@ -320,7 +325,16 @@ impl AppState {
     /// consumers derive their appearance from the returned struct.
     #[allow(dead_code)] // Wired to consumers in step 3 (lens) and step 4 (foil).
     pub fn sky_light(&self) -> SkyLight {
-        SkyLight::at_elapsed(self.elapsed_secs)
+        SkyLight::at_elapsed_with_cycle(self.elapsed_secs, self.day_cycle_secs)
+    }
+
+    /// Simulated time of day in hours (0.0..24.0), with 0.0 = midnight
+    /// (deep-night mood) and 12.0 = noon. Used only for debug logging
+    /// under `--debug-day-loop-length` — nothing visual reads this.
+    pub fn time_of_day_hours(&self) -> f32 {
+        let cycle = self.day_cycle_secs.max(1.0);
+        let t = self.elapsed_secs.rem_euclid(cycle).max(0.0);
+        (t / cycle) * 24.0
     }
 
     /// Width of the code pane in physical pixels.

@@ -11,6 +11,7 @@ use winit::window::{Window, WindowId};
 
 use crate::cards::{layout_cards, CardId};
 use crate::renderer::{fold_buttons_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
+use crate::sky::DEFAULT_DAY_CYCLE_SECS;
 use crate::state::{AppState, FoldState, WindowSize, LINES_PER_WHEEL_NOTCH};
 
 const INITIAL_WIDTH: u32 = 1280;
@@ -21,11 +22,15 @@ pub struct App {
     renderer: Option<Renderer>,
     /// Wall-clock instant at the previous frame. `None` before first frame.
     last_frame: Option<Instant>,
+    /// Last simulated-time HH:MM printed to the console (under
+    /// `--debug-day-loop-length`). Kept so we print once per minute of
+    /// simulated time instead of spamming every frame.
+    last_debug_time_print: Option<(u32, u32)>,
 }
 
 impl App {
     pub fn new(state: AppState) -> Self {
-        Self { state, renderer: None, last_frame: None }
+        Self { state, renderer: None, last_frame: None, last_debug_time_print: None }
     }
 
     pub fn run(self) -> Result<()> {
@@ -194,6 +199,19 @@ impl ApplicationHandler for App {
                 // dependent visual (nebula tint, lens glint, foil specular,
                 // …) derives from this single scalar.
                 self.state.advance_clock(dt);
+
+                // Under --debug-day-loop-length, print the simulated time
+                // of day once per simulated minute — lets the tuner match
+                // what they see on screen to a clock position in the cycle.
+                if (self.state.day_cycle_secs - DEFAULT_DAY_CYCLE_SECS).abs() > 1e-3 {
+                    let tod = self.state.time_of_day_hours();
+                    let hh = tod.floor() as u32 % 24;
+                    let mm = ((tod - tod.floor()) * 60.0).floor() as u32 % 60;
+                    if self.last_debug_time_print != Some((hh, mm)) {
+                        println!("[sky] time-of-day {hh:02}:{mm:02}");
+                        self.last_debug_time_print = Some((hh, mm));
+                    }
+                }
 
                 match renderer.render(&self.state) {
                     Ok(()) => {}

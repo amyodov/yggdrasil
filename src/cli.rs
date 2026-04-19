@@ -39,6 +39,13 @@ pub struct Cli {
     #[arg(long)]
     pub git: bool,
 
+    /// Debug: override the full day cycle length, in seconds. Default ≈ 120s
+    /// (2 min). Drop to e.g. 30 to flip through night → noon → dusk quickly
+    /// when tuning SkyLight consumers; raise toward 600 for release-cadence
+    /// viewing. Invisible in the UI — purely a time-base override.
+    #[arg(long, value_name = "SECONDS")]
+    pub debug_day_loop_length: Option<f32>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
