@@ -411,6 +411,7 @@ mod tests {
             full_lines: 0..0,
             docstring_range: None,
             docstring_lines: None,
+            lines: vec![],
         };
         assert_eq!(card_fold_states(&card).len(), 2);
         assert_eq!(card_well_position(&card, 0.0), 0.0);
@@ -448,6 +449,7 @@ mod tests {
             full_lines: 0..0,
             docstring_range: None,
             docstring_lines: None,
+            lines: vec![],
         };
         let src = SourceFile {
             path: std::path::PathBuf::from("/tmp/x.py"),
@@ -487,6 +489,7 @@ mod tests {
             full_lines: 0..0,
             docstring_range: None,
             docstring_lines: None,
+            lines: vec![],
         };
         let src = SourceFile {
             path: std::path::PathBuf::from("/tmp/x.py"),
@@ -525,6 +528,7 @@ mod tests {
             full_lines: 0..3,
             docstring_range: Some(1..5),
             docstring_lines: Some(1..2),
+            lines: vec![],
         };
         let states = card_fold_states(&card);
         assert_eq!(states.len(), 3);
@@ -561,6 +565,7 @@ mod tests {
             full_lines: 0..0,
             docstring_range: None,
             docstring_lines: None,
+            lines: vec![],
         };
         assert!(card_fold_states(&snippet).is_empty());
         assert_eq!(card_well_position(&snippet, 0.5), 0.0);

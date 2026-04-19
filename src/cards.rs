@@ -18,6 +18,44 @@ use tree_sitter::{Node, Tree};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CardId(pub u32);
 
+/// Opaque line identifier. Stable within the current scene description
+/// (extracted from a given source). Cross-version stability — the same
+/// logical line retaining the same ID after an edit — is M6's
+/// responsibility (AST-matching diff). Today we seed IDs from the line's
+/// 0-based offset in the source file, which is stable within one version
+/// and trivially derivable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineId(pub u32);
+
+/// One logical line of text inside a card. Has stable identity within
+/// the scene (`id`), a byte range into the source, an index inside its
+/// parent card, and per-line animation state hooks: `opacity` (0..1)
+/// and `y_offset` (pixels). Today `opacity = 1.0` and `y_offset = 0.0`
+/// for every line — the rendering path ignores these fields. M7's
+/// scrub-driven diff animations will start reading from them to apply
+/// per-line visuals (added/removed flashes, line slides for moves)
+/// without retrofitting glyphon's one-buffer-per-card model.
+///
+/// This is the core M6.0 architectural plant: a data structure the
+/// renderer doesn't consume today, but that we can fill with animation
+/// state before that pipeline is built, so M6/M7 don't need a separate
+/// data-model migration.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields are M6/M7 consumer hooks; not read today.
+pub struct LogicalLine {
+    pub id: LineId,
+    /// Byte range of this line in the source file (excluding trailing
+    /// newline where applicable).
+    pub byte_range: Range<usize>,
+    /// Zero-based index within the parent card's ordered line list.
+    pub line_index_in_card: u32,
+    /// 0.0 = fully transparent, 1.0 = fully opaque. Default 1.0.
+    pub opacity: f32,
+    /// Pixels. Default 0.0 (line at its natural position). Positive =
+    /// shifted downward.
+    pub y_offset: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardKind {
     /// `class Foo: ...` at any nesting level.
@@ -107,6 +145,14 @@ pub struct Card {
     /// as the fold goes 0 → HeaderOnly, then from docstring height to
     /// full body height as fold goes HeaderOnly → Unfolded.
     pub docstring_lines: Option<Range<usize>>,
+
+    /// The M6.0 per-line model: one `LogicalLine` per line covered by
+    /// `full_lines`, with stable line-identity hooks and per-line
+    /// animation state. Populated during extraction; ignored by today's
+    /// rendering path. M6/M7 will start reading from these for diff
+    /// states and per-line scrub animations without needing to change
+    /// the card data model.
+    pub lines: Vec<LogicalLine>,
 }
 
 // Semantic-rules accessors on Card. `#[allow(dead_code)]` because consumers
@@ -271,6 +317,11 @@ fn process_statement(
             None => (None, None),
         };
 
+    // M6.0 per-line model: build a LogicalLine per source line in
+    // full_lines. Ignored by rendering today; M6/M7 consumers read from
+    // these for diff states and per-line animations.
+    let lines = build_logical_lines(&full_range, &full_lines, line_offsets);
+
     let id = CardId(*next_id);
     *next_id += 1;
     out.push(Card {
@@ -290,6 +341,7 @@ fn process_statement(
         full_lines,
         docstring_range,
         docstring_lines,
+        lines,
     });
 
     // Recurse into class bodies for methods + nested classes.
@@ -312,6 +364,8 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
     let header_range = full_range.clone();
     let header_lines = full_lines.clone();
 
+    let lines = build_logical_lines(&full_range, &full_lines, line_offsets);
+
     let id = CardId(*next_id);
     *next_id += 1;
     out.push(Card {
@@ -333,7 +387,37 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
         full_lines,
         docstring_range: None,
         docstring_lines: None,
+        lines,
     });
+}
+
+/// Build the M6.0 per-line list for a card covering `full_lines` in the
+/// source. One `LogicalLine` per source line within that range, with
+/// byte range clipped to `full_range` so partial-line edges stay sane.
+/// LineId seeds from the 0-based line-in-source — stable within a
+/// version and trivially derivable.
+fn build_logical_lines(
+    full_range: &Range<usize>,
+    full_lines: &Range<usize>,
+    line_offsets: &[usize],
+) -> Vec<LogicalLine> {
+    let mut out = Vec::with_capacity(full_lines.end.saturating_sub(full_lines.start));
+    for (idx, ln) in full_lines.clone().enumerate() {
+        let ls = line_offsets.get(ln).copied().unwrap_or(full_range.start);
+        // Use the NEXT line offset as exclusive end; fall back to
+        // full_range.end for the last line.
+        let le = line_offsets.get(ln + 1).copied().unwrap_or(full_range.end);
+        let start = ls.max(full_range.start);
+        let end = le.min(full_range.end);
+        out.push(LogicalLine {
+            id: LineId(ln as u32),
+            byte_range: start..end,
+            line_index_in_card: idx as u32,
+            opacity: 1.0,
+            y_offset: 0.0,
+        });
+    }
+    out
 }
 
 /// Detect a leading docstring in the given body block. Returns the string
@@ -975,6 +1059,39 @@ mod tests {
         let c = &cards[card_idx];
         assert_eq!(c.docstring_range.is_some(), expect_docstring, "docstring_range");
         assert_eq!(c.docstring_lines.is_some(), expect_docstring, "docstring_lines");
+    }
+
+    /// M6.0 per-line model: a card's `lines` has one `LogicalLine` per
+    /// source line in its `full_lines` range, in order, each with a
+    /// populated byte range and default opacity/offset. Stable LineIds
+    /// for the same source line across re-extractions.
+    #[test]
+    fn logical_lines_cover_full_range() {
+        let src = "def f():\n    \"d\"\n    pass\n";
+        let cards = extract(src);
+        let c = &cards[0];
+        // 3 source lines in this function (def / "d" / pass).
+        assert_eq!(c.lines.len(), 3);
+        for (i, line) in c.lines.iter().enumerate() {
+            assert_eq!(line.line_index_in_card, i as u32);
+            assert!(line.byte_range.start >= c.full_range.start);
+            assert!(line.byte_range.end <= c.full_range.end);
+            assert_eq!(line.opacity, 1.0);
+            assert_eq!(line.y_offset, 0.0);
+        }
+        // LineId for the first line is seeded from the absolute line-in-
+        // source: line 0 → LineId(0).
+        assert_eq!(c.lines[0].id, LineId(0));
+    }
+
+    /// Snippets also get per-line data so diff states/animations can
+    /// attach to top-level imports / constants later.
+    #[test]
+    fn logical_lines_populated_for_snippets() {
+        let src = "import os\nCONST = 1\n";
+        let cards = extract(src);
+        assert_eq!(cards[0].kind, CardKind::Snippet);
+        assert_eq!(cards[0].lines.len(), 1);
     }
 
     /// Parent/child links: methods of a class have that class as parent.
