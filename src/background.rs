@@ -387,36 +387,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // camera." Lower amplitude so they don't dominate.
     let near_uv = auv * 7.0 + vec2<f32>(t * 0.180, t * 0.135);
     let near    = smoothstep(0.55, 0.92, fbm(near_uv)) * 0.55;
-    // Near clouds bias toward accent — visually distinct from far clouds
-    // even in the same frame.
-    let near_color = accent * 1.1;
+    // Near clouds lean *neutral*, not cosmic — they're the layer closest
+    // to the viewer/star, so they should take most of their color from
+    // the current sky (applied in the blend below) rather than from the
+    // deep-space palette. A dim neutral base means even at night (when
+    // star response → 0) they stay restrained and don't dominate.
+    let near_color = mix(accent * 1.1, vec3<f32>(0.35, 0.35, 0.40), 0.55);
 
     // FINE TURBULENCE: surface shimmer, not a cloud layer — just texture.
     let turb_uv = auv * 12.0 + vec2<f32>(-t * 0.280, t * 0.210);
     let turb = fbm(turb_uv) * 0.12;
 
-    // ---- SkyLight tint per cloud layer.
-    // Each layer has a `star_response` coefficient (far ~0.1, mid ~0.4,
-    // near ~0.8) that controls how much it takes on the sky's current
-    // color. Far clouds are effectively ambient; near clouds breathe
-    // warm/cool/magenta with the sun in lockstep with every reflection
-    // on the scene. `intensity` gates the whole thing — at night
-    // (intensity ~0.05) the tint is zero, so each layer stays its own
-    // baseline color but dimmed. ----
-    let sky_c = u.sky_color.rgb;
-    let far_tint  = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.1 * u.sky_intensity);
-    let mid_tint  = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.4 * u.sky_intensity);
-    let near_tint = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.8 * u.sky_intensity);
-    let far_tinted  = far_color  * far_tint;
-    let mid_tinted  = mid_color  * mid_tint;
-    let near_tinted = near_color * near_tint;
+    // ---- SkyLight blend per cloud layer.
+    //
+    // Each layer INTERPOLATES from its intrinsic cosmic color toward the
+    // sky's current color, proportional to `star_response × intensity`.
+    // Multiplicative tinting preserved the cosmic palette even at high
+    // response (magenta × warm-orange = muddy brown); `mix` replaces the
+    // cosmic palette with the sky color as response rises, which gives
+    // the near layers their "sunlit clouds at noon, deep-red at dusk"
+    // reading. Far layers keep a low response so they stay cosmic —
+    // distant clouds don't take much light from the nearby star.
+    //
+    // Response coefficients:
+    //   far  ~0.15  — barely sky-colored, always cosmic
+    //   mid  ~0.55  — half-and-half at peak intensity
+    //   near ~0.90  — dominant sky color when the sun is out
+    let sky_bright = u.sky_color.rgb * 1.5;
+    let far_final  = mix(far_color,  sky_bright, 0.15 * u.sky_intensity);
+    let mid_final  = mix(mid_color,  sky_bright, 0.55 * u.sky_intensity);
+    let near_final = mix(near_color, sky_bright, 0.90 * u.sky_intensity);
 
     // Compose. Three cloud layers sum additively because in real nebulae,
     // atmospheric emission stacks. Peak composite ≈ 0.18 — visible but
     // keeps the sky comfortably dim.
-    var nebula = far_tinted  * far  * 0.55
-               + mid_tinted  * mid  * 0.75
-               + near_tinted * near * 0.60
+    var nebula = far_final  * far  * 0.55
+               + mid_final  * mid  * 0.75
+               + near_final * near * 0.60
                + vec3<f32>(turb, turb, turb) * 0.25;
 
     // Overall brightness modulated by SkyLight.intensity: ~45% at night,

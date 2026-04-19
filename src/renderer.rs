@@ -1439,8 +1439,13 @@ fn push_card_shapes(
     }
 
     // ---- Rolling edge during fold animation. ----
+    // Show only while the fold is actively animating (progress ≠ target),
+    // not when it's resting at an intermediate fold state (HeaderOnly at
+    // progress = 0.5 is a valid *rest* now, not a mid-animation frame).
     let progress = state.fold_progress.get(&card.id).copied().unwrap_or(1.0);
-    if progress > 0.02 && progress < 0.98 && rect.body_h > 0.5 {
+    let target = state.fold_target.get(&card.id).copied().unwrap_or(1.0);
+    let is_animating = (progress - target).abs() > 1e-3;
+    if is_animating && progress > 0.02 && progress < 0.98 && rect.body_h > 0.5 {
         let edge_y = local_y + rect.header_h + rect.body_h - ROLL_EDGE_THICKNESS_PT * sf;
         let mut edge_color = ROLL_EDGE_COLOR;
         let mut edge_glow = ROLL_EDGE_GLOW;
