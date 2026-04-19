@@ -6,6 +6,7 @@ mod background;
 mod cards;
 mod cli;
 mod composite;
+mod header;
 mod icon_pipeline;
 mod icons;
 mod lens_pipeline;
