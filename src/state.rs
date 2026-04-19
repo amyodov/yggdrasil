@@ -99,16 +99,21 @@ pub const FOLD_DURATION_SECS: f32 = 0.2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FoldState {
     Folded,
+    /// Header + docstring visible, body hidden. Only applicable to cards
+    /// whose body starts with a docstring. For docstring-less cards, the
+    /// 2-state switch skips this slot entirely.
+    HeaderOnly,
     Unfolded,
 }
 
 impl FoldState {
     /// Position on the continuous `fold_progress` axis corresponding to this
-    /// discrete state. 0.0 = fully folded; 1.0 = fully unfolded. Used when
-    /// a button click commits a new target.
+    /// discrete state. 0.0 = fully folded; 0.5 = header + docstring; 1.0 =
+    /// fully unfolded. Used when a button click commits a new target.
     pub fn target_progress(self) -> f32 {
         match self {
             FoldState::Folded => 0.0,
+            FoldState::HeaderOnly => 0.5,
             FoldState::Unfolded => 1.0,
         }
     }
@@ -116,15 +121,26 @@ impl FoldState {
 
 /// Ordered fold states this card supports — equivalent to the physical slot
 /// order on the switch, lowest index = most folded. Empty for snippets (no
-/// body to fold). Today every non-snippet card returns `[Folded, Unfolded]`;
-/// M3.4 will insert `HeaderOnly` in the middle for cards whose body starts
-/// with a docstring and leave docstring-less cards at 2 slots.
+/// body to fold). Three slots for cards whose body starts with a docstring
+/// (`Folded / HeaderOnly / Unfolded`); two slots otherwise (`Folded /
+/// Unfolded`). Classes currently stay 2-slot even with a class-docstring,
+/// because class body_h comes from stacked method children, not a body
+/// text block.
 pub fn card_fold_states(card: &Card) -> &'static [FoldState] {
     use crate::cards::CardKind;
+    static THREE_SLOT: &[FoldState] = &[
+        FoldState::Folded,
+        FoldState::HeaderOnly,
+        FoldState::Unfolded,
+    ];
     static TWO_SLOT: &[FoldState] = &[FoldState::Folded, FoldState::Unfolded];
     static NONE: &[FoldState] = &[];
     if matches!(card.kind, CardKind::Snippet) {
         NONE
+    } else if matches!(card.kind, CardKind::Function | CardKind::Method)
+        && card.docstring_range.is_some()
+    {
+        THREE_SLOT
     } else {
         TWO_SLOT
     }
@@ -393,6 +409,8 @@ mod tests {
             header_lines: 0..0,
             body_lines: None,
             full_lines: 0..0,
+            docstring_range: None,
+            docstring_lines: None,
         };
         assert_eq!(card_fold_states(&card).len(), 2);
         assert_eq!(card_well_position(&card, 0.0), 0.0);
@@ -428,6 +446,8 @@ mod tests {
             header_lines: 0..0,
             body_lines: None,
             full_lines: 0..0,
+            docstring_range: None,
+            docstring_lines: None,
         };
         let src = SourceFile {
             path: std::path::PathBuf::from("/tmp/x.py"),
@@ -465,6 +485,8 @@ mod tests {
             header_lines: 0..0,
             body_lines: None,
             full_lines: 0..0,
+            docstring_range: None,
+            docstring_lines: None,
         };
         let src = SourceFile {
             path: std::path::PathBuf::from("/tmp/x.py"),
@@ -478,6 +500,43 @@ mod tests {
         state.cancel_press();
         assert!(state.press.is_none());
         assert_eq!(state.fold_target[&card.id], 1.0, "cancel restores original target");
+    }
+
+    /// Docstring cards (M3.4) expose three fold slots, with the middle
+    /// HeaderOnly slot landing at fold_progress = 0.5. The well sweeps
+    /// linearly through all three slot indices across the progress range.
+    #[test]
+    fn docstring_card_has_three_fold_slots() {
+        use crate::cards::{Card, CardId, CardKind, MethodModifier, Visibility};
+        let card = Card {
+            id: CardId(0),
+            kind: CardKind::Function,
+            parent: None,
+            depth: 0,
+            name: "f".into(),
+            visibility: Visibility::Public,
+            modifier: MethodModifier::None,
+            decorators: vec![],
+            header_range: 0..0,
+            body_range: Some(0..10),
+            full_range: 0..10,
+            header_lines: 0..1,
+            body_lines: Some(1..3),
+            full_lines: 0..3,
+            docstring_range: Some(1..5),
+            docstring_lines: Some(1..2),
+        };
+        let states = card_fold_states(&card);
+        assert_eq!(states.len(), 3);
+        assert_eq!(states[0], FoldState::Folded);
+        assert_eq!(states[1], FoldState::HeaderOnly);
+        assert_eq!(states[2], FoldState::Unfolded);
+        // HeaderOnly target lands at progress 0.5, which maps to slot 1.
+        assert!((card_well_position(&card, 0.5) - 1.0).abs() < 1e-6);
+        // Endpoints and midpoint.
+        assert_eq!(card_well_position(&card, 0.0), 0.0);
+        assert_eq!(card_well_position(&card, 1.0), 2.0);
+        assert_eq!(card_slot_index(&card, FoldState::HeaderOnly), Some(1));
     }
 
     /// Snippet cards have no fold-switch slots; `well_position` collapses to
@@ -500,6 +559,8 @@ mod tests {
             header_lines: 0..0,
             body_lines: None,
             full_lines: 0..0,
+            docstring_range: None,
+            docstring_lines: None,
         };
         assert!(card_fold_states(&snippet).is_empty());
         assert_eq!(card_well_position(&snippet, 0.5), 0.0);

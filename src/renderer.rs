@@ -244,6 +244,7 @@ const FOLD_LENS_PER_CARD_JITTER: f32 = 0.08;
 fn icon_for_fold_state(state: FoldState) -> IconId {
     match state {
         FoldState::Folded => IconId::Rows1,
+        FoldState::HeaderOnly => IconId::Rows2,
         FoldState::Unfolded => IconId::Rows3,
     }
 }

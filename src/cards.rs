@@ -93,6 +93,20 @@ pub struct Card {
     /// For a decorated function, `full_lines.start` is the line of the `@`.
     /// Used by layout to size leaf cards against the actually-rendered text.
     pub full_lines: Range<usize>,
+
+    /// Byte range of the leading docstring, if any. Python docstrings are
+    /// the first statement of a function/class body when it's a string
+    /// literal; tree-sitter reports this as an `expression_statement`
+    /// whose sole child is a `string`. `None` means this card has no
+    /// docstring and therefore participates in the 2-state (Folded /
+    /// Unfolded) fold switch rather than the 3-state form.
+    pub docstring_range: Option<Range<usize>>,
+    /// Line range of the docstring (parallel to `docstring_range`), used
+    /// by layout to piecewise-scale `body_h` through the HeaderOnly fold
+    /// state: `body_h` grows from 0 to `docstring_lines.len() * line_h`
+    /// as the fold goes 0 → HeaderOnly, then from docstring height to
+    /// full body height as fold goes HeaderOnly → Unfolded.
+    pub docstring_lines: Option<Range<usize>>,
 }
 
 // Semantic-rules accessors on Card. `#[allow(dead_code)]` because consumers
@@ -248,6 +262,15 @@ fn process_statement(
     // when `node` isn't a decorated_definition.
     let decorators = extract_decorators(node, source);
 
+    // Docstring detection (Python): first non-comment statement of the
+    // body is a string literal. Enables the M3.4 three-state fold switch
+    // on this card.
+    let (docstring_range, docstring_lines) =
+        match def_node.child_by_field_name("body") {
+            Some(body) => detect_docstring(body, line_offsets),
+            None => (None, None),
+        };
+
     let id = CardId(*next_id);
     *next_id += 1;
     out.push(Card {
@@ -265,6 +288,8 @@ fn process_statement(
         header_lines,
         body_lines,
         full_lines,
+        docstring_range,
+        docstring_lines,
     });
 
     // Recurse into class bodies for methods + nested classes.
@@ -306,7 +331,40 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
         header_lines,
         body_lines: None,
         full_lines,
+        docstring_range: None,
+        docstring_lines: None,
     });
+}
+
+/// Detect a leading docstring in the given body block. Returns the string
+/// statement's byte + line ranges, or `None` if the first non-comment
+/// child of the body isn't an `expression_statement` wrapping a `string`.
+fn detect_docstring(
+    body: Node,
+    line_offsets: &[usize],
+) -> (Option<Range<usize>>, Option<Range<usize>>) {
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "comment" => continue, // skip leading comments if any
+            "expression_statement" => {
+                // Docstring iff the expression statement wraps a single
+                // string literal. Anything else (a function call, a name,
+                // etc.) means there's no docstring here.
+                let mut inner_cursor = child.walk();
+                for inner in child.children(&mut inner_cursor) {
+                    if inner.kind() == "string" {
+                        let range = child.byte_range();
+                        let lines = byte_range_to_line_range(&range, line_offsets);
+                        return (Some(range), Some(lines));
+                    }
+                }
+                return (None, None);
+            }
+            _ => return (None, None),
+        }
+    }
+    (None, None)
 }
 
 /// If `node` is a `decorated_definition`, return the dotted identifier of
@@ -507,7 +565,22 @@ fn layout_subtree(
         CardKind::Snippet => 0.0,
     };
 
-    let body_h = body_full_h * progress;
+    // Piecewise body_h for cards that have a docstring (M3.4 three-state
+    // fold). progress 0..0.5 fills in the docstring band; 0.5..1.0 fills
+    // in the rest of the body. Cards without a docstring use the linear
+    // mapping as before.
+    let body_h = match card.docstring_lines.as_ref() {
+        Some(ds) if matches!(card.kind, CardKind::Function | CardKind::Method) => {
+            let docstring_h = (ds.end.saturating_sub(ds.start)) as f32 * m.line_height;
+            let docstring_h = docstring_h.min(body_full_h);
+            if progress <= 0.5 {
+                docstring_h * (progress * 2.0)
+            } else {
+                docstring_h + (body_full_h - docstring_h) * ((progress - 0.5) * 2.0)
+            }
+        }
+        _ => body_full_h * progress,
+    };
 
     // Fix up our body_h now that we know it.
     if let Some(r) = rects.get_mut(&card.id) {
@@ -863,6 +936,45 @@ mod tests {
         let c = &cards[card_idx];
         assert_eq!(c.is_abstract(), expect_abstract, "is_abstract()");
         assert_eq!(c.is_dataclass(), expect_dataclass, "is_dataclass()");
+    }
+
+    /// Docstring detection (M3.4): Python functions/methods whose body's
+    /// first statement is a string literal get a populated
+    /// `docstring_range`. Docstring-less cards get `None`.
+    #[rstest]
+    #[case::plain_function(
+        "def f():\n    pass\n",
+        0, false
+    )]
+    #[case::function_with_docstring(
+        "def f():\n    \"short\"\n    pass\n",
+        0, true
+    )]
+    #[case::method_with_docstring(
+        "class A:\n    def m(self):\n        \"doc\"\n        return 1\n",
+        1, true
+    )]
+    #[case::method_no_docstring(
+        "class A:\n    def m(self):\n        return 1\n",
+        1, false
+    )]
+    #[case::first_statement_not_a_string(
+        "def f():\n    x = 1\n    return x\n",
+        0, false
+    )]
+    #[case::triple_quoted(
+        "def f():\n    \"\"\"triple\"\"\"\n    pass\n",
+        0, true
+    )]
+    fn docstring_detection(
+        #[case] src: &str,
+        #[case] card_idx: usize,
+        #[case] expect_docstring: bool,
+    ) {
+        let cards = extract(src);
+        let c = &cards[card_idx];
+        assert_eq!(c.docstring_range.is_some(), expect_docstring, "docstring_range");
+        assert_eq!(c.docstring_lines.is_some(), expect_docstring, "docstring_lines");
     }
 
     /// Parent/child links: methods of a class have that class as parent.
