@@ -360,12 +360,9 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 
 ## Task tracking
 
-High-level roadmap (milestones M1–M8 and their sub-milestones at one-line granularity) lives in `TASKS.md`. The `TASKS.md` document is the git-visible story of *where this project is going and in what order*.
+- **Roadmap** (M1–M8 + sub-milestones, one-line each) lives in `TASKS.md` — the git-visible story of *where this is going*.
+- **Per-issue specs, status, decisions** live in **Linear** (project `Yggdrasil`, team `Yggdrasil`, IDs `YGG-<n>`).
 
-Per-sub-milestone specs, status, and claiming live in **Linear** — project `Yggdrasil`, team `Yggdrasil`. Each sub-milestone has a `YGG-<n>` issue with the full description, parent links, and `blockedBy` relationships.
+Linear functions primarily as an **agent-to-agent memory channel** across sessions — between eyes-on reviews and cold-started LLM instances, tickets carry the design context conversations lose. Write tickets as notes to your future self (specific, concise, token-dense); read the full state (description, comments, linked tickets) before acting on any pickup.
 
-When adding a new sub-milestone:
-1. Create it in Linear (full description, status, parent/blocks as appropriate).
-2. Add a one-line pointer in `TASKS.md` under the right milestone, referencing the Linear ID.
-
-This split keeps the git history coherent (roadmap decisions are diffable) without duplicating detailed descriptions.
+The full workflow — creation thresholds, status transitions, ship-note comments, decision recording, cross-ticket impact, scope-drift handling — lives in the `maintaining-linear-issues` skill (`.claude/skills/maintaining-linear-issues/SKILL.md`). It activates automatically when Linear work is in scope.
