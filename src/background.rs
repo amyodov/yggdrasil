@@ -27,12 +27,18 @@ use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::sky::SkyLight;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct Uniforms {
     viewport_size: [f32; 2],
     time_seconds: f32,
-    _pad: f32,
+    sky_intensity: f32,
+    /// Unit vector toward the unseen dominant star; xyz. `w` is padding.
+    sky_direction: [f32; 4],
+    /// Sky color temperature (linear RGB); rgb. `a` is padding.
+    sky_color: [f32; 4],
 }
 
 pub struct BackgroundRenderer {
@@ -122,11 +128,14 @@ impl BackgroundRenderer {
         queue: &wgpu::Queue,
         viewport_size: (u32, u32),
         time_seconds: f32,
+        sky: SkyLight,
     ) {
         let u = Uniforms {
             viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32],
             time_seconds,
-            _pad: 0.0,
+            sky_intensity: sky.intensity,
+            sky_direction: [sky.direction.x, sky.direction.y, sky.direction.z, 0.0],
+            sky_color: [sky.color.x, sky.color.y, sky.color.z, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
     }
@@ -142,7 +151,9 @@ const SHADER: &str = r#"
 struct Uniforms {
     viewport_size: vec2<f32>,
     time_seconds: f32,
-    _pad: f32,
+    sky_intensity: f32,
+    sky_direction: vec4<f32>,
+    sky_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -384,13 +395,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let turb_uv = auv * 12.0 + vec2<f32>(-t * 0.280, t * 0.210);
     let turb = fbm(turb_uv) * 0.12;
 
+    // ---- SkyLight tint per cloud layer.
+    // Each layer has a `star_response` coefficient (far ~0.1, mid ~0.4,
+    // near ~0.8) that controls how much it takes on the sky's current
+    // color. Far clouds are effectively ambient; near clouds breathe
+    // warm/cool/magenta with the sun in lockstep with every reflection
+    // on the scene. `intensity` gates the whole thing — at night
+    // (intensity ~0.05) the tint is zero, so each layer stays its own
+    // baseline color but dimmed. ----
+    let sky_c = u.sky_color.rgb;
+    let far_tint  = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.1 * u.sky_intensity);
+    let mid_tint  = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.4 * u.sky_intensity);
+    let near_tint = mix(vec3<f32>(1.0, 1.0, 1.0), sky_c * 1.4, 0.8 * u.sky_intensity);
+    let far_tinted  = far_color  * far_tint;
+    let mid_tinted  = mid_color  * mid_tint;
+    let near_tinted = near_color * near_tint;
+
     // Compose. Three cloud layers sum additively because in real nebulae,
     // atmospheric emission stacks. Peak composite ≈ 0.18 — visible but
     // keeps the sky comfortably dim.
-    let nebula = far_color  * far  * 0.55
-               + mid_color  * mid  * 0.75
-               + near_color * near * 0.60
+    var nebula = far_tinted  * far  * 0.55
+               + mid_tinted  * mid  * 0.75
+               + near_tinted * near * 0.60
                + vec3<f32>(turb, turb, turb) * 0.25;
+
+    // Overall brightness modulated by SkyLight.intensity: ~45% at night,
+    // 100% at noon. Wide diapason so you can see the day/night cycle in
+    // the sky itself, not only in the reflections.
+    let brightness = 0.45 + 0.55 * u.sky_intensity;
+    nebula = nebula * brightness;
 
     // ---- Nebula lightnings (M3.8.1). Short curved arcs, bright white core
     // with tinted halo. Mostly tinted by the local nebula colour so each

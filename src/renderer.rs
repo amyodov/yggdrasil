@@ -650,10 +650,13 @@ impl Renderer {
         );
 
         // Background uniforms stay window-sized (it draws to the swap chain).
+        // Passes SkyLight so the nebula's tint + brightness track the sky
+        // cycle in sync with lens glints and spine highlights.
         self.background_renderer.prepare(
             &self.queue,
             (state.window_size.width, state.window_size.height),
             self.start_time.elapsed().as_secs_f32(),
+            state.sky_light(),
         );
 
         // ---- Glyphon: prepare text areas for visible cards (plate-local) ----
