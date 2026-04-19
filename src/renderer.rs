@@ -202,11 +202,23 @@ const FOLD_LENS_SPECULAR_SKY_MIX: f32 = 0.22;
 /// Matches "night" moods (intensity ~0.04–0.12) so the sun's reflection
 /// vanishes when the star is below the horizon.
 const FOLD_LENS_SPECULAR_NIGHT_THRESHOLD: f32 = 0.15;
-/// Per-lens angular perturbation range (radians). Each lens's card_id
-/// seeds a small offset so a grid of lenses doesn't glint in perfect
-/// lockstep — reads more like "many pieces of real glass, each slightly
-/// differently oriented" than "cloned lens objects."
-const FOLD_LENS_PER_CARD_JITTER: f32 = 0.22;
+/// Virtual sun distance from the plate, in logical points. The sun is
+/// anchored at a point in plate-local coords and each lens computes its
+/// own "vector to sun" using its own position — so lenses at different
+/// positions on the plate see the glint at different angles. Large
+/// enough that the effect is subtle-realistic rather than dramatic-
+/// funhouse-mirror; small enough that scrolling visibly changes where
+/// each lens's specular sits.
+const SUN_VIRTUAL_DISTANCE_PT: f32 = 400.0;
+/// Plate-local anchor the sun's direction is applied to. Picked near the
+/// plate's expected horizontal mid so lenses to either side get
+/// symmetric angular spread.
+const SUN_ANCHOR_X_PT: f32 = 280.0;
+const SUN_ANCHOR_Y_PT: f32 = 0.0;
+/// Tiny per-card angular jitter (radians) on top of the position-driven
+/// angle. Keeps lenses that happen to sit at near-identical plate-local
+/// positions from glinting identically.
+const FOLD_LENS_PER_CARD_JITTER: f32 = 0.08;
 
 /// Icon for a given fold target. The `Rows1` / `Rows2` / `Rows3` series is
 /// an ordered visual progression — one bar for "just the header", two for
@@ -1311,10 +1323,23 @@ fn push_card_shapes(
                 / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
                 .clamp(0.0, 1.0);
             if spec_intensity > 0.001 {
-                let base_angle = sky.direction.y.atan2(sky.direction.x);
-                // Deterministic per-card jitter: sin of a prime multiplier
-                // gives a fractal-looking spread across card ids without
-                // any allocations.
+                // Position-dependent sun angle: anchor the sun at a fixed
+                // point in plate-local coords, push it out along the sky
+                // direction, then compute the angle from THIS lens to the
+                // sun. Different lenses at different positions see the
+                // sun from different angles, so their glints disagree
+                // slightly — exactly what real lenses scattered on a
+                // plate would do.  Scrolling shifts every lens's y →
+                // every lens's glint angle migrates too.
+                let sun_x = (SUN_ANCHOR_X_PT + SUN_VIRTUAL_DISTANCE_PT * sky.direction.x) * sf;
+                let sun_y = (SUN_ANCHOR_Y_PT + SUN_VIRTUAL_DISTANCE_PT * sky.direction.y) * sf;
+                let lens_center_y_abs = lens_disc_y + lens_disc_size * 0.5;
+                let to_sun_dx = sun_x - lens_x;
+                let to_sun_dy = sun_y - lens_center_y_abs;
+                let base_angle = to_sun_dy.atan2(to_sun_dx);
+                // Tiny per-card jitter on top, breaking any residual
+                // "same exact position" coincidence for lenses that
+                // happen to overlap.
                 let card_seed = card.id.0 as f32 * 2.3998;
                 let jitter = card_seed.sin() * FOLD_LENS_PER_CARD_JITTER;
                 let angle = base_angle + jitter;
