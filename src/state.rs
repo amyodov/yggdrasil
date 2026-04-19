@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::analyzer::SourceFile;
 use crate::cards::{Card, CardId};
+use crate::filetree::DirectoryListing;
 use crate::sky::{SkyLight, DEFAULT_DAY_CYCLE_SECS};
 use crate::syntax::TokenKind;
 
@@ -225,6 +226,11 @@ pub struct AppState {
     /// Overridable via `--debug-day-loop-length`; defaults to
     /// `DEFAULT_DAY_CYCLE_SECS`.
     pub day_cycle_secs: f32,
+    /// Directory listing when the app was launched with `ygg <dir>`.
+    /// `None` when launched on a single file. Consumed by the tree
+    /// substrate (YGG-14 commit 2+); today stored as pure data, not
+    /// yet rendered.
+    pub directory: Option<DirectoryListing>,
 }
 
 impl AppState {
@@ -241,6 +247,7 @@ impl AppState {
             press: None,
             elapsed_secs: 0.0,
             day_cycle_secs: DEFAULT_DAY_CYCLE_SECS,
+            directory: None,
         }
     }
 

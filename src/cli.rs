@@ -94,8 +94,6 @@ pub enum CliError {
     PathNotFound(PathBuf),
     #[error("expected a file, got a directory: {0}")]
     ExpectedFileGotDir(PathBuf),
-    #[error("`ygg <directory>` mode is not yet implemented (planned for M4)")]
-    DirectoryModeNotImplemented,
     #[error("`ygg diff` mode is not yet implemented (planned for M6)")]
     DiffModeNotImplemented,
 }
@@ -118,8 +116,10 @@ impl Cli {
         }
 
         if fs.is_dir(&path) {
-            // Directory mode is M4+; reject cleanly in M1.
-            return Err(CliError::DirectoryModeNotImplemented);
+            // M4.1: directory mode is being wired up. First pass opens a
+            // representative file from the directory and carries a flat
+            // listing alongside; visible tree lands in a later commit.
+            return Ok(Mode::Directory { path, git: self.git });
         }
 
         if !fs.is_file(&path) {
@@ -189,7 +189,8 @@ mod tests {
     // One parameterized test covers:
     //  - valid file path            → Mode::File
     //  - missing path on disk       → PathNotFound
-    //  - directory given            → DirectoryModeNotImplemented (M1)
+    //  - directory given            → Mode::Directory (M4.1)
+    //  - directory with --git flag  → Mode::Directory { git: true }
     //  - `diff` subcommand          → DiffModeNotImplemented (M1)
     //
     // The expected outcome is encoded as a closure so each case asserts only on
@@ -205,10 +206,15 @@ mod tests {
         &[], &[],
         |r: &Result<Mode, CliError>| matches!(r, Err(CliError::PathNotFound(p)) if p == Path::new("missing.py")),
     )]
-    #[case::directory_not_yet_impl(
+    #[case::directory_ok(
         &["ygg", "some_dir"],
         &[], &["some_dir"],
-        |r: &Result<Mode, CliError>| matches!(r, Err(CliError::DirectoryModeNotImplemented)),
+        |r: &Result<Mode, CliError>| matches!(r, Ok(Mode::Directory { path, git: false }) if path == Path::new("some_dir")),
+    )]
+    #[case::directory_with_git(
+        &["ygg", "some_dir", "--git"],
+        &[], &["some_dir"],
+        |r: &Result<Mode, CliError>| matches!(r, Ok(Mode::Directory { path, git: true }) if path == Path::new("some_dir")),
     )]
     #[case::diff_not_yet_impl(
         &["ygg", "diff", "HEAD~1", "HEAD"],
