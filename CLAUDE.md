@@ -334,6 +334,30 @@ When Claude Code (or similar) works on this codebase:
 - When in doubt about state, re-read the **One state, derived rendering** principle. Avoid event-driven animation code.
 - Write the smallest parameterized test that covers a logical unit. Don't pad tests for coverage metrics.
 
+## Commits
+
+### When to commit
+
+In **remote-control / headless mode** (no live app in front of the user), commit after each logically self-contained change so there's a safety net — tests + clippy per commit are the only feedback available.
+
+In **eyes-on mode** (user is watching the app, iterating visually), commit only *after* the user approves the solution, never before showing them. Rapid visual tuning produces many tiny edits; those get batched into one coherent commit when we converge — the git history should show *what was decided*, not *the deliberation*. Exceptions: the user explicitly says "commit," or we are moving to a clearly different topic and the current topic is stable enough to land.
+
+### Message style
+
+**Subject (required):** a one-line summary that stands on its own. Short enough to fit in a `git log --oneline` terminal; reads as the headline you'd skim before deciding whether to open the diff. Title-case first word, period at the end.
+
+**Body (required for anything not purely mechanical):** explain the **purpose** — why the change matters to its consumer. The consumer is usually the user (visible change) but can also be a future developer (an architectural refactor that unlocks later work). Say what's now true that wasn't before: *"the near-cloud layer now takes the star's color,"* not *"replaced multiplicative tint with mix() at coefficient 0.9."*
+
+**Avoid the HOW.** Implementation details belong in the diff, not the log. Magic numbers, shader-coefficient tuning, which smoothstep range, which branch was taken — all of those read like inventory lists and age badly. They only belong in the body when the decision itself *is* the business — i.e., the choice would have been worth its own commit.
+
+**Trailer:** every commit gets co-authorship attribution to Claude. The model ID follows whichever model actually wrote the code. Historical commits by Opus 4.6 keep that attribution; commits authored by Opus 4.7 use that attribution. Form:
+
+```
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+```
+
+(substitute the running model ID). This produces the "amyodov and Claude committed together" reading in GitHub's UI, which is the honest record — no commit on this project was authored solo.
+
 ## Task tracking
 
 High-level roadmap (milestones M1–M8 and their sub-milestones at one-line granularity) lives in `TASKS.md`. The `TASKS.md` document is the git-visible story of *where this project is going and in what order*.
