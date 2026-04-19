@@ -41,25 +41,27 @@ When it's unclear whether a design choice fits the dialect, ask: *"Would this si
 1. **One world, shared physics.** Every element obeys the same lighting grammar (see *The world: three zones*). The physics is the coherence; the vocabulary can be eclectic.
 2. **Metaphors picked for didactic clarity, not cleverness.** A scroll is used because it *is* long rolled-up content. A console is used because it *is* a deliberation surface. A hologram is used because it *is* a projection linking A to B. Each metaphor earns its place by teaching its function.
 3. **Restrained palette and luminance.** Deep-space darks, dim materials lit from within, rare specular glints. Never glossy, never saturated-bright.
-4. **One material per object class.** Cards are always paper. Plates are always parchment. Projections are always pale-blue holographic. The types are consistent even though the palette of types is rich.
+4. **One material per object class.** Cards are always paper. Scrolls are always parchment. Projections are always pale-blue holographic. The types are consistent even though the palette of types is rich.
 5. **Function-first.** If an element doesn't teach the reader something or anchor an interaction, it doesn't belong — no matter how pretty.
 
 ### Visual vocabulary (the "words")
 
 The dialect has a small fixed vocabulary. When adding a new visual, first identify which word(s) it's using:
 
-- **Zone** — *where are we?* Void / plate / on-plate. Governs lighting (see *The world: three zones* below).
+- **Zone** — *where are we?* Void / scroll / on-scroll. Governs lighting (see *The world: three zones* below).
 - **Paper** — *what kind of content is this?* Multiple papers, each a specific semantic class:
   - **White paper** — regular code implementation (default).
   - **Blueprint blue** — interfaces, declarations, contracts (`.pyi`, `.h`, Rust `trait`, TS `interface`, Python `Protocol`/`ABC`).
   - **Graph paper** (blue rule on white) — tests.
   - **Kraft** (tan/brown) — configuration / data (YAML, TOML, JSON-config).
   - **Vellum / tissue** (cream, translucent) — prose / docs / docstring bands.
-  - **Linen** — the scroll plate itself. A woven material with a rhythmic thread pattern and tiny weave holes. Two-channel transparency: diffuse light (nebula) passes through uniformly at low alpha; sharp point light (stars) passes through *weave holes only*. That's what gates the star field behind the plate into a textural density rather than a distracting pinpoint map. Plate color shifts to the linen's natural warm-ivory in the interior lighting; the inner luminance is light passing through the cloth from behind. (Parchment — animal-skin, smooth, no weave — is a reserved word for future cases; the default scroll is linen.)
-- **Cardboard** — headers / planks / title bands. Heavier than paper, smaller than metal. The header-plank of a scroll is cardboard.
+  - **Linen** — the scroll's substrate material. A woven cloth with a rhythmic thread pattern and tiny weave holes. Two-channel transparency: diffuse light (nebula) passes through uniformly at low alpha; sharp point light (stars) passes through *weave holes only*. The star field behind the scroll therefore reads as textural density rather than a distracting pinpoint map. Scroll colour shifts to the linen's natural warm-ivory in the interior lighting; the inner luminance is light passing through the cloth from behind. (Parchment — animal-skin, smooth, no weave — is a reserved word for future cases; the default scroll is linen.)
+- **Cardboard** — title bands and metadata chips glued onto planks. Heavier than paper, smaller than metal. The scroll's header plank is a composite: **wooden base** (part of the scroll carcass) with a **cardboard inset** glued on top carrying the filename and any metadata chips. Wood grain is visible in the plank's surface around the cardboard inset.
 - **Metal** — *joining, at every scale.* Three uses: (a) small structural (brass rivets, rod caps, bolt where plank meets rod); (b) foil inlay (a thin metal stripe on paper, used to say "this edge matters" without introducing a full metal object); (c) big structural (the class armature spine — glowing, emissive-metal — plus its connectors to method cards). Metal catches light from the void: occasional directional specular glints (~1 every 4–8 seconds per element) when nebula or aurora brightens past it. That's how the eye reads "actually metal" rather than "gray paint."
 - **Projection** — *this thing and that thing are identical, seen from different places.* Pale blue-white, ~40% opacity, scan-line edges, occasional Leia-crackle flicker. Always makes an identity claim — never used decoratively. Examples: code pane ↔ file in the tree, code pane ↔ timeline position, symbol definition ↔ each call-site, diff-before ↔ diff-after.
-- **Wood / Workbench** — *deliberation mode.* Wood is the body of the Fairlight console. Appears when the user shifts from flow to comparison (PR review is the canonical case). Changes the lighting grammar: light falls on the workbench from above (a lamp), unlike void-light which comes from within plates. Three interaction modes: full / edge / absent (see *Canonical mode* above).
+- **Wood** — two distinct uses, both physical, both mostly unseen:
+  - **Workbench** (*deliberation mode*): wood is the body of the Fairlight console. Appears when the user shifts from flow to comparison (PR review is the canonical case). Changes the lighting grammar: light falls on the workbench from above (a lamp), unlike void-light which comes from within scrolls. Three interaction modes: full / edge / absent (see *Canonical mode* above).
+  - **Scroll carcass** (*implied structural frame*): each scroll has a wooden framework holding it — top bar, bottom bar, implied side bars. Mostly invisible, *implied* through the linen's semi-transparency (the carcass occludes what's behind the linen, so you see faint darker regions where its shape lies). The **header plank** is the visible front face of the top bar; everything else stays as an implication. Cap-glows at the scroll's left/right edges hint at where the top-bar wood exits the linen. Rods as *visible* objects are explicitly not earned; the carcass already conveys the structural role.
 
 Implicit (not vocabulary words, don't need naming):
 - **Void-matter** — what nebulae and sky are made of (spatial noise, deep hues, vignette).
@@ -109,29 +111,29 @@ Don't build structures that make any of these harder to bolt on later. Scrub-bre
 
 The Yggdrasil canvas has three distinct zones. Each has its own grammar. Mixing grammars is where "glow on glow" confusion comes from — don't.
 
-**Zone 1 — The void.** The dark space outside any plate. Breathing near-black sky, slightly textured so it's not dead. *Rule*: objects in the void emit light — halos, bloom, outer glow. No shadows. Depth from brightness, sharpness, scale, blur. Think Tron, Mass Effect codex, Bourne Ultimatum surveillance screens.
+**Zone 1 — The void.** The dark space outside any scroll. Breathing near-black sky, slightly textured so it's not dead. *Rule*: objects in the void emit light — halos, bloom, outer glow. No shadows. Depth from brightness, sharpness, scale, blur. Think Tron, Mass Effect codex, Bourne Ultimatum surveillance screens.
 
-**Zone 2 — The plate (scroll).** A floating luminous surface in the void, holding code content. *Rule*: the plate is a lit material — holographic parchment. It has two faces:
-- **Outer edge** (facing the void): emits light outward as a soft bloom halo. This is the plate's presence in the void.
+**Zone 2 — The scroll.** A floating luminous surface in the void, holding code content. *Rule*: the scroll is a lit material — linen substrate with an implicit wooden carcass behind it. It has two faces:
+- **Outer edge** (facing the void): emits light outward as a soft bloom halo. This is the scroll's presence in the void.
 - **Top surface** (facing the viewer): a lit plane under implicit light from above. Objects laid on this surface are lit by it.
 
-**Zone 3 — On the plate.** Cards, text, icons, handles — content placed on a lit surface. *Rule*: 2.5D physical objects with small drop shadows. Near-opaque tinted fills, subtle top-edge rim light from the implicit above-source. **No outer glow** — the plate lights them; they don't light themselves. Think objects on a glowing holographic table in sci-fi (Avengers, Minority Report): the *table* glows, the *objects on it* are physical and cast tiny shadows.
+**Zone 3 — On the scroll.** Cards, text, icons, handles — content placed on a lit surface. *Rule*: 2.5D physical objects with small drop shadows. Near-opaque tinted fills, subtle top-edge rim light from the implicit above-source. **No outer glow** — the scroll lights them; they don't light themselves. Think objects on a glowing holographic table in sci-fi (Avengers, Minority Report): the *table* glows, the *objects on it* are physical and cast tiny shadows.
 
-**Semantic lights: the exception.** Certain elements on the plate *are* allowed to emit — they're not decorative glow, they carry meaning. Specifically:
-- Class armature / spine (genuinely luminous — it's a light-emitting rail built into the plate).
+**Semantic lights: the exception.** Certain elements on the scroll *are* allowed to emit — they're not decorative glow, they carry meaning. Specifically:
+- Class armature / spine (genuinely luminous — it's a light-emitting rail built into the scroll).
 - Fold-state transitions (brief light pulses).
 - Diff-change flashes (red/green/blue per operation type).
 - Rolling edge during a fold animation.
 
 These are functional lights, not ambient decoration. Keep the set small; new semantic lights require a real reason.
 
-This grammar supersedes the older "everything emits light, no shadows anywhere" doctrine — that rule applied to *things in the void* and was misread as applying on the plate too. The unified rule now: **glow belongs to things floating in void or to semantic lights; shadows belong on lit surfaces.**
+This grammar supersedes the older "everything emits light, no shadows anywhere" doctrine — that rule applied to *things in the void* and was misread as applying on the scroll too. The unified rule now: **glow belongs to things floating in void or to semantic lights; shadows belong on lit surfaces.**
 
 ### Why not Material / paper-on-desk
-Material Design / macOS paper-on-desk metaphors don't fit this canvas — they assume a page under ambient room light, no inherent luminosity. Yggdrasil's plate *is* the light source. Shadows on the plate exist because the plate lights objects from below/around, not because there's a desk behind it.
+Material Design / macOS paper-on-desk metaphors don't fit this canvas — they assume a page under ambient room light, no inherent luminosity. Yggdrasil's scroll *is* the light source. Shadows on the scroll exist because the scroll lights objects from below/around, not because there's a desk behind it.
 
 ### Cards
-Methods and classes are rendered as **2.5D physical objects on the plate** ("cards") — not themselves luminous. Each card has:
+Methods and classes are rendered as **2.5D physical objects on the scroll** ("cards") — not themselves luminous. Each card has:
 - A structured header: keyword badge (`def`/`class`/`fn`/`pub`), name, signature with typed params as mini-columns, return type badge on the right. Keyword-only separators (`*`, `/`) visible as divider columns.
 - A docstring sub-header in a distinct style, separated by a hairline.
 - The body: code with syntax highlighting, grid-aligned monospace.
@@ -139,9 +141,9 @@ Methods and classes are rendered as **2.5D physical objects on the plate** ("car
 
 Visual treatment (per Zone-3 rule):
 - **Near-opaque tinted fill** — a "paper" or "plastic" material colored by semantics.
-- **Tiny drop shadow** beneath the card (~2–3pt offset, low-alpha, softly blurred) — card sits *on* the plate.
+- **Tiny drop shadow** beneath the card (~2–3pt offset, low-alpha, softly blurred) — card sits *on* the scroll.
 - **Subtle top-edge rim light** — 1px bright line inside the top edge, cue for "lit from above."
-- **No outer glow on the card itself.** Outer glow belongs to the plate (Zone 2) and to semantic lights.
+- **No outer glow on the card itself.** Outer glow belongs to the scroll (Zone 2) and to semantic lights.
 
 Cards have a colored accent strip on the left encoding visibility/semantics:
 - Public methods: bright accent, full opacity, elevated (a hair taller shadow).
@@ -174,8 +176,12 @@ All diff visuals are parameterized by `progress: 0.0..1.0` and direction-indepen
 - **Rename** (file or symbol): letters morph between old and new name; the node in the file tree smoothly relocates/rewrites. If combined with move or modify, compose as above.
 - **Copy/fork** (file copied with `git diff -C` detection): not "appeared from nothing" but a cell-division animation from the ancestor node. Optional dotted ancestry link persists.
 
-### Panes as plates, not boxes
-UI panes (file tree on left, code plate on right) are not walled-off boxes with borders — they're **plates** (Zone 2): luminous surfaces floating in the void. The plate's outer bloom into the void doubles as the "pane is here" cue; no borders or splitters needed. Hover or focus-into-a-plate → the plate's bloom brightens slightly ("scroll here, interactions target this region"). All over a unified void.
+### Regions, not boxes
+The code-browsing region (right side — what other editors would call the "code pane") is a **scroll**: linen substrate, header plank above, cards glued onto it, pleatable and windable, with an implicit wooden carcass behind it. The file-tree region (left side) is a distinct artifact whose metaphor is still open — likely not a scroll; something more ghost-like, perhaps a shelf of tiny wound scrolls, or a constellation, or a cartographic vellum map. To be decided when the tree actually ships.
+
+Neither region is a walled-off box with borders. The scroll's outer bloom into the void doubles as the "this region is here" cue; the tree's eventual material will do its own version. All over a unified void.
+
+"Pane" is NOT a vocabulary word — it's a *positional-mental reference* bridging to how the user thinks about existing editors ("the spot where the tree would be, the spot where code would be"). It never describes an object in our world.
 
 The void has a subtle, slow ambient animation (breathing sky + faint drifting clouds at very low contrast) to feel alive without distracting.
 
@@ -185,10 +191,10 @@ Inspired by game engine editors (Unity, Blender) more than by code editors. Time
 ### 3D vs 2.5D — hybrid by zone
 Each zone has its own rule:
 
-- **Zone 1 (void)**: objects float in pseudo-3D space, orthographic + frontal projection by default. Depth cues in the void come from glow, opacity, scale, blur — not geometry. Camera movements (zoom, fly-through) feel 3D without actually rotating individual plates. Plates *can* rotate here (future: repo-browse history pages, branch-graph tilts) because they're 3D quads in the pipeline from M3.1 onward.
-- **Zone 3 (on the plate)**: 2.5D — flat-with-shadows. Physical objects lying on the plate's top surface. Shadows cue depth. No rotation of items within a plate; they stay parallel to the plate's own surface.
+- **Zone 1 (void)**: objects float in pseudo-3D space, orthographic + frontal projection by default. Depth cues in the void come from glow, opacity, scale, blur — not geometry. Camera movements (zoom, fly-through) feel 3D without actually rotating individual scrolls. Scrolls *can* rotate here (future: repo-browse history pages, branch-graph tilts) because they're 3D quads in the pipeline from M3.1 onward.
+- **Zone 3 (on the scroll)**: 2.5D — flat-with-shadows. Physical objects lying on the scroll's top surface. Shadows cue depth. No rotation of items within a scroll; they stay parallel to the scroll's own surface.
 
-This hybrid is intentional: the void gets holographic FUI flow; the plate surface gets paper-on-a-lit-desk legibility. The two aesthetics sit on different sides of the plate's edge and don't fight each other.
+This hybrid is intentional: the void gets holographic FUI flow; the scroll surface gets paper-on-a-lit-desk legibility. The two aesthetics sit on different sides of the scroll's edge and don't fight each other.
 
 ### Git branch graphs (future)
 Branches that diverge and converge are inherently a graph structure. A future exploration is tilting the branch graph slightly toward 3D to make merge topology legible. Not in prototype scope — noted for later.

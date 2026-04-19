@@ -1,37 +1,45 @@
-//! Plate primitive — the architectural foundation of M3.1.
+//! Substrate primitive — the architectural foundation of M3.1.
 //!
-//! A **plate** is a rectangular surface that owns an offscreen render target
-//! (RT). Its contents (shapes, text) are drawn into the RT in *plate-local*
+//! A **substrate** is a rectangular region that owns an offscreen render target
+//! (RT). Its contents (shapes, text) are drawn into the RT in *substrate-local*
 //! coordinates (`0..size`). The compositor then samples the RT as a textured
-//! quad, transformed by the plate's model matrix, onto the swap chain.
+//! quad, transformed by the substrate's model matrix, onto the swap chain.
+//!
+//! In design vocabulary, a substrate used for code becomes a **scroll** (linen
+//! substrate, header plank above, cards glued onto it, pleatable, windable).
+//! The tree (left-side structure) will likely also be a substrate underneath,
+//! though its metaphor is still open. "Substrate" is the technical name for
+//! the primitive; "scroll" and whatever-the-tree-becomes are the design
+//! vocabulary words that use it.
 //!
 //! ## Why this primitive exists (architectural stake)
 //!
-//! Every downstream visual concern benefits from rendering through a plate:
+//! Every downstream visual concern benefits from rendering through a substrate:
 //!
 //! - **Scroll**: today we re-render visible content each frame; future work
-//!   samples a larger-than-plate RT with a UV offset, getting scroll for free.
+//!   samples a larger-than-substrate RT with a UV offset, getting scroll for
+//!   free.
 //! - **Curl / scroll-winding (M3.7)**: the top/bottom pin zones sample the
-//!   plate RT onto a cylindrical UV mapping. Impossible without an RT.
-//! - **3D rotation / plate-as-page (future)**: the model matrix handles this.
-//!   With identity it looks 2D today; with a rotation it *is* 3D. No code
-//!   elsewhere has to know.
-//! - **Dirty-flag caching**: if the plate's contents didn't change, don't
+//!   substrate RT onto a cylindrical UV mapping. Impossible without an RT.
+//! - **3D rotation / substrate-as-page (future)**: the model matrix handles
+//!   this. With identity it looks 2D today; with a rotation it *is* 3D. No
+//!   code elsewhere has to know.
+//! - **Dirty-flag caching**: if the substrate's contents didn't change, don't
 //!   redraw them — just re-composite the cached RT. Cheap frame-to-frame.
 //!
 //! ## M3.1 scope and deferred
 //!
 //! M3.1 ships:
-//! - RT = plate size. One RT per plate.
+//! - RT = substrate size. One RT per substrate.
 //! - Identity model matrix (ortho + frontal). Looks 2D.
 //! - Mipmap level count = 1. No angular rendering yet.
 //! - `dirty` field is maintained but the renderer re-renders every frame for
 //!   now; wiring up actual dirty-skip is trivial once there's motivation.
 //!
 //! Deferred to follow-ups (noted here, not reimplemented-and-forgotten):
-//! - Plate-height × 3 RT with UV-offset scrolling.
+//! - Substrate-height × 3 RT with UV-offset scrolling.
 //! - Manual mipmap chain + sampling at higher mip for angled views.
-//! - RT pool with recycling across plates.
+//! - RT pool with recycling across surfaces.
 
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindingResource, Buffer,
@@ -39,7 +47,7 @@ use wgpu::{
     TextureUsages, TextureView, TextureViewDescriptor,
 };
 
-/// A 4x4 column-major identity matrix. The plate's default orientation —
+/// A 4x4 column-major identity matrix. The substrate's default orientation —
 /// frontal, no rotation. Rotations swap this for a real matrix later.
 pub const IDENTITY4: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
@@ -48,31 +56,32 @@ pub const IDENTITY4: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
-pub struct Plate {
-    /// Plate size in physical pixels (also the RT size in M3.1).
+pub struct Substrate {
+    /// Substrate size in physical pixels (also the RT size in M3.1).
     pub size_px: [u32; 2],
-    /// Top-left of the plate in *window / swap-chain* space, physical pixels.
-    /// The compositor adds this to model-transformed plate-local coordinates
-    /// to compute screen positions.
+    /// Top-left of the substrate in *window / swap-chain* space, physical
+    /// pixels. The compositor adds this to model-transformed substrate-local
+    /// coordinates to compute screen positions.
     pub pos_px: [f32; 2],
-    /// 4x4 model matrix applied to plate-local coords `[0, size_px]` before
-    /// the screen translation. Identity = frontal.
+    /// 4x4 model matrix applied to substrate-local coords `[0, size_px]`
+    /// before the screen translation. Identity = frontal.
     pub model: [[f32; 4]; 4],
-    /// RT texture the plate's contents draw into.
+    /// RT texture the substrate's contents draw into.
     pub rt_texture: Texture,
     /// View of the RT — used both as a render attachment (when drawing into
-    /// the plate) and as a shader resource (during composite).
+    /// the substrate) and as a shader resource (during composite).
     pub rt_view: TextureView,
-    /// Bind group for the composite pipeline: shared uniforms + this plate's
-    /// texture + sampler. Rebuilt when the RT is reallocated (on resize).
+    /// Bind group for the composite pipeline: shared uniforms + this
+    /// substrate's texture + sampler. Rebuilt when the RT is reallocated (on
+    /// resize).
     pub composite_bg: BindGroup,
-    /// Does the plate's RT need re-rendering this frame? M3.1 re-renders
+    /// Does the substrate's RT need re-rendering this frame? M3.1 re-renders
     /// unconditionally, but the field exists so follow-ups can opt in to
     /// cached-RT compositing without touching the primitive.
     pub dirty: bool,
 }
 
-impl Plate {
+impl Substrate {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
@@ -96,7 +105,7 @@ impl Plate {
         }
     }
 
-    /// Update the plate's position and (optionally) size. A size change
+    /// Update the substrate's position and (optionally) size. A size change
     /// reallocates the RT and rebuilds the composite bind group. Returns
     /// `true` if the RT was reallocated (callers may want to invalidate
     /// caches).
@@ -138,7 +147,7 @@ fn allocate_rt(
     format: TextureFormat,
 ) -> (Texture, TextureView) {
     let texture = device.create_texture(&TextureDescriptor {
-        label: Some("ygg-plate-rt"),
+        label: Some("ygg-substrate-rt"),
         size: Extent3d {
             width: size_px[0].max(1),
             height: size_px[1].max(1),
@@ -163,7 +172,7 @@ fn build_bind_group(
     sampler: &Sampler,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
-        label: Some("ygg-plate-composite-bg"),
+        label: Some("ygg-substrate-composite-bg"),
         layout,
         entries: &[
             BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },

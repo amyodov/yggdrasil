@@ -60,7 +60,7 @@ use crate::composite::CompositeRenderer;
 use crate::lens_pipeline::{LensInstance, LensRenderer};
 use crate::icon_pipeline::{IconInstance, IconRenderer};
 use crate::icons::IconId;
-use crate::plate::Plate;
+use crate::substrate::Substrate;
 use crate::shapes::{RectInstance, ShapeRenderer};
 use crate::state::{
     card_fold_states, card_well_position, AppState, FoldState, HighlightedSource, WindowSize,
@@ -333,7 +333,7 @@ pub struct Renderer {
 
     // Plate infrastructure (M3.1).
     composite: CompositeRenderer,
-    code_plate: Plate,
+    code_scroll: Substrate,
 
     // glyphon
     font_system: FontSystem,
@@ -455,7 +455,7 @@ impl Renderer {
             (code_w - inset * 2.0).max(1.0) as u32,
             (size.height as f32 - inset * 2.0).max(1.0) as u32,
         ];
-        let code_plate = Plate::new(
+        let code_scroll = Substrate::new(
             &device,
             plate_size,
             plate_pos,
@@ -466,7 +466,7 @@ impl Renderer {
         );
         // Lens pass reads from the plate RT, so bind it now and rebind
         // any time the RT is reallocated (on window resize).
-        lens_renderer.bind_plate(&device, &code_plate.rt_view);
+        lens_renderer.bind_plate(&device, &code_scroll.rt_view);
 
         // egui
         let egui_ctx = egui::Context::default();
@@ -492,7 +492,7 @@ impl Renderer {
             lens_renderer,
             start_time: Instant::now(),
             composite,
-            code_plate,
+            code_scroll,
             font_system,
             swash_cache,
             viewport,
@@ -561,7 +561,7 @@ impl Renderer {
         // Reconfigure the plate if the window size or scale factor changed the
         // plate's target dimensions.
         let (plate_pos, plate_size) = plate_rect(state);
-        let rt_reallocated = self.code_plate.reconfigure(
+        let rt_reallocated = self.code_scroll.reconfigure(
             &self.device,
             plate_size,
             plate_pos,
@@ -574,7 +574,7 @@ impl Renderer {
             // Lens pass samples the plate RT — its bind group must
             // point at the freshly-allocated texture view.
             self.lens_renderer
-                .bind_plate(&self.device, &self.code_plate.rt_view);
+                .bind_plate(&self.device, &self.code_scroll.rt_view);
         }
 
         let frame = self.surface.get_current_texture()?;
@@ -698,14 +698,14 @@ impl Renderer {
         self.composite.prepare(
             &self.queue,
             (self.surface_config.width, self.surface_config.height),
-            self.code_plate.pos_px,
-            self.code_plate.size_px,
+            self.code_scroll.pos_px,
+            self.code_scroll.size_px,
             PANEL_CORNER_RADIUS_PT * sf,
             PLATE_BLOOM_RADIUS_PT * sf,
             PLATE_BLOOM_COLOR,
             PLATE_RIM_THICKNESS_PT * sf,
             PLATE_RIM_INTENSITY,
-            self.code_plate.model,
+            self.code_scroll.model,
             sky_dir_2d,
             sky_color,
             sky.intensity,
@@ -762,7 +762,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ygg-plate-shapes-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.code_plate.rt_view,
+                    view: &self.code_scroll.rt_view,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -781,7 +781,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ygg-plate-text-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.code_plate.rt_view,
+                    view: &self.code_scroll.rt_view,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
                 })],
@@ -800,7 +800,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ygg-plate-icon-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.code_plate.rt_view,
+                    view: &self.code_scroll.rt_view,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
                 })],
@@ -824,7 +824,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.composite.render(&mut pass, &self.code_plate.composite_bg);
+            self.composite.render(&mut pass, &self.code_scroll.composite_bg);
         }
 
         // Pass 4b: lens → swap chain. Samples the plate RT at magnified

@@ -11,7 +11,7 @@ mod icon_pipeline;
 mod icons;
 mod language;
 mod lens_pipeline;
-mod plate;
+mod substrate;
 mod renderer;
 mod shapes;
 mod sky;
