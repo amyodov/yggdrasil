@@ -688,6 +688,13 @@ impl Renderer {
         }
 
         // ---- Composite uniforms (plate → swap chain) ----
+        // SkyLight drives the plate's edge treatment — asymmetric bloom,
+        // directional key rim, and counter-shine all read from the same
+        // state that lights the nebula, lens glint, and foil spine. The
+        // 2D projection drops `direction.z` (plate view is frontal).
+        let sky = state.sky_light();
+        let sky_dir_2d = [sky.direction.x, sky.direction.y];
+        let sky_color = [sky.color.x, sky.color.y, sky.color.z];
         self.composite.prepare(
             &self.queue,
             (self.surface_config.width, self.surface_config.height),
@@ -699,6 +706,9 @@ impl Renderer {
             PLATE_RIM_THICKNESS_PT * sf,
             PLATE_RIM_INTENSITY,
             self.code_plate.model,
+            sky_dir_2d,
+            sky_color,
+            sky.intensity,
         );
 
         // ---- Egui ----

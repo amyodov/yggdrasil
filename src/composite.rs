@@ -36,12 +36,14 @@ use bytemuck::{Pod, Zeroable};
 /// needs 16-byte alignment, `vec2<f32>` needs 8-byte alignment. Field order
 /// is chosen so every 16-byte-aligned type lands on a 16-byte boundary.
 ///
-/// Layout (total 128 bytes):
+/// Layout (total 160 bytes):
 /// - viewport_size + plate_pos  ( 0.. 16)
 /// - plate_size + _pad0         (16.. 32)
 /// - bloom_color                (32.. 48)
-/// - corner_radius + bloom_radius + _pad1 (48.. 64)
+/// - corner_radius + bloom_radius + rim_thickness + rim_intensity (48.. 64)
 /// - model                      (64..128)
+/// - sky_direction + _pad1      (128..144)
+/// - sky_color + sky_intensity  (144..160)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CompositeUniforms {
@@ -64,13 +66,23 @@ pub struct CompositeUniforms {
     /// side so the halo fits.
     pub bloom_radius: f32,
     /// Rim-light thickness in physical pixels — how far inward from the
-    /// plate's top edge the rim highlight extends before fading out.
+    /// plate's edge the rim highlight extends before fading out.
     pub rim_thickness: f32,
     /// Rim-light peak intensity (multiplier on the rim color).
     pub rim_intensity: f32,
     /// Column-major 4x4 matrix applied to plate-local coordinates before the
     /// screen translation. Identity = frontal (M3.1).
     pub model: [[f32; 4]; 4],
+    /// 2D projection of `SkyLight.direction` (x,y) — where the unseen star
+    /// sits. The rim light, counter-shine, and outer bloom all ask "how
+    /// much does this edge face the star?" by dotting their local edge
+    /// normal with this vector. Z is dropped (the plate view is frontal).
+    pub sky_direction: [f32; 2],
+    pub _pad1: [f32; 2],
+    /// RGB = `SkyLight.color`, A = `SkyLight.intensity`. Tints the rim on
+    /// the lit side (counter-shine stays cool-ambient) and modulates the
+    /// overall rim brightness so night produces a muted shimmer.
+    pub sky_color_intensity: [f32; 4],
 }
 
 pub struct CompositeRenderer {
@@ -207,6 +219,9 @@ impl CompositeRenderer {
         rim_thickness: f32,
         rim_intensity: f32,
         model: [[f32; 4]; 4],
+        sky_direction: [f32; 2],
+        sky_color: [f32; 3],
+        sky_intensity: f32,
     ) {
         let u = CompositeUniforms {
             viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32],
@@ -219,6 +234,9 @@ impl CompositeRenderer {
             rim_thickness,
             rim_intensity,
             model,
+            sky_direction,
+            _pad1: [0.0; 2],
+            sky_color_intensity: [sky_color[0], sky_color[1], sky_color[2], sky_intensity],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
     }
@@ -246,6 +264,9 @@ struct Uniforms {
     rim_thickness: f32,
     rim_intensity: f32,
     model:         mat4x4<f32>,
+    sky_direction: vec2<f32>,
+    _pad1:         vec2<f32>,
+    sky_color_intensity: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -357,7 +378,16 @@ fn linen_weave(p_px: vec2<f32>) -> f32 {
     return max(h, v);
 }
 
-fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_intensity: f32) -> vec4<f32> {
+fn plate_interior(
+    p: vec2<f32>,
+    s: vec2<f32>,
+    d: f32,
+    rim_thickness: f32,
+    rim_intensity: f32,
+    sky_direction: vec2<f32>,
+    sky_color: vec3<f32>,
+    sky_intensity: f32,
+) -> vec4<f32> {
     let uv = p / s;
 
     // Vertical gradient — linen has natural warm-ivory; the plate picks up
@@ -374,14 +404,34 @@ fn plate_interior(p: vec2<f32>, s: vec2<f32>, d: f32, rim_thickness: f32, rim_in
     let radial = smoothstep(0.70, 0.05, r);
     rgb = rgb + vec3<f32>(0.026, 0.030, 0.034) * radial;
 
-    // Top-edge rim light. Uses SDF inside-depth (`-d`, positive inside) so
-    // the rim follows the rounded corners naturally. Gated by a vertical
-    // factor so only the top half of the plate lights up (light from above).
+    // Directional rim light — a thin bright band inside the plate edge,
+    // brightest on the side of the plate facing the unseen star. The
+    // opposite side gets a far fainter counter-shine (~25% strength) in
+    // a cool ambient tint — the optical trick that says "this is a
+    // solid object lit from outside," not "this is a glowing card-out."
+    //
+    // `n_edge` approximates the outward normal at the rim by taking the
+    // vector from plate centre to this fragment. For the SDF-thin rim
+    // band this is accurate enough; the rim_falloff keeps it confined
+    // to the band itself.
     let inside_depth = max(-d, 0.0);
     let rim_falloff = 1.0 - smoothstep(0.0, rim_thickness, inside_depth);
-    let upperness = smoothstep(s.y * 0.55, 0.0, p.y);
-    let rim = rim_falloff * upperness * rim_intensity;
-    rgb = rgb + vec3<f32>(0.14, 0.18, 0.28) * rim;
+    let n_edge = normalize(p - s * 0.5);
+    let facing = dot(n_edge, sky_direction);
+    let lit    = max(0.0, facing);
+    let shadow = max(0.0, -facing);
+    // At night the rim shouldn't vanish entirely — some ambient glow
+    // survives so the plate's shape is still read. 30% floor + 70%
+    // scaled by the sky's intensity.
+    let sky_influence = 0.30 + 0.70 * sky_intensity;
+    let key_strength = rim_falloff * lit * rim_intensity * sky_influence;
+    let counter_strength = rim_falloff * shadow * rim_intensity * 0.25 * sky_influence;
+    // Key rim picks up the sky colour (mostly — pure sky would be too
+    // saturated). Counter-shine keeps the old cool-blue ambient tint.
+    let key_rim_color = mix(vec3<f32>(0.14, 0.18, 0.28), sky_color, 0.70);
+    let counter_rim_color = vec3<f32>(0.10, 0.14, 0.22);
+    rgb = rgb + key_rim_color * key_strength;
+    rgb = rgb + counter_rim_color * counter_strength;
 
     // Linen weave: modulates per-pixel alpha by a rhythmic pattern. The
     // contrast is intentionally narrow — the weave should be *felt* as
@@ -416,7 +466,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Plate interior background (lit material) — computed whenever inside
     // the silhouette. Outside the silhouette, the plate mask zeroes this out.
-    let bg = plate_interior(in.plate_local, u.plate_size, d, u.rim_thickness, u.rim_intensity);
+    let bg = plate_interior(
+        in.plate_local, u.plate_size, d,
+        u.rim_thickness, u.rim_intensity,
+        u.sky_direction, u.sky_color_intensity.rgb, u.sky_color_intensity.w,
+    );
 
     // Plate silhouette mask with 1-pixel AA band across the rounded edge.
     // At d < -0.5 (firmly inside) mask = 1; at d > 0.5 (firmly outside) = 0.
@@ -426,12 +480,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let plate_rgb = (tex.rgb + bg.rgb * (1.0 - tex.a)) * plate_mask;
     let plate_a   = (tex.a   + bg.a   * (1.0 - tex.a)) * plate_mask;
 
-    // Outside the plate: bloom halo. Quadratic falloff based on SDF
-    // distance. Masked by (1 - plate_mask) so it doesn't double up with
-    // the plate interior inside the edge.
+    // Outside the plate: directional bloom halo. The same edge-normal
+    // trick used inside for the rim runs outside too: the halo is
+    // brightest on the side of the plate facing the star and dims —
+    // but doesn't vanish — on the opposite side. Mapping facing
+    // [-1, +1] to [0.45, 1.35] gives ~3× contrast between shadowed and
+    // lit sides without extinguishing the ambient glow anywhere.
+    let n_edge_out = normalize(in.plate_local - u.plate_size * 0.5);
+    let facing_out = dot(n_edge_out, u.sky_direction);
+    let bloom_mult = 0.45 + 0.90 * (facing_out * 0.5 + 0.5);
+    // Tint the bloom slightly toward the sky colour so dawn washes
+    // warm orange into the halo and dusk washes cool violet. 25%
+    // tint keeps the plate's own bloom identity dominant.
+    let bloom_tint_amount = 0.25 * u.sky_color_intensity.w;
+    let bloom_tinted = mix(u.bloom_color.rgb, u.sky_color_intensity.rgb, bloom_tint_amount);
     let bloom_t = clamp(1.0 - max(d, 0.0) / u.bloom_radius, 0.0, 1.0);
-    let bloom_alpha = bloom_t * bloom_t * u.bloom_color.a * (1.0 - plate_mask);
-    let bloom_rgb = u.bloom_color.rgb * bloom_alpha;  // premultiplied
+    let bloom_alpha = bloom_t * bloom_t * u.bloom_color.a * bloom_mult * (1.0 - plate_mask);
+    let bloom_rgb = bloom_tinted * bloom_alpha;  // premultiplied
 
     return vec4<f32>(plate_rgb + bloom_rgb, plate_a + bloom_alpha);
 }
