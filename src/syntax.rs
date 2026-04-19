@@ -1,8 +1,9 @@
 //! Syntax highlighting — tree-sitter + a luminous-void theme.
 //!
-//! M2 ships Python only (see CLAUDE.md "Language expansion"). The shape is
-//! designed for extension: swap `new_python()` for `new_rust()` etc. and the
-//! renderer doesn't care which grammar it's getting tokens from.
+//! Grammar and highlight query are supplied by a `LanguageModule`
+//! (see `src/language.rs`), so this file is language-agnostic. The
+//! token-kind mapping from capture names to `TokenKind` stays here
+//! because the palette is shared across languages.
 //!
 //! The output is a per-byte `Vec<TokenKind>` rather than a list of spans.
 //! This is deliberate:
@@ -15,7 +16,9 @@
 use std::ops::Range;
 
 use anyhow::Result;
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+
+use crate::language::LanguageModule;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -48,12 +51,17 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    pub fn new_python() -> Result<Self> {
-        let language: Language = tree_sitter_python::LANGUAGE.into();
+    /// Build a Highlighter from a language module. The module
+    /// supplies both the tree-sitter grammar and the highlight query;
+    /// everything else (capture-name → TokenKind mapping) stays
+    /// shared.
+    pub fn new_for_language(module: &dyn LanguageModule) -> Result<Self> {
+        let language = module.grammar();
         let mut parser = Parser::new();
         parser.set_language(&language)?;
 
-        let query = Query::new(&language, tree_sitter_python::HIGHLIGHTS_QUERY)?;
+        let query_source = module.highlights_query();
+        let query = Query::new(&language, query_source)?;
         let capture_kind: Vec<TokenKind> = query
             .capture_names()
             .iter()
@@ -61,6 +69,14 @@ impl Highlighter {
             .collect();
 
         Ok(Self { parser, query, capture_kind })
+    }
+
+    /// Convenience for tests: build a Python Highlighter directly.
+    /// Production code uses `new_for_language` with the module from
+    /// the registry.
+    #[cfg(test)]
+    pub fn new_python() -> Result<Self> {
+        Self::new_for_language(&crate::language::python::PythonModule)
     }
 
     /// Parse `source` into a tree-sitter `Tree`. Returns `None` if parsing
