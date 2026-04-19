@@ -480,9 +480,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var out_rgb = vec3<f32>(rs.r, gs.g, bs.b);
     let plate_a = max(max(rs.a, gs.a), bs.a);
 
-    // Rim darkening: the glass's edges refract light and read darker.
-    let rim_dark = smoothstep(0.72, 1.0, norm_r) * 0.32;
-    out_rgb = out_rgb * (1.0 - rim_dark);
+    // Fade the magnified content into a solid dark glass tint near the
+    // rim. Below ~0.70 normalized radius the lens shows clean
+    // magnification; past 0.95 it's uniform glass. The outer ring is
+    // reserved for the specular arc and a thin rim line — the sampled
+    // plate content would otherwise show through as noisy colored
+    // variation, which is what made the outline feel messy.
+    let glass_tint = vec3<f32>(0.07, 0.09, 0.14);
+    let content_fade = 1.0 - smoothstep(0.70, 0.95, norm_r);
+    out_rgb = mix(glass_tint, out_rgb, content_fade);
+
+    // Thin rim line at the very edge — light catching the outer
+    // curvature of the glass. Softens the AA boundary into something
+    // the eye reads as a deliberate object outline, not a rough fade.
+    let rim_line = smoothstep(0.93, 0.97, norm_r) * (1.0 - smoothstep(0.98, 1.0, norm_r));
+    let rim_line_color = vec3<f32>(0.55, 0.62, 0.72);
+    out_rgb = mix(out_rgb, rim_line_color, rim_line * 0.55);
 
     // Three-dot specular arc: one center dot at `spec_angle`, two
     // flanks at ±0.28 rad, all at radius 0.82. Each dot is a small
