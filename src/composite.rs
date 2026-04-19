@@ -426,12 +426,15 @@ fn plate_interior(
     let sky_influence = 0.30 + 0.70 * sky_intensity;
     let key_strength = rim_falloff * lit * rim_intensity * sky_influence;
     let counter_strength = rim_falloff * shadow * rim_intensity * 0.25 * sky_influence;
-    // Key rim picks up the sky colour (mostly — pure sky would be too
-    // saturated). Counter-shine keeps the old cool-blue ambient tint.
-    let key_rim_color = mix(vec3<f32>(0.14, 0.18, 0.28), sky_color, 0.70);
-    let counter_rim_color = vec3<f32>(0.10, 0.14, 0.22);
-    rgb = rgb + key_rim_color * key_strength;
-    rgb = rgb + counter_rim_color * counter_strength;
+    // All rim light comes from the same unseen star. The key rim is
+    // directly lit; the counter-shine is star-light scattered around
+    // the plate. Both take the sky colour verbatim — no artificial
+    // cool-blue baseline, because nothing in this cosmology is
+    // inherently cool-blue. At night the sky itself is a deep cool
+    // blue, so the rim naturally reads that way then; at dawn it's
+    // warm orange; at noon it's near-white.
+    rgb = rgb + sky_color * key_strength;
+    rgb = rgb + sky_color * counter_strength;
 
     // Linen weave: modulates per-pixel alpha by a rhythmic pattern. The
     // contrast is intentionally narrow — the weave should be *felt* as
@@ -489,14 +492,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n_edge_out = normalize(in.plate_local - u.plate_size * 0.5);
     let facing_out = dot(n_edge_out, u.sky_direction);
     let bloom_mult = 0.45 + 0.90 * (facing_out * 0.5 + 0.5);
-    // Tint the bloom slightly toward the sky colour so dawn washes
-    // warm orange into the halo and dusk washes cool violet. 25%
-    // tint keeps the plate's own bloom identity dominant.
-    let bloom_tint_amount = 0.25 * u.sky_color_intensity.w;
-    let bloom_tinted = mix(u.bloom_color.rgb, u.sky_color_intensity.rgb, bloom_tint_amount);
+    // The bloom is the star's light scattered around the plate, so its
+    // colour is the sky's colour. `bloom_color` is kept only for its
+    // peak-alpha value — the RGB is now fully star-driven.
     let bloom_t = clamp(1.0 - max(d, 0.0) / u.bloom_radius, 0.0, 1.0);
     let bloom_alpha = bloom_t * bloom_t * u.bloom_color.a * bloom_mult * (1.0 - plate_mask);
-    let bloom_rgb = bloom_tinted * bloom_alpha;  // premultiplied
+    let bloom_rgb = u.sky_color_intensity.rgb * bloom_alpha;  // premultiplied
 
     return vec4<f32>(plate_rgb + bloom_rgb, plate_a + bloom_alpha);
 }

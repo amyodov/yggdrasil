@@ -200,7 +200,7 @@ const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
 /// dark widget/disc it reads as the "lighter than anything else on
 /// screen" spot. Tinted slightly by `SkyLight.color` so it still warms
 /// with the sky.
-const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [1.00, 1.00, 1.00, 0.98];
+const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [1.00, 1.00, 1.00, 1.00];
 // Three-dot tangent arc constants — now baked into the lens shader
 // (see `lens_pipeline.rs`). Kept for reference tuning; the shader's
 // own constants `0.82` (rim radius) and `0.28` (arc spread) mirror

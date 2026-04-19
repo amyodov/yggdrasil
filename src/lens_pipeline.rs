@@ -494,40 +494,48 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // so the fade composes correctly with the disc's SDF AA.
     let rim_alpha = 1.0 - smoothstep(0.70, 1.0, norm_r);
 
-    // Three-dot specular arc: one center dot at `spec_angle`, two
-    // flanks at ±0.28 rad, all at radius 0.82. Each dot is a small
-    // bright circle drawn additively on top of the magnified content.
+    // Continuous specular arc — one streak along the bezel, thickest
+    // at `spec_angle` and tapering to both sides along the rim. This
+    // reads as a single highlight catching light off a curved glass
+    // surface, not as three polka dots.
+    //
+    // Radial: thin band centred at `spec_rim`, radial falloff over
+    // `spec_radial_half` on each side.
+    //
+    // Angular: peak at `spec_angle`, falloff over `spec_angular_span`
+    // (roughly a ~50° total arc). Multiplying the two gives a 2D
+    // Gaussian-like peak with a natural crescent-along-the-rim shape.
+    //
+    // `spec_rim` pulled inward from 0.82 → 0.75: keeps the highlight
+    // reading as "on the bezel" while staying outside the rim-fade
+    // zone (which starts at 0.70) and sitting visibly over the
+    // magnified icon instead of hugging the absolute edge.
+    //
     // Gated by spec_intensity so night produces no glint.
-    let spec_rim = 0.82;
-    let spec_dot_size = 0.10; // in normalized disc radii
+    let spec_rim = 0.75;
+    let spec_radial_half = 0.08;
+    let spec_angular_span = 0.45;
     let frag_norm = in.rel / max(in.radius, 1.0);
-    var spec_strength = 0.0;
-    // Center dot:
-    {
-        let a = in.spec_angle;
-        let dot_center = vec2<f32>(cos(a), sin(a)) * spec_rim;
-        let d_dot = length(frag_norm - dot_center);
-        let alpha = 1.0 - smoothstep(0.0, spec_dot_size, d_dot);
-        spec_strength = max(spec_strength, alpha * 1.0);
-    }
-    // Flank -:
-    {
-        let a = in.spec_angle - 0.28;
-        let dot_center = vec2<f32>(cos(a), sin(a)) * spec_rim;
-        let d_dot = length(frag_norm - dot_center);
-        let alpha = 1.0 - smoothstep(0.0, spec_dot_size * 0.8, d_dot);
-        spec_strength = max(spec_strength, alpha * 0.45);
-    }
-    // Flank +:
-    {
-        let a = in.spec_angle + 0.28;
-        let dot_center = vec2<f32>(cos(a), sin(a)) * spec_rim;
-        let d_dot = length(frag_norm - dot_center);
-        let alpha = 1.0 - smoothstep(0.0, spec_dot_size * 0.8, d_dot);
-        spec_strength = max(spec_strength, alpha * 0.45);
-    }
+    let frag_r = length(frag_norm);
+    let frag_angle = atan2(frag_norm.y, frag_norm.x);
+    let d_radius = abs(frag_r - spec_rim);
+    let radial_falloff = 1.0 - smoothstep(0.0, spec_radial_half, d_radius);
+    // Wrap angular distance to [0, π] so the arc stays coherent
+    // across the atan2 discontinuity at ±π.
+    let d_angle_raw = abs(frag_angle - in.spec_angle);
+    let d_angle = min(d_angle_raw, 6.2831853 - d_angle_raw);
+    let angular_falloff = 1.0 - smoothstep(0.0, spec_angular_span, d_angle);
+    var spec_strength = radial_falloff * angular_falloff;
     spec_strength = spec_strength * in.spec_intensity * in.spec_color.a;
-    out_rgb = mix(out_rgb, in.spec_color.rgb, spec_strength);
+    // White core, sky-tinted corona. At the arc's brightest point the
+    // highlight is pure `(1, 1, 1)` — the hot star itself. Away from
+    // the peak, the colour fades to `spec_color` (the 0.6*white +
+    // 0.4*sky mix), so the tapers of the arc carry the sky's tint.
+    // Matches how a real specular on curved glass looks: a bright
+    // white core with a coloured halo.
+    let core_weight = smoothstep(0.5, 0.95, spec_strength);
+    let highlight_color = mix(in.spec_color.rgb, vec3<f32>(1.0, 1.0, 1.0), core_weight);
+    out_rgb = mix(out_rgb, highlight_color, spec_strength);
 
     // Final alpha: disc AA × (rim transparency OR glint strength) ×
     // plate coverage. `rim_alpha` reaches 0 at the disc boundary so
@@ -537,7 +545,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // colour would be dimmed into the background. Taking the max
     // means bright glint pixels stay opaque enough for their colour
     // to read, while the rest of the rim keeps its soft dissolve.
-    let coverage_alpha = max(rim_alpha, spec_strength * 0.9);
+    let coverage_alpha = max(rim_alpha, spec_strength);
     let final_a = disc_alpha * coverage_alpha * max(plate_a, 0.25);
     return vec4<f32>(out_rgb * final_a, final_a);
 }
