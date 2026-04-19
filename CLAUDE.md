@@ -344,19 +344,7 @@ In **eyes-on mode** (user is watching the app, iterating visually), commit only 
 
 ### Message style
 
-**Subject (required):** a one-line summary that stands on its own. Short enough to fit in a `git log --oneline` terminal; reads as the headline you'd skim before deciding whether to open the diff. Title-case first word, period at the end.
-
-**Body (required for anything not purely mechanical):** explain the **purpose** — why the change matters to its consumer. The consumer is usually the user (visible change) but can also be a future developer (an architectural refactor that unlocks later work). Say what's now true that wasn't before: *"the near-cloud layer now takes the star's color,"* not *"replaced multiplicative tint with mix() at coefficient 0.9."*
-
-**Avoid the HOW.** Implementation details belong in the diff, not the log. Magic numbers, shader-coefficient tuning, which smoothstep range, which branch was taken — all of those read like inventory lists and age badly. They only belong in the body when the decision itself *is* the business — i.e., the choice would have been worth its own commit.
-
-**Trailer:** every commit gets co-authorship attribution to Claude. The model ID follows whichever model actually wrote the code. Historical commits by Opus 4.6 keep that attribution; commits authored by Opus 4.7 use that attribution. Form:
-
-```
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-```
-
-(substitute the running model ID). This produces the "amyodov and Claude committed together" reading in GitHub's UI, which is the honest record — no commit on this project was authored solo.
+Subject is a headline, body explains purpose (why the change matters, not which file changed), every commit gets the Claude co-authorship trailer. Full rules and examples live in the `writing-commit-messages` skill (`.claude/skills/writing-commit-messages/SKILL.md`) — it activates automatically whenever a commit message is being composed.
 
 ## Task tracking
 
