@@ -459,8 +459,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let base_uv = sample_plate / u.plate_size;
 
     // Chromatic aberration: red sample shifts outward, blue inward
-    // (radially). Offsets are in plate-local pixels, converted to UV.
-    let ca_amount_px = in.distort * 3.0 * norm_r;
+    // (radially). Peak is in the mid-zone, not at the rim — the rim
+    // is reserved for light play (darkening + specular), and overlapping
+    // CA there just turns it into color mush. `ca_fade` ramps the
+    // aberration back down in the outer 30% of the disc.
+    let ca_fade = 1.0 - smoothstep(0.70, 1.0, norm_r);
+    let ca_amount_px = in.distort * 4.0 * norm_r * ca_fade;
     let ca_offset_uv = dir * ca_amount_px / u.plate_size;
     let r_uv = base_uv + ca_offset_uv;
     let g_uv = base_uv;
