@@ -57,6 +57,7 @@ use crate::cards::{
     Visibility,
 };
 use crate::composite::CompositeRenderer;
+use crate::lens_pipeline::{LensInstance, LensRenderer};
 use crate::icon_pipeline::{IconInstance, IconRenderer};
 use crate::icons::IconId;
 use crate::plate::Plate;
@@ -154,18 +155,27 @@ const USE_DENT_METAPHOR: bool = false;
 /// Size of the magnified icon inside the lens. ~1.75x the regular handle
 /// size so the lens distinctly stands apart from the small slot icons
 /// and extends a pixel or two above the widget's pillow-peak silhouette.
+///
+/// With the pixel-space lens pipeline (post-composite sampling), this
+/// constant is unused — the lens pass samples the plate RT and magnifies
+/// its pixels directly. Kept for the dormant `USE_DENT_METAPHOR` path
+/// and for reference.
+#[allow(dead_code)]
 const FOLD_LENS_ICON_SIZE_PT: f32 = 28.0;
+
+/// Lens magnification factor. 1.75 reads as "clearly bigger but still
+/// recognizable"; pushed higher (>2.5) tends toward funhouse-mirror.
+const FOLD_LENS_MAGNIFICATION: f32 = 1.75;
 
 /// Lens disc — the visible glass circle the magnified icon sits inside.
 /// Slightly larger than the magnified icon so its rim sits clear of the
 /// icon strokes. Corner radius is set to half the side at render time,
 /// which yields a perfect circle.
 const FOLD_LENS_DISC_SIZE_PT: f32 = 30.0;
-/// Glass tint — slightly lighter than the widget body so the disc reads
-/// as "collected light through glass" rather than as the same flat fill.
-/// Kept dark (like the widget body) so the specular highlight on top
-/// reads as HDR-bright. Fully opaque so it covers the small icon in
-/// the slot it overlays.
+/// Glass tint — unused with the pixel-space lens (the lens pass samples
+/// the plate RT directly, no flat disc fill). Kept for the dormant
+/// `USE_DENT_METAPHOR` path and for tuning reference.
+#[allow(dead_code)]
 const FOLD_LENS_DISC_COLOR: [f32; 4] = [0.20, 0.24, 0.32, 1.0];
 
 /// Lens drop shadow — dark-gray glow (not pure black), slightly offset,
@@ -181,18 +191,19 @@ const FOLD_LENS_SHADOW_GLOW_PT: f32 = 4.0;
 /// screen" spot. Tinted slightly by `SkyLight.color` so it still warms
 /// with the sky.
 const FOLD_LENS_SPECULAR_BASE: [f32; 4] = [1.00, 1.00, 1.00, 0.98];
-/// Three-dot tangent arc approximates a crescent-moon specular on the
-/// lens rim: one main bright dot at the reflection angle, two dimmer
-/// flanks at ±`FOLD_LENS_SPECULAR_ARC_SPREAD` radians tangentially
-/// along the rim. Together they form a thin highlight instead of a
-/// single "fat point." Flank alpha drops so the arc fades out smoothly
-/// away from its peak.
+// Three-dot tangent arc constants — now baked into the lens shader
+// (see `lens_pipeline.rs`). Kept for reference tuning; the shader's
+// own constants `0.82` (rim radius) and `0.28` (arc spread) mirror
+// these so tweaks here don't actually apply without a shader edit.
+#[allow(dead_code)]
 const FOLD_LENS_SPECULAR_CENTER_SIZE_PT: f32 = 2.5;
+#[allow(dead_code)]
 const FOLD_LENS_SPECULAR_FLANK_SIZE_PT: f32 = 2.0;
+#[allow(dead_code)]
 const FOLD_LENS_SPECULAR_ARC_SPREAD: f32 = 0.28; // radians
+#[allow(dead_code)]
 const FOLD_LENS_SPECULAR_FLANK_ALPHA: f32 = 0.45;
-/// Radius at which the specular arc sits on the disc, as a fraction of
-/// the disc radius. 0.82 puts it right on the visible rim.
+#[allow(dead_code)]
 const FOLD_LENS_SPECULAR_RIM_RADIUS: f32 = 0.82;
 /// Blend weight of SkyLight.color into the specular highlight color.
 /// 0.22 keeps the core bright-white while letting dawns warm it and
@@ -315,6 +326,7 @@ pub struct Renderer {
     shape_renderer: ShapeRenderer,
     background_renderer: BackgroundRenderer,
     icon_renderer: IconRenderer,
+    lens_renderer: LensRenderer,
     /// Reference instant used to compute the time uniform fed into the
     /// background shader for the breathing animation.
     start_time: Instant,
@@ -421,11 +433,12 @@ impl Renderer {
             card_buffers.insert(card.id, buf);
         }
 
-        // Shape + background + composite pipelines.
+        // Shape + background + composite + icon pipelines.
         let shape_renderer = ShapeRenderer::new(&device, format);
         let background_renderer = BackgroundRenderer::new(&device, format);
         let composite = CompositeRenderer::new(&device, format);
         let icon_renderer = IconRenderer::new(&device, &queue, format);
+        let mut lens_renderer = LensRenderer::new(&device, format);
 
         // Code pane plate — sized from the initial window + scale factor. The
         // Renderer is built before AppState knows about the current scale, so
@@ -451,6 +464,9 @@ impl Renderer {
             &composite.sampler,
             &composite.uniform_buffer,
         );
+        // Lens pass reads from the plate RT, so bind it now and rebind
+        // any time the RT is reallocated (on window resize).
+        lens_renderer.bind_plate(&device, &code_plate.rt_view);
 
         // egui
         let egui_ctx = egui::Context::default();
@@ -473,6 +489,7 @@ impl Renderer {
             shape_renderer,
             background_renderer,
             icon_renderer,
+            lens_renderer,
             start_time: Instant::now(),
             composite,
             code_plate,
@@ -544,7 +561,7 @@ impl Renderer {
         // Reconfigure the plate if the window size or scale factor changed the
         // plate's target dimensions.
         let (plate_pos, plate_size) = plate_rect(state);
-        self.code_plate.reconfigure(
+        let rt_reallocated = self.code_plate.reconfigure(
             &self.device,
             plate_size,
             plate_pos,
@@ -553,6 +570,12 @@ impl Renderer {
             &self.composite.sampler,
             &self.composite.uniform_buffer,
         );
+        if rt_reallocated {
+            // Lens pass samples the plate RT — its bind group must
+            // point at the freshly-allocated texture view.
+            self.lens_renderer
+                .bind_plate(&self.device, &self.code_plate.rt_view);
+        }
 
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
@@ -572,6 +595,7 @@ impl Renderer {
         // transparent and we only draw cards into it.
         let mut instances: Vec<RectInstance> = Vec::with_capacity(state.cards.len() * 5);
         let mut icon_instances: Vec<IconInstance> = Vec::with_capacity(state.cards.len());
+        let mut lens_instances: Vec<LensInstance> = Vec::with_capacity(state.cards.len());
         let plate_h = plate_size[1] as f32;
         for card in &state.cards {
             let Some(rect) = layout.rects.get(&card.id) else { continue };
@@ -582,7 +606,16 @@ impl Renderer {
             if local_bottom < -32.0 || local_y > plate_h + 32.0 {
                 continue;
             }
-            push_card_shapes(&mut instances, &mut icon_instances, card, rect, local_y, state);
+            push_card_shapes(
+                &mut instances,
+                &mut icon_instances,
+                &mut lens_instances,
+                card,
+                rect,
+                local_y,
+                state,
+                plate_pos,
+            );
         }
 
         // Shapes' uniform viewport = plate size (we're rendering into the plate RT).
@@ -595,6 +628,19 @@ impl Renderer {
             &self.device,
             &self.queue,
             &icon_instances,
+            (plate_size[0], plate_size[1]),
+        );
+
+        // Lens pass renders on the swap chain (post-composite), sampling
+        // the plate RT. Uniforms carry viewport size (swap chain) and
+        // the plate origin / size so the shader can convert lens
+        // positions (swap-chain pixels) back into plate-local UVs.
+        self.lens_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &lens_instances,
+            (self.surface_config.width, self.surface_config.height),
+            (plate_pos[0], plate_pos[1]),
             (plate_size[0], plate_size[1]),
         );
 
@@ -768,6 +814,28 @@ impl Renderer {
             self.composite.render(&mut pass, &self.code_plate.composite_bg);
         }
 
+        // Pass 4b: lens → swap chain. Samples the plate RT at magnified
+        // coordinates inside each lens disc and writes the result on
+        // top of the composited plate. The plate RT itself is unmodified,
+        // so small slot icons stay where they are and the lens naturally
+        // reveals whichever icon (or widget body, or empty area) is
+        // underneath its current position — no icon swap, no discrete
+        // transitions.
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-lens-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.lens_renderer.render(&mut pass);
+        }
+
         // Pass 5: egui HUD → swap chain.
         {
             let mut pass = encoder
@@ -906,13 +974,16 @@ impl<'a> AreaSpec<'a> {
 /// 6. **Rolling edge** (during fold animation) — thin luminous hairline.
 ///
 /// All output coordinates are **plate-local**.
+#[allow(clippy::too_many_arguments)]
 fn push_card_shapes(
     out: &mut Vec<RectInstance>,
     icons_out: &mut Vec<IconInstance>,
+    lenses_out: &mut Vec<LensInstance>,
     card: &Card,
     rect: &CardRect,
     local_y: f32,
     state: &AppState,
+    plate_pos: [f32; 2],
 ) {
     // If this card has been almost-fully collapsed by a parent's nested-fold
     // cascade, skip drawing it. Saves instance buffer space and avoids the
@@ -1252,27 +1323,23 @@ fn push_card_shapes(
         let lens_slot_pos = card_well_position(card, fold_progress);
         let lens_x = widget_x + slot_stride * (lens_slot_pos + 0.5);
 
-        // ---- Lens glass: drop shadow + disc + sky-driven specular.
-        //      Drawn in the shape pass, before icons. The disc's fill is
-        //      opaque so anything rendered in the shape pass underneath
-        //      it is hidden; the magnified icon sits on top in the icon
-        //      pass and reads as "seen through glass."
-        //
-        //      The specular highlight's position follows SkyLight.direction
-        //      (unseen star → reflection point on lens surface), its color
-        //      borrows SkyLight.color, and its brightness scales with
-        //      SkyLight.intensity — so over the ~9-min sky cycle the
-        //      glint drifts around the lens and warms/cools in lockstep
-        //      with the rest of the environment. ----
+        // ---- Lens: drop shadow into the plate RT, plus a LensInstance
+        //      emitted for the pixel-space lens pass. The disc body, rim
+        //      darkening, and specular arc are all drawn by that later
+        //      pass — it samples the plate RT at magnified coordinates
+        //      so the icons underneath are literally magnified through
+        //      the glass, with barrel + chromatic aberration applied. ----
         if !USE_DENT_METAPHOR {
             let sky = state.sky_light();
 
             let lens_disc_size = FOLD_LENS_DISC_SIZE_PT * sf;
             let lens_disc_x = lens_x - lens_disc_size * 0.5;
             let lens_disc_y = widget_y + (widget_height - lens_disc_size) * 0.5;
-            let lens_corner = lens_disc_size * 0.5; // perfect circle
+            let lens_radius = lens_disc_size * 0.5;
 
-            // Drop shadow: transparent fill with a dark glow halo.
+            // Drop shadow: drawn in the plate RT so the shadow sits on
+            // the widget surface, outside the lens disc. Inside the
+            // disc it'll be painted over by the lens pass anyway.
             let mut lens_shadow_color = FOLD_LENS_SHADOW_COLOR;
             lens_shadow_color[3] *= alpha;
             out.push(RectInstance::glowing(
@@ -1281,182 +1348,74 @@ fn push_card_shapes(
                 lens_disc_size,
                 lens_disc_size,
                 [0.0, 0.0, 0.0, 0.0],
-                lens_corner,
+                lens_radius,
                 lens_shadow_color,
                 FOLD_LENS_SHADOW_GLOW_PT * sf,
             ));
 
-            // Disc body: glass-tint fill + positive dome shading
-            // (convex-lens lighting — light gathers toward the center).
-            // Gentle intensity modulation so the glass brightens/dims
-            // with the sky without losing legibility at low intensity.
-            let disc_intensity_mod = 0.85 + 0.15 * sky.intensity;
-            let mut lens_disc_color = FOLD_LENS_DISC_COLOR;
-            lens_disc_color[0] *= disc_intensity_mod;
-            lens_disc_color[1] *= disc_intensity_mod;
-            lens_disc_color[2] *= disc_intensity_mod;
-            lens_disc_color[3] *= alpha;
-            out.push(
-                RectInstance::solid(
-                    lens_disc_x,
-                    lens_disc_y,
-                    lens_disc_size,
-                    lens_disc_size,
-                    lens_disc_color,
-                    lens_corner,
-                )
-                .with_dome(FOLD_CHIP_DOME)
-                .with_pillow_mask([0.0, 0.0]),
-            );
-
-            // Specular: a three-dot tangent arc along the disc rim.
-            // One bright center dot at the sky-driven reflection angle
-            // plus two dimmer flanks at ±ARC_SPREAD tangentially around
-            // the rim — together they read as a thin crescent of light,
-            // not a fat point. Hidden at night (sun below horizon).
-            //
-            // Per-card jitter: each card's id contributes a small
-            // angular offset so a stack of class cards doesn't glint in
-            // lockstep — the plate reads as "many real glass lenses"
-            // rather than "N identical clones rendered N times."
-            let spec_intensity = ((sky.intensity - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
+            // Specular angle: position-dependent, per-card jittered.
+            // Hidden at night via spec_intensity = 0.
+            let spec_intensity = ((sky.intensity
+                - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD)
                 / (1.0 - FOLD_LENS_SPECULAR_NIGHT_THRESHOLD))
                 .clamp(0.0, 1.0);
-            if spec_intensity > 0.001 {
-                // Position-dependent sun angle: anchor the sun at a fixed
-                // point in plate-local coords, push it out along the sky
-                // direction, then compute the angle from THIS lens to the
-                // sun. Different lenses at different positions see the
-                // sun from different angles, so their glints disagree
-                // slightly — exactly what real lenses scattered on a
-                // plate would do.  Scrolling shifts every lens's y →
-                // every lens's glint angle migrates too.
-                let sun_x = (SUN_ANCHOR_X_PT + SUN_VIRTUAL_DISTANCE_PT * sky.direction.x) * sf;
-                let sun_y = (SUN_ANCHOR_Y_PT + SUN_VIRTUAL_DISTANCE_PT * sky.direction.y) * sf;
-                let lens_center_y_abs = lens_disc_y + lens_disc_size * 0.5;
-                let to_sun_dx = sun_x - lens_x;
-                let to_sun_dy = sun_y - lens_center_y_abs;
-                let base_angle = to_sun_dy.atan2(to_sun_dx);
-                // Tiny per-card jitter on top, breaking any residual
-                // "same exact position" coincidence for lenses that
-                // happen to overlap.
-                let card_seed = card.id.0 as f32 * 2.3998;
-                let jitter = card_seed.sin() * FOLD_LENS_PER_CARD_JITTER;
-                let angle = base_angle + jitter;
+            let sun_x = (SUN_ANCHOR_X_PT
+                + SUN_VIRTUAL_DISTANCE_PT * sky.direction.x)
+                * sf;
+            let sun_y = (SUN_ANCHOR_Y_PT
+                + SUN_VIRTUAL_DISTANCE_PT * sky.direction.y)
+                * sf;
+            let lens_center_y_abs = lens_disc_y + lens_disc_size * 0.5;
+            let to_sun_dx = sun_x - lens_x;
+            let to_sun_dy = sun_y - lens_center_y_abs;
+            let base_angle = to_sun_dy.atan2(to_sun_dx);
+            let card_seed = card.id.0 as f32 * 2.3998;
+            let jitter = card_seed.sin() * FOLD_LENS_PER_CARD_JITTER;
+            let spec_angle = base_angle + jitter;
 
-                let spec_rim = lens_disc_size * 0.5 * FOLD_LENS_SPECULAR_RIM_RADIUS;
-                let mix = FOLD_LENS_SPECULAR_SKY_MIX;
-                let spec_base = [
-                    FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
-                    FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
-                    FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
-                ];
-                let alpha_full =
-                    FOLD_LENS_SPECULAR_BASE[3] * alpha * spec_intensity;
+            let mix = FOLD_LENS_SPECULAR_SKY_MIX;
+            let spec_color = [
+                FOLD_LENS_SPECULAR_BASE[0] * (1.0 - mix) + sky.color.x * mix,
+                FOLD_LENS_SPECULAR_BASE[1] * (1.0 - mix) + sky.color.y * mix,
+                FOLD_LENS_SPECULAR_BASE[2] * (1.0 - mix) + sky.color.z * mix,
+                FOLD_LENS_SPECULAR_BASE[3],
+            ];
 
-                // One emit per dot: (angular offset, size, alpha scale).
-                let dots: [(f32, f32, f32); 3] = [
-                    (-FOLD_LENS_SPECULAR_ARC_SPREAD,
-                     FOLD_LENS_SPECULAR_FLANK_SIZE_PT,
-                     FOLD_LENS_SPECULAR_FLANK_ALPHA),
-                    (0.0,
-                     FOLD_LENS_SPECULAR_CENTER_SIZE_PT,
-                     1.0),
-                    (FOLD_LENS_SPECULAR_ARC_SPREAD,
-                     FOLD_LENS_SPECULAR_FLANK_SIZE_PT,
-                     FOLD_LENS_SPECULAR_FLANK_ALPHA),
-                ];
-                for (ang_off, size_pt, a_scale) in dots {
-                    let a = angle + ang_off;
-                    let dot_size = size_pt * sf;
-                    let dot_cx = lens_x + a.cos() * spec_rim;
-                    let dot_cy = lens_disc_y
-                        + lens_disc_size * 0.5
-                        + a.sin() * spec_rim;
-                    let dot_color = [
-                        spec_base[0],
-                        spec_base[1],
-                        spec_base[2],
-                        alpha_full * a_scale,
-                    ];
-                    out.push(RectInstance::solid(
-                        dot_cx - dot_size * 0.5,
-                        dot_cy - dot_size * 0.5,
-                        dot_size,
-                        dot_size,
-                        dot_color,
-                        dot_size * 0.5,
-                    ));
-                }
-            }
+            // Lens center in SWAP-CHAIN pixels = plate origin + the
+            // lens's plate-local position.
+            let lens_screen_x = plate_pos[0] + lens_x;
+            let lens_screen_y = plate_pos[1] + lens_center_y_abs;
+
+            lenses_out.push(LensInstance::new(
+                [lens_screen_x, lens_screen_y],
+                lens_radius,
+                FOLD_LENS_MAGNIFICATION,
+                alpha, // distort scaled by card alpha so fold-out lenses fade
+                spec_angle,
+                spec_intensity * alpha,
+                spec_color,
+            ));
         }
 
-        // ---- Small icons at every slot except the one the lens is
-        //      currently covering. Skipped slots reappear as the lens
-        //      slides away (distance > threshold). Without this skip,
-        //      the small icon renders above the lens disc in the icon
-        //      pass and peeks through the magnified icon's transparent
-        //      stroke gaps. ----
+        // ---- Small icons at every slot, always full alpha.
+        //      The lens pass samples the plate RT (which contains these
+        //      icons at their slot positions) and magnifies whatever
+        //      pixels are underneath, so wherever the lens slides, the
+        //      corresponding icon is naturally revealed magnified. No
+        //      special handling needed — no "hide the selected slot,"
+        //      no "fade at midpoint," no magnified-icon-on-top hack. ----
         let icon_y = widget_y + (widget_height - handle_size) * 0.5;
         let mut icon_tint = FOLD_HANDLE_ICON;
         icon_tint[3] *= alpha;
         for (slot, &target) in fold_states.iter().enumerate() {
-            let distance = (lens_slot_pos - slot as f32).abs();
-            // Fade-out band: fully hidden within 0.45 slot-units of the
-            // lens, fully visible past 0.55. Narrow transition avoids a
-            // pop when the lens crosses a slot boundary.
-            let small_alpha = ((distance - 0.45) / 0.1).clamp(0.0, 1.0);
-            if small_alpha < 0.001 {
-                continue;
-            }
             let cx = slot_center_x(slot);
-            let mut small_tint = icon_tint;
-            small_tint[3] *= small_alpha;
             icons_out.push(IconInstance::new(
                 cx - handle_size * 0.5,
                 icon_y,
                 handle_size,
-                small_tint,
+                icon_tint,
                 icon_for_fold_state(target).atlas_index(),
             ));
-        }
-
-        // ---- Magnified icon inside the lens.  `with_distort(1.0)`
-        //      switches this onto the aberration shader path (barrel
-        //      + chromatic fringing). The icon's *alpha* fades to 0 at
-        //      slide midpoints so the icon_id swap happens while the
-        //      glyph is invisible — the lens becomes a pure piece of
-        //      empty glass for the fraction of a second that its
-        //      identity is in transit, then fades back in carrying the
-        //      new state's icon. Matches how a real magnifier reads
-        //      when it passes between two distinct objects on a desk. ----
-        if !USE_DENT_METAPHOR {
-            let nearest_slot_idx = lens_slot_pos
-                .round()
-                .clamp(0.0, (slot_count - 1) as f32)
-                as usize;
-            let lens_state = fold_states[nearest_slot_idx];
-            // Distance-to-nearest-slot in slot units (0 at slot, 0.5 at
-            // midpoint). Alpha = 1 at slot, 0 at midpoint.
-            let dist_to_nearest = (lens_slot_pos - nearest_slot_idx as f32).abs();
-            let lens_icon_alpha = (1.0 - 2.0 * dist_to_nearest).clamp(0.0, 1.0);
-            if lens_icon_alpha > 0.001 {
-                let lens_icon_size = FOLD_LENS_ICON_SIZE_PT * sf;
-                let lens_icon_y =
-                    widget_y + (widget_height - lens_icon_size) * 0.5;
-                let mut lens_tint = icon_tint;
-                lens_tint[3] *= lens_icon_alpha;
-                icons_out.push(
-                    IconInstance::new(
-                        lens_x - lens_icon_size * 0.5,
-                        lens_icon_y,
-                        lens_icon_size,
-                        lens_tint,
-                        icon_for_fold_state(lens_state).atlas_index(),
-                    )
-                    .with_distort(1.0),
-                );
-            }
         }
     }
 
@@ -1772,7 +1731,17 @@ mod tests {
         let class_rect = layout.rects[&cards[0].id];
         let mut out = vec![];
         let mut icons = vec![];
-        push_card_shapes(&mut out, &mut icons, &cards[0], &class_rect, 0.0, &state);
+        let mut lenses = vec![];
+        push_card_shapes(
+            &mut out,
+            &mut icons,
+            &mut lenses,
+            &cards[0],
+            &class_rect,
+            0.0,
+            &state,
+            [0.0, 0.0],
+        );
 
         // Class card emits at least: bg, accent strip, spine, fold handle → 4 rects.
         assert!(out.len() >= 4, "class emits ≥4 shapes, got {}", out.len());

@@ -8,6 +8,7 @@ mod cli;
 mod composite;
 mod icon_pipeline;
 mod icons;
+mod lens_pipeline;
 mod plate;
 mod renderer;
 mod shapes;
