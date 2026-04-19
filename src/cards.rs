@@ -356,38 +356,49 @@ fn process_statement(
     // Nested functions inside functions are out of scope for M3.
 }
 
-/// Emit a single Snippet card covering the entire file. Used by
-/// language modules whose real `extract_cards` isn't written yet, so
-/// opening e.g. a `.rs` or `.md` still shows the source on the plate
-/// as one long read-only card instead of a blank plate. Replace with
-/// a language-specific extraction once the tagged-CardKind rework
-/// (YGG-27 Part 2) lands.
-pub fn whole_file_snippet(source: &str, line_offsets: &[usize]) -> Vec<Card> {
-    if source.is_empty() {
-        return Vec::new();
-    }
-    let full_range = 0..source.len();
+/// Shared Card constructor used by every non-Python language module.
+/// Fills in the boilerplate (line ranges, logical-line list, empty
+/// docstring/decorator slots) so each language's `extract_cards` only
+/// concerns itself with the AST walk and the kind/name/visibility
+/// decisions. Returns the Card by value; the caller owns ID assignment.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_card(
+    id: CardId,
+    kind: CardKind,
+    parent: Option<CardId>,
+    depth: usize,
+    name: String,
+    visibility: Visibility,
+    header_range: Range<usize>,
+    body_range: Option<Range<usize>>,
+    full_range: Range<usize>,
+    line_offsets: &[usize],
+) -> Card {
+    let header_lines = byte_range_to_line_range(&header_range, line_offsets);
+    let body_lines = body_range
+        .as_ref()
+        .map(|r| byte_range_to_line_range(r, line_offsets));
     let full_lines = byte_range_to_line_range(&full_range, line_offsets);
     let lines = build_logical_lines(&full_range, &full_lines, line_offsets);
-    vec![Card {
-        id: CardId(0),
-        kind: CardKind::Snippet,
-        parent: None,
-        depth: 0,
-        name: String::new(),
-        visibility: Visibility::Public,
+    Card {
+        id,
+        kind,
+        parent,
+        depth,
+        name,
+        visibility,
         modifier: MethodModifier::None,
         decorators: Vec::new(),
-        header_range: full_range.clone(),
-        body_range: None,
-        full_range: full_range.clone(),
-        header_lines: full_lines.clone(),
-        body_lines: None,
+        header_range,
+        body_range: body_range.clone(),
+        full_range,
+        header_lines,
+        body_lines,
         full_lines,
         docstring_range: None,
         docstring_lines: None,
         lines,
-    }]
+    }
 }
 
 /// Emit a `Snippet` card for a top-level orphan statement. No body / no
@@ -430,7 +441,7 @@ fn emit_snippet(node: Node, line_offsets: &[usize], out: &mut Vec<Card>, next_id
 /// byte range clipped to `full_range` so partial-line edges stay sane.
 /// LineId seeds from the 0-based line-in-source — stable within a
 /// version and trivially derivable.
-fn build_logical_lines(
+pub(crate) fn build_logical_lines(
     full_range: &Range<usize>,
     full_lines: &Range<usize>,
     line_offsets: &[usize],
@@ -813,7 +824,7 @@ fn leaf_body_height(card: &Card, m: &LayoutMetrics) -> f32 {
 /// Given a byte range and the `line_offsets` vector (which has a sentinel at
 /// `contents.len()`), compute the half-open line range this byte range
 /// touches. Line indices are 0-based.
-fn byte_range_to_line_range(br: &Range<usize>, line_offsets: &[usize]) -> Range<usize> {
+pub(crate) fn byte_range_to_line_range(br: &Range<usize>, line_offsets: &[usize]) -> Range<usize> {
     // `partition_point` is stable and returns the first index `i` where
     // `line_offsets[i] > br.start` → the line `i-1` contains `br.start`.
     let start_line = line_offsets
