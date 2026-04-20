@@ -35,6 +35,7 @@
 //! comparing against `fold_buttons_scene` output.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,6 +53,7 @@ use wgpu::{
 use winit::window::Window;
 
 use crate::background::BackgroundRenderer;
+use crate::blind;
 use crate::cards::{
     layout_cards, Card, CardId, CardKind, CardRect, Layout, LayoutMetrics, MethodModifier,
     Visibility,
@@ -335,6 +337,19 @@ pub struct Renderer {
     composite: CompositeRenderer,
     code_scroll: Substrate,
 
+    // Blind (file-tree, Phase B). Drawn directly into the swap chain in
+    // Zone 1 (the void). Separate ShapeRenderer + TextRenderer + Viewport
+    // because the existing ones are configured frame-by-frame for the
+    // plate-RT viewport and renders into the plate RT — the blind's
+    // viewport is the full window and its render attachment is the swap
+    // chain. Container-tree formalization (YGG-51) will let one renderer
+    // serve both with per-caller buffers; for Phase B duplicate is the
+    // smaller commit.
+    blind_shapes: ShapeRenderer,
+    blind_text_renderer: TextRenderer,
+    blind_viewport: Viewport,
+    blind_buffers: HashMap<PathBuf, Buffer>,
+
     // glyphon
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -422,8 +437,11 @@ impl Renderer {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
+        let blind_viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let blind_text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         // One buffer per card, built eagerly at load.
@@ -435,6 +453,7 @@ impl Renderer {
 
         // Shape + background + composite + icon pipelines.
         let shape_renderer = ShapeRenderer::new(&device, format);
+        let blind_shapes = ShapeRenderer::new(&device, format);
         let background_renderer = BackgroundRenderer::new(&device, format);
         let composite = CompositeRenderer::new(&device, format);
         let icon_renderer = IconRenderer::new(&device, &queue, format);
@@ -492,6 +511,10 @@ impl Renderer {
             start_time: Instant::now(),
             composite,
             code_scroll,
+            blind_shapes,
+            blind_text_renderer,
+            blind_viewport,
+            blind_buffers: HashMap::new(),
             font_system,
             swash_cache,
             viewport,
@@ -551,6 +574,9 @@ impl Renderer {
         if font_size != self.applied_font_size || line_height != self.applied_line_height {
             let metrics = Metrics::new(font_size, line_height);
             for buf in self.card_buffers.values_mut() {
+                buf.set_metrics(&mut self.font_system, metrics);
+            }
+            for buf in self.blind_buffers.values_mut() {
                 buf.set_metrics(&mut self.font_system, metrics);
             }
             self.applied_font_size = font_size;
@@ -684,6 +710,97 @@ impl Renderer {
         ) {
             log::warn!("glyphon prepare failed: {e:?}");
         }
+
+        // ---- Blind (file-tree) layout, shapes, and text. Drawn into the
+        // swap chain after composite + lens so the blind sits on top of the
+        // void with no occlusion concerns. Skipped entirely when no tree
+        // is present (single-file launch).
+        let blind_layout = state.tree.as_ref().map(|tree| {
+            let pane_left = 0.0;
+            let pane_width = state.code_pane_left() as f32;
+            let pane_height = state.window_size.height as f32;
+            blind::layout(tree, pane_left, pane_width, pane_height, state.scale_factor)
+        });
+        let blind_text_areas = if let Some(layout) = blind_layout.as_ref() {
+            let mut blind_instances: Vec<RectInstance> =
+                Vec::with_capacity(layout.slats.len() + 1);
+            // Wire goes first so slats render on top of it where they overlap.
+            blind_instances.push(RectInstance::glowing(
+                layout.wire.x,
+                layout.wire.y,
+                layout.wire.width,
+                layout.wire.height,
+                layout.wire.color,
+                layout.wire.width * 0.5,
+                layout.wire.glow_color,
+                layout.wire.glow_radius,
+            ));
+            let win_h = state.window_size.height as f32;
+            for slat in &layout.slats {
+                if slat.y + slat.height < -32.0 || slat.y > win_h + 32.0 {
+                    continue;
+                }
+                blind_instances.push(RectInstance::glowing(
+                    slat.x,
+                    slat.y,
+                    slat.width,
+                    slat.height,
+                    slat.bg,
+                    slat.corner,
+                    slat.glow_color,
+                    slat.glow_radius,
+                ));
+                if !self.blind_buffers.contains_key(&slat.entry.path) {
+                    let buf = blind::build_filename_buffer(
+                        &mut self.font_system,
+                        &slat.entry.name,
+                        slat.entry.kind,
+                        font_size,
+                        line_height,
+                    );
+                    self.blind_buffers.insert(slat.entry.path.clone(), buf);
+                }
+            }
+            self.blind_shapes.prepare(
+                &self.device,
+                &self.queue,
+                &blind_instances,
+                (self.surface_config.width, self.surface_config.height),
+            );
+
+            self.blind_viewport.update(
+                &self.queue,
+                Resolution {
+                    width: self.surface_config.width,
+                    height: self.surface_config.height,
+                },
+            );
+            let areas = collect_blind_text_areas(
+                &self.blind_buffers,
+                layout,
+                state.scale_factor,
+                line_height,
+                self.surface_config.height as f32,
+            );
+            if let Err(e) = self.blind_text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.blind_viewport,
+                areas.iter().map(|a| a.to_text_area()),
+                &mut self.swash_cache,
+            ) {
+                log::warn!("blind text prepare failed: {e:?}");
+            }
+            areas
+        } else {
+            Vec::new()
+        };
+        // `blind_text_areas` is owned for the rest of the frame so the
+        // text-area buffer references in the prepared draw stay valid until
+        // the blind text pass runs.
+        let _ = &blind_text_areas;
 
         // ---- Composite uniforms (plate → swap chain) ----
         // SkyLight drives the plate's edge treatment — asymmetric bloom,
@@ -850,6 +967,44 @@ impl Renderer {
             self.lens_renderer.render(&mut pass);
         }
 
+        // Pass 4c: blind shapes (slats + brass wire) → swap chain. Drawn
+        // after composite + lens so the blind sits on top of the void.
+        if blind_layout.is_some() {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-blind-shapes-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.blind_shapes.render(&mut pass);
+        }
+
+        // Pass 4d: blind filenames → swap chain.
+        if blind_layout.is_some() {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-blind-text-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if let Err(e) =
+                self.blind_text_renderer
+                    .render(&self.atlas, &self.blind_viewport, &mut pass)
+            {
+                log::warn!("blind text render failed: {e:?}");
+            }
+        }
+
         // Pass 5: egui HUD → swap chain.
         {
             let mut pass = encoder
@@ -973,6 +1128,52 @@ impl<'a> AreaSpec<'a> {
             custom_glyphs: &[],
         }
     }
+}
+
+/// Collect text areas for the blind's slat filenames. Coordinates are
+/// **window-space** (the blind text pass renders directly to the swap
+/// chain). Bounds clip each filename to its slat so long names don't
+/// bleed into adjacent slats or off the blind's right edge.
+fn collect_blind_text_areas<'a>(
+    blind_buffers: &'a HashMap<PathBuf, Buffer>,
+    layout: &blind::BlindLayout,
+    scale_factor: f32,
+    line_height: f32,
+    window_h: f32,
+) -> Vec<AreaSpec<'a>> {
+    let mut out = Vec::with_capacity(layout.slats.len());
+    let inset_x = blind::text_inset_x(scale_factor);
+    let (r, g, b) = blind::FILENAME_RGB;
+    let color = GlyphonColor::rgb(r, g, b);
+    for slat in &layout.slats {
+        if slat.y + slat.height < 0.0 || slat.y > window_h {
+            continue;
+        }
+        let Some(buffer) = blind_buffers.get(&slat.entry.path) else {
+            continue;
+        };
+        let left = slat.x + inset_x;
+        let right = slat.x + slat.width - inset_x * 0.5;
+        if right <= left {
+            continue;
+        }
+        // Vertically center the line in the slat.
+        let top = slat.y + (slat.height - line_height) * 0.5;
+        let bounds = TextBounds {
+            left: left as i32,
+            top: slat.y.max(0.0) as i32,
+            right: right as i32,
+            bottom: (slat.y + slat.height).min(window_h) as i32,
+        };
+        out.push(AreaSpec {
+            buffer,
+            left,
+            top,
+            bounds,
+            default_color: color,
+        });
+    }
+    out
 }
 
 /// Append the shape instances for one card. Order matters — each instance

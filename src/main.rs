@@ -3,6 +3,7 @@
 mod analyzer;
 mod app;
 mod background;
+mod blind;
 mod cards;
 mod cli;
 mod composite;
