@@ -25,7 +25,6 @@
 //! swap chain (which already has the sky from the background pass) produces
 //! the correct composite.
 
-use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -89,7 +88,6 @@ pub struct CompositeRenderer {
     pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
-    pub uniform_buffer: wgpu::Buffer,
 }
 
 impl CompositeRenderer {
@@ -146,13 +144,6 @@ impl CompositeRenderer {
             ..Default::default()
         });
 
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ygg-composite-uniforms"),
-            size: size_of::<CompositeUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ygg-composite-pl"),
             bind_group_layouts: &[&bind_group_layout],
@@ -200,16 +191,18 @@ impl CompositeRenderer {
             cache: None,
         });
 
-        Self { pipeline, bind_group_layout, sampler, uniform_buffer }
+        Self { pipeline, bind_group_layout, sampler }
     }
 
-    /// Write the uniforms for the single plate we're about to composite.
-    /// For multi-plate rendering in future milestones, call once per plate
-    /// (with dynamic offsets) or switch to per-plate uniform buffers.
+    /// Write the uniforms for one substrate. Each `Substrate` owns its
+    /// own uniform buffer (and composite bind group), so multiple
+    /// substrates can composite in the same frame without uniform
+    /// collision. Caller passes the target buffer.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         queue: &wgpu::Queue,
+        target: &wgpu::Buffer,
         viewport_size: (u32, u32),
         plate_pos: [f32; 2],
         plate_size: [u32; 2],
@@ -238,7 +231,7 @@ impl CompositeRenderer {
             _pad1: [0.0; 2],
             sky_color_intensity: [sky_color[0], sky_color[1], sky_color[2], sky_intensity],
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(target, 0, bytemuck::bytes_of(&u));
     }
 
     pub fn render<'a>(

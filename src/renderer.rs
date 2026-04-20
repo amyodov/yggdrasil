@@ -462,7 +462,6 @@ impl Renderer {
             format,
             &composite.bind_group_layout,
             &composite.sampler,
-            &composite.uniform_buffer,
         );
         // Lens pass reads from the plate RT, so bind it now and rebind
         // any time the RT is reallocated (on window resize).
@@ -568,7 +567,6 @@ impl Renderer {
             self.surface_config.format,
             &self.composite.bind_group_layout,
             &self.composite.sampler,
-            &self.composite.uniform_buffer,
         );
         if rt_reallocated {
             // Lens pass samples the plate RT — its bind group must
@@ -697,6 +695,7 @@ impl Renderer {
         let sky_color = [sky.color.x, sky.color.y, sky.color.z];
         self.composite.prepare(
             &self.queue,
+            &self.code_scroll.uniform_buffer,
             (self.surface_config.width, self.surface_config.height),
             self.code_scroll.pos_px,
             self.code_scroll.size_px,
@@ -710,6 +709,7 @@ impl Renderer {
             sky_color,
             sky.intensity,
         );
+
 
         // ---- Egui ----
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -826,6 +826,7 @@ impl Renderer {
             });
             self.composite.render(&mut pass, &self.code_scroll.composite_bg);
         }
+
 
         // Pass 4b: lens → swap chain. Samples the plate RT at magnified
         // coordinates inside each lens disc and writes the result on

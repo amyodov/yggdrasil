@@ -43,9 +43,11 @@
 
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindingResource, Buffer,
-    Device, Extent3d, Sampler, Texture, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureView, TextureViewDescriptor,
+    BufferDescriptor, BufferUsages, Device, Extent3d, Sampler, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
 };
+
+use crate::composite::CompositeUniforms;
 
 /// A 4x4 column-major identity matrix. The substrate's default orientation —
 /// frontal, no rotation. Rotations swap this for a real matrix later.
@@ -71,8 +73,12 @@ pub struct Substrate {
     /// View of the RT — used both as a render attachment (when drawing into
     /// the substrate) and as a shader resource (during composite).
     pub rt_view: TextureView,
-    /// Bind group for the composite pipeline: shared uniforms + this
-    /// substrate's texture + sampler. Rebuilt when the RT is reallocated (on
+    /// Per-substrate composite uniform buffer. Gives each substrate its
+    /// own set of composite-pass uniforms so two substrates can composite
+    /// in the same frame without uniform collision.
+    pub uniform_buffer: Buffer,
+    /// Bind group for the composite pipeline: this substrate's uniforms +
+    /// texture + shared sampler. Rebuilt when the RT is reallocated (on
     /// resize).
     pub composite_bg: BindGroup,
     /// Does the substrate's RT need re-rendering this frame? M3.1 re-renders
@@ -82,7 +88,6 @@ pub struct Substrate {
 }
 
 impl Substrate {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         size_px: [u32; 2],
@@ -90,16 +95,22 @@ impl Substrate {
         format: TextureFormat,
         layout: &BindGroupLayout,
         sampler: &Sampler,
-        uniform_buffer: &Buffer,
     ) -> Self {
         let (rt_texture, rt_view) = allocate_rt(device, size_px, format);
-        let composite_bg = build_bind_group(device, layout, uniform_buffer, &rt_view, sampler);
+        let uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("ygg-substrate-uniforms"),
+            size: std::mem::size_of::<CompositeUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let composite_bg = build_bind_group(device, layout, &uniform_buffer, &rt_view, sampler);
         Self {
             size_px,
             pos_px,
             model: IDENTITY4,
             rt_texture,
             rt_view,
+            uniform_buffer,
             composite_bg,
             dirty: true,
         }
@@ -109,7 +120,6 @@ impl Substrate {
     /// reallocates the RT and rebuilds the composite bind group. Returns
     /// `true` if the RT was reallocated (callers may want to invalidate
     /// caches).
-    #[allow(clippy::too_many_arguments)]
     pub fn reconfigure(
         &mut self,
         device: &Device,
@@ -118,7 +128,6 @@ impl Substrate {
         format: TextureFormat,
         layout: &BindGroupLayout,
         sampler: &Sampler,
-        uniform_buffer: &Buffer,
     ) -> bool {
         self.pos_px = pos_px;
         let size_changed = self.size_px != size_px;
@@ -128,7 +137,7 @@ impl Substrate {
             self.rt_texture = tex;
             self.rt_view = view;
             self.composite_bg =
-                build_bind_group(device, layout, uniform_buffer, &self.rt_view, sampler);
+                build_bind_group(device, layout, &self.uniform_buffer, &self.rt_view, sampler);
         }
         self.dirty = true;
         size_changed
