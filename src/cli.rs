@@ -16,8 +16,37 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
+
+/// How the file-tree blind renders each slat this session. Debug-only
+/// toggle so designers can compare Venetian-slat pitches without
+/// waiting for click-based animation. See `blind.rs` for the visual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum SlatMode {
+    /// All slats face the viewer (filenames visible). Production default.
+    #[default]
+    Open,
+    /// All slats tilted edge-on (thin strip, filename hidden).
+    Closed,
+    /// Odd-indexed slats closed, even open — lets both states appear
+    /// in one shot for visual comparison.
+    Alternating,
+}
+
+/// Whether the code pane wraps long lines at the card's right edge.
+/// Debug-only toggle; a button or preference lands in a later milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum WrapMode {
+    /// Wrap long lines at the card body's right edge (word-boundary).
+    /// Card height grows to fit the wrapped content. Default.
+    #[default]
+    On,
+    /// Do not wrap. Long lines extend past the card; horizontal scroll
+    /// (shift-wheel / trackpad) reveals the rest. Content is clipped
+    /// at the card's left and right edges.
+    Off,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +74,23 @@ pub struct Cli {
     /// viewing. Invisible in the UI — purely a time-base override.
     #[arg(long, value_name = "SECONDS")]
     pub debug_day_loop_length: Option<f32>,
+
+    /// Debug: expand every folder in the blind on open, so nested-tree
+    /// layout is visible without waiting for click-to-expand (which
+    /// lands in Phase C of M4.1). Applies to `ygg <dir>` only.
+    #[arg(long)]
+    pub debug_expand_all: bool,
+
+    /// Debug: which slat pitch to render in the file-tree blind. See
+    /// `SlatMode`. Defaults to `open`.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub debug_slat_mode: Option<SlatMode>,
+
+    /// Debug: whether the code pane wraps long lines at the card's
+    /// right edge. See `WrapMode`. Defaults to `on`. Later this will
+    /// be a UI toggle.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub debug_wrap: Option<WrapMode>,
 
     #[command(subcommand)]
     pub command: Option<Command>,

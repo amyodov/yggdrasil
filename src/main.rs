@@ -47,11 +47,14 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let day_cycle_override = cli.debug_day_loop_length;
+    let expand_all = cli.debug_expand_all;
+    let slat_mode = cli.debug_slat_mode.unwrap_or_default();
+    let wrap_mode = cli.debug_wrap.unwrap_or_default();
     let mode = cli.resolve(&RealFs).context("invalid command-line arguments")?;
 
     match mode {
         Mode::File { path } => {
-            let state = open_file(&path, None, day_cycle_override)?;
+            let state = open_file(&path, None, day_cycle_override, slat_mode, wrap_mode)?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }
@@ -72,7 +75,10 @@ fn run() -> Result<()> {
             )?;
             let mut tree = filetree::TreeState::new(listing);
             tree.selected = Some(file.clone());
-            let state = open_file(&file, Some(tree), day_cycle_override)?;
+            if expand_all {
+                crate::blind::expand_all(&mut tree);
+            }
+            let state = open_file(&file, Some(tree), day_cycle_override, slat_mode, wrap_mode)?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }
@@ -87,6 +93,8 @@ fn open_file(
     path: &std::path::Path,
     tree_state: Option<filetree::TreeState>,
     day_cycle_override: Option<f32>,
+    slat_mode: cli::SlatMode,
+    wrap_mode: cli::WrapMode,
 ) -> Result<AppState> {
     let source = SourceFile::read(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -106,6 +114,8 @@ fn open_file(
     let highlighted = HighlightedSource::from_parts(source, kinds, line_offsets);
     let mut state = AppState::new(highlighted, cards);
     state.tree = tree_state;
+    state.slat_mode = slat_mode;
+    state.wrap_mode = wrap_mode;
     if let Some(secs) = day_cycle_override {
         state.day_cycle_secs = secs.max(crate::sky::MIN_DAY_CYCLE_SECS);
     }

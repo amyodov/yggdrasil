@@ -619,6 +619,23 @@ pub fn layout_cards(
     fold_progress: &HashMap<CardId, f32>,
     m: LayoutMetrics,
 ) -> Layout {
+    layout_cards_with_overrides(cards, fold_progress, m, None)
+}
+
+/// As `layout_cards`, but accepts optional per-card overrides for
+/// the card's effective text-line count. Used when word-wrap is on:
+/// a Snippet's wrapped glyph-count differs from its source line count,
+/// and the card's height must grow to fit the wrapped content.
+///
+/// Overrides today apply to `CardKind::Snippet` only — function /
+/// method bodies rarely wrap and the wrapping story for them is
+/// covered by a future sub-milestone.
+pub fn layout_cards_with_overrides(
+    cards: &[Card],
+    fold_progress: &HashMap<CardId, f32>,
+    m: LayoutMetrics,
+    line_count_overrides: Option<&HashMap<CardId, usize>>,
+) -> Layout {
     let mut rects = HashMap::with_capacity(cards.len());
     let mut cursor_y = 0.0f32;
 
@@ -631,8 +648,16 @@ pub fn layout_cards(
 
     let top_level = children_of.get(&None).cloned().unwrap_or_default();
     for (i, &idx) in top_level.iter().enumerate() {
-        let height =
-            layout_subtree(idx, cards, &children_of, fold_progress, &m, cursor_y, &mut rects);
+        let height = layout_subtree(
+            idx,
+            cards,
+            &children_of,
+            fold_progress,
+            &m,
+            cursor_y,
+            &mut rects,
+            line_count_overrides,
+        );
         cursor_y += height;
         if i + 1 < top_level.len() {
             cursor_y += m.top_level_gap;
@@ -644,6 +669,7 @@ pub fn layout_cards(
 
 /// Recursive helper — lays out `card_idx` and its subtree starting at `y`.
 /// Writes into `rects` and returns the total height consumed by the subtree.
+#[allow(clippy::too_many_arguments)]
 fn layout_subtree(
     card_idx: usize,
     cards: &[Card],
@@ -652,9 +678,11 @@ fn layout_subtree(
     m: &LayoutMetrics,
     y: f32,
     rects: &mut HashMap<CardId, CardRect>,
+    line_count_overrides: Option<&HashMap<CardId, usize>>,
 ) -> f32 {
     let card = &cards[card_idx];
-    let header_h = header_height(card, m);
+    let override_lines = line_count_overrides.and_then(|ov| ov.get(&card.id).copied());
+    let header_h = header_height(card, m, override_lines);
     // Linear progress advances at constant rate per second (see
     // AppState::tick_animations). We apply a smoothstep here so the *visual*
     // result eases in and out — the raw progress stays monotonic (good for
@@ -681,7 +709,16 @@ fn layout_subtree(
             let mut total = 0.0;
             if let Some(kids) = children_of.get(&Some(card.id)) {
                 for &k in kids {
-                    let h = layout_subtree(k, cards, children_of, fold_progress, m, child_y, rects);
+                    let h = layout_subtree(
+                        k,
+                        cards,
+                        children_of,
+                        fold_progress,
+                        m,
+                        child_y,
+                        rects,
+                        line_count_overrides,
+                    );
                     child_y += h;
                     total += h;
                 }
@@ -780,7 +817,7 @@ fn scale_subtree(
 ///   the decorator context and the signature are structurally important.
 /// - Inner padding is added above AND below the visible preamble so the
 ///   first/last line don't touch the frame.
-fn header_height(card: &Card, m: &LayoutMetrics) -> f32 {
+fn header_height(card: &Card, m: &LayoutMetrics, override_lines: Option<usize>) -> f32 {
     let preamble_lines: usize = match (&card.kind, &card.body_lines) {
         (CardKind::Class, _) => (card.header_lines.end - card.header_lines.start).max(1),
         // For functions/methods, preamble = everything in full_range before
@@ -788,7 +825,11 @@ fn header_height(card: &Card, m: &LayoutMetrics) -> f32 {
         (_, Some(body_lines)) => {
             body_lines.start.saturating_sub(card.full_lines.start).max(1)
         }
-        (_, None) => (card.full_lines.end - card.full_lines.start).max(1),
+        // Snippets (no body) honor the wrap-aware override when present:
+        // their whole content lives in the preamble and must grow to fit
+        // wrapped visual lines when word-wrap is on.
+        (_, None) => override_lines
+            .unwrap_or_else(|| (card.full_lines.end - card.full_lines.start).max(1)),
     };
     (preamble_lines as f32) * m.line_height + m.card_inner_pad_y * 2.0
 }

@@ -7,9 +7,11 @@ use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
+use crate::blind;
 use crate::cards::{layout_cards, CardId};
+use crate::cli::WrapMode;
 use crate::renderer::{fold_buttons_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
 use crate::sky::DEFAULT_DAY_CYCLE_SECS;
 use crate::state::{AppState, FoldState, WindowSize, LINES_PER_WHEEL_NOTCH};
@@ -125,11 +127,25 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 // Cursor positions come in physical pixels on winit 0.30.
-                self.state.cursor_pos = Some((position.x as f32, position.y as f32));
+                let cx = position.x as f32;
+                let cy = position.y as f32;
+                self.state.cursor_pos = Some((cx, cy));
+                // Slat rows read as clickable affordances — switch the
+                // cursor to a pointer so the user stops seeing the i-beam
+                // the platform defaults to. Actual click handling lands in
+                // Phase C; the cursor icon is the early affordance.
+                let over_slat = cursor_over_slat(&self.state, cx, cy);
+                let icon = if over_slat {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                };
+                renderer.window().set_cursor(icon);
             }
 
             WindowEvent::CursorLeft { .. } => {
                 self.state.cursor_pos = None;
+                renderer.window().set_cursor(CursorIcon::Default);
             }
 
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
@@ -173,12 +189,35 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let lh = self.state.effective_line_height();
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_x, y) => y * LINES_PER_WHEEL_NOTCH * lh,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (
+                        x * LINES_PER_WHEEL_NOTCH * lh,
+                        y * LINES_PER_WHEEL_NOTCH * lh,
+                    ),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                self.state.scroll_y -= dy;
-                self.state.clamp_scroll(lh);
+                // Route vertical scroll to whichever pane the cursor is
+                // over. Horizontal scroll goes to the code pane's scroll_x
+                // when wrap is off (the only context in which horizontal
+                // content can exist).
+                let over_tree_pane = match self.state.cursor_pos {
+                    Some((cx, _)) => {
+                        self.state.tree.is_some()
+                            && cx < self.state.code_pane_left() as f32
+                    }
+                    None => false,
+                };
+                if over_tree_pane {
+                    scroll_tree(&mut self.state, dy);
+                } else {
+                    self.state.scroll_y -= dy;
+                    self.state.clamp_scroll(lh);
+                    if self.state.wrap_mode == WrapMode::Off && dx.abs() > 0.5 {
+                        self.state.scroll_x -= dx;
+                        let max_x = 5000.0;
+                        self.state.scroll_x = self.state.scroll_x.clamp(0.0, max_x);
+                    }
+                }
                 renderer.window().request_redraw();
             }
 
@@ -237,6 +276,50 @@ impl ApplicationHandler for App {
         if let Some(renderer) = self.renderer.as_ref() {
             renderer.window().request_redraw();
         }
+    }
+}
+
+/// True if `(cursor_x, cursor_y)` (window-space physical pixels) falls
+/// over any slat's clickable slot. Recomputes the blind layout on
+/// demand — cheap, flatten + a handful of rect computations. Returns
+/// false when no tree is loaded.
+fn cursor_over_slat(state: &AppState, cursor_x: f32, cursor_y: f32) -> bool {
+    let Some(tree) = state.tree.as_ref() else {
+        return false;
+    };
+    let pane_width = state.code_pane_left() as f32;
+    let pane_height = state.window_size.height as f32;
+    let layout = blind::layout(
+        tree,
+        0.0,
+        pane_width,
+        pane_height,
+        state.scale_factor,
+        state.slat_mode,
+    );
+    blind::hit_test_slat(&layout, cursor_x, cursor_y)
+}
+
+/// Apply `dy` of scroll delta to the tree's scroll_y and clamp it to
+/// legal bounds. Max scroll is (content_height - viewport_height) or 0
+/// if the blind's content fits the viewport.
+fn scroll_tree(state: &mut AppState, dy: f32) {
+    let Some(tree) = state.tree.as_mut() else {
+        return;
+    };
+    let sf = state.scale_factor;
+    let slot = (blind::SLAT_HEIGHT_PT + blind::SLAT_GAP_PT) * sf;
+    let count = crate::filetree::flatten(tree).len();
+    let content_h = count as f32 * slot;
+    let viewport_h =
+        (state.window_size.height as f32 - 2.0 * blind::BLIND_MARGIN_PT * sf).max(0.0);
+    let max = (content_h - viewport_h).max(0.0);
+    tree.scroll_y -= dy;
+    if tree.scroll_y < 0.0 {
+        tree.scroll_y = 0.0;
+    }
+    if tree.scroll_y > max {
+        tree.scroll_y = max;
     }
 }
 

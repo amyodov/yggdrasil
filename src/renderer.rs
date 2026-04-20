@@ -42,7 +42,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use wgpu::{
     CommandEncoderDescriptor, CompositeAlphaMode, Device, DeviceDescriptor, Features, Instance,
@@ -55,9 +55,10 @@ use winit::window::Window;
 use crate::background::BackgroundRenderer;
 use crate::blind;
 use crate::cards::{
-    layout_cards, Card, CardId, CardKind, CardRect, Layout, LayoutMetrics, MethodModifier,
-    Visibility,
+    layout_cards_with_overrides, Card, CardId, CardKind, CardRect, Layout, LayoutMetrics,
+    MethodModifier, Visibility,
 };
+use crate::cli::WrapMode;
 use crate::composite::CompositeRenderer;
 use crate::lens_pipeline::{LensInstance, LensRenderer};
 use crate::icon_pipeline::{IconInstance, IconRenderer};
@@ -363,6 +364,9 @@ pub struct Renderer {
     /// Last-applied font_size / line_height — rebuilt on DPI change.
     applied_font_size: f32,
     applied_line_height: f32,
+    /// Last-applied wrap configuration `(wrap_mode, layout_metrics.width)`
+    /// — when this drifts, every card buffer is re-sized + re-wrapped.
+    applied_wrap_config: Option<(WrapMode, f32)>,
 
     // egui
     egui_ctx: egui::Context,
@@ -523,6 +527,7 @@ impl Renderer {
             card_buffers,
             applied_font_size: font_size,
             applied_line_height: line_height,
+            applied_wrap_config: None,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -609,7 +614,65 @@ impl Renderer {
 
         // ---- Layout (plate-local coordinates) ----
         let metrics = self.layout_metrics(state);
-        let layout = layout_cards(&state.cards, &state.fold_progress, metrics);
+
+        // Keep card buffers in sync with the current wrap mode + pane
+        // width. When either changes, each buffer gets its wrap flag
+        // and layout width re-applied so wrapped text reflows into
+        // the new pane width.
+        let cur_wrap_cfg = (state.wrap_mode, metrics.width);
+        if self.applied_wrap_config != Some(cur_wrap_cfg) {
+            let sf = state.scale_factor;
+            let text_inset_total = CARD_TEXT_INSET_PT * sf * 1.5;
+            for card in &state.cards {
+                let Some(buf) = self.card_buffers.get_mut(&card.id) else { continue };
+                let card_width =
+                    (metrics.width - (card.depth as f32) * metrics.depth_indent).max(0.0);
+                let text_width = (card_width - text_inset_total).max(10.0);
+                match state.wrap_mode {
+                    WrapMode::On => {
+                        buf.set_wrap(&mut self.font_system, Wrap::Word);
+                        buf.set_size(&mut self.font_system, Some(text_width), None);
+                    }
+                    WrapMode::Off => {
+                        buf.set_wrap(&mut self.font_system, Wrap::None);
+                        buf.set_size(&mut self.font_system, Some(100_000.0), None);
+                    }
+                }
+                buf.shape_until_scroll(&mut self.font_system, false);
+            }
+            self.applied_wrap_config = Some(cur_wrap_cfg);
+        }
+
+        // Wrap-aware line-count overrides for Snippet cards: their
+        // height must grow to fit the wrapped visual lines. Computed
+        // only when wrap is on; otherwise the raw source line count
+        // is correct.
+        let wrapped_overrides: HashMap<CardId, usize> = if state.wrap_mode == WrapMode::On {
+            state
+                .cards
+                .iter()
+                .filter(|c| matches!(c.kind, CardKind::Snippet))
+                .filter_map(|c| {
+                    self.card_buffers.get(&c.id).map(|buf| {
+                        let n = buf.layout_runs().count().max(1);
+                        (c.id, n)
+                    })
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let layout = layout_cards_with_overrides(
+            &state.cards,
+            &state.fold_progress,
+            metrics,
+            if wrapped_overrides.is_empty() {
+                None
+            } else {
+                Some(&wrapped_overrides)
+            },
+        );
         let scene_top_local = SCENE_TOP_PAD_PT * state.scale_factor;
 
         // ---- Build shape + icon instances ----
@@ -719,37 +782,140 @@ impl Renderer {
             let pane_left = 0.0;
             let pane_width = state.code_pane_left() as f32;
             let pane_height = state.window_size.height as f32;
-            blind::layout(tree, pane_left, pane_width, pane_height, state.scale_factor)
+            blind::layout(
+                tree,
+                pane_left,
+                pane_width,
+                pane_height,
+                state.scale_factor,
+                state.slat_mode,
+            )
         });
         let blind_text_areas = if let Some(layout) = blind_layout.as_ref() {
+            // Slats emit: body rect + hole-shadow + hole-rope disc = 3
+            // rects per slat. Plus one per rope segment.
             let mut blind_instances: Vec<RectInstance> =
-                Vec::with_capacity(layout.slats.len() + 1);
-            // Wire goes first so slats render on top of it where they overlap.
-            blind_instances.push(RectInstance::glowing(
-                layout.wire.x,
-                layout.wire.y,
-                layout.wire.width,
-                layout.wire.height,
-                layout.wire.color,
-                layout.wire.width * 0.5,
-                layout.wire.glow_color,
-                layout.wire.glow_radius,
-            ));
+                Vec::with_capacity(layout.slats.len() * 3 + layout.ropes.len());
+            // Ropes first so slats render on top of them — each rope
+            // is hidden behind slat bodies except inside each slat's
+            // hole, where a brass disc reveals it.
+            for rope in &layout.ropes {
+                blind_instances.push(RectInstance::glowing(
+                    rope.x,
+                    rope.y_top,
+                    rope.width,
+                    (rope.y_bottom - rope.y_top).max(1.0),
+                    rope.color,
+                    rope.width * 0.5,
+                    rope.glow_color,
+                    rope.glow_radius,
+                ));
+            }
             let win_h = state.window_size.height as f32;
+            let blind_right = state.code_pane_left() as f32
+                - blind::BLIND_MARGIN_PT * state.scale_factor;
+            let tilt_thickness = blind::TILT_STRIP_PT * state.scale_factor;
+            let rope_w_px = blind::ROPE_WIDTH_PT * state.scale_factor;
             for slat in &layout.slats {
-                if slat.y + slat.height < -32.0 || slat.y > win_h + 32.0 {
+                if slat.slot_y + slat.slot_height < -32.0
+                    || slat.slot_y > win_h + 32.0
+                {
                     continue;
                 }
-                blind_instances.push(RectInstance::glowing(
-                    slat.x,
-                    slat.y,
-                    slat.width,
-                    slat.height,
-                    slat.bg,
-                    slat.corner,
-                    slat.glow_color,
-                    slat.glow_radius,
-                ));
+                // Clamp the placeholder-wide slat to the blind's right
+                // edge (layout() returned a wide sentinel width so it
+                // didn't need to know the pane's bounds).
+                let slat_w = (blind_right - slat.slat_x).min(slat.slat_width).max(0.0);
+                if slat_w > 0.0 {
+                    // (1) Slat body.
+                    blind_instances.push(RectInstance::glowing(
+                        slat.slat_x,
+                        slat.slat_y,
+                        slat_w,
+                        slat.slat_height,
+                        slat.bg,
+                        slat.corner,
+                        slat.glow_color,
+                        slat.glow_radius,
+                    ));
+                    // (2) Tilt cue — a thin strip just ABOVE the slat.
+                    //     Closed: the slat's back TOP EDGE peeks up
+                    //     (darker cardboard). Open: a sliver of FACE
+                    //     hints above the shelf edge (lighter).
+                    let tilt_color = match slat.design {
+                        blind::SlatDesign::Closed => blind::CLOSED_BACK_EDGE,
+                        blind::SlatDesign::Open => blind::OPEN_FACE_HINT,
+                    };
+                    blind_instances.push(RectInstance::solid(
+                        slat.slat_x,
+                        slat.slat_y - tilt_thickness,
+                        slat_w,
+                        tilt_thickness,
+                        tilt_color,
+                        slat.corner,
+                    ));
+                    // (3) Top highlight — a hair-thin bright strip at
+                    //     the slat's very top edge, sells "lit from
+                    //     above" so the body reads as a material face.
+                    let rim = (1.0 * state.scale_factor).max(1.0);
+                    blind_instances.push(RectInstance::solid(
+                        slat.slat_x,
+                        slat.slat_y,
+                        slat_w,
+                        rim,
+                        blind::SLAT_TOP_HIGHLIGHT,
+                        slat.corner * 0.5,
+                    ));
+                    // (4) Bottom shadow strip — far edge in shadow.
+                    blind_instances.push(RectInstance::solid(
+                        slat.slat_x,
+                        slat.slat_y + slat.slat_height - rim,
+                        slat_w,
+                        rim,
+                        blind::SLAT_BOTTOM_SHADOW,
+                        slat.corner * 0.5,
+                    ));
+                }
+                // Rope-hole — only present in Closed (plaque) design.
+                // Open's shelf is thin enough that the rope naturally
+                // appears to "enter above, exit below" just by being
+                // hidden behind the shelf body with no decoration.
+                if let Some(hole) = slat.hole {
+                    // Hole rim: a slightly larger dark pill so the
+                    // hole's edge reads as a rim of slat thickness.
+                    let rim_pad = 1.0 * state.scale_factor;
+                    let rim_w = hole.width + rim_pad;
+                    let rim_h = hole.height + rim_pad;
+                    blind_instances.push(RectInstance::solid(
+                        hole.center_x - rim_w * 0.5,
+                        hole.center_y - rim_h * 0.5,
+                        rim_w,
+                        rim_h,
+                        blind::HOLE_RIM_COLOR,
+                        rim_w * 0.5,
+                    ));
+                    // Hole interior: the "void" seen through the cut.
+                    blind_instances.push(RectInstance::solid(
+                        hole.center_x - hole.width * 0.5,
+                        hole.center_y - hole.height * 0.5,
+                        hole.width,
+                        hole.height,
+                        blind::HOLE_VOID_COLOR,
+                        hole.width * 0.5,
+                    ));
+                    // Rope visible through the hole: a thin brass
+                    // vertical strip matching the hole's height,
+                    // rope-wide — leaving dark "void" on either side
+                    // of the rope INSIDE the hole.
+                    blind_instances.push(RectInstance::solid(
+                        hole.center_x - rope_w_px * 0.5,
+                        hole.center_y - hole.height * 0.5,
+                        rope_w_px,
+                        hole.height,
+                        blind::hole_rope_color(),
+                        rope_w_px * 0.5,
+                    ));
+                }
                 if !self.blind_buffers.contains_key(&slat.entry.path) {
                     let buf = blind::build_filename_buffer(
                         &mut self.font_system,
@@ -775,10 +941,12 @@ impl Renderer {
                     height: self.surface_config.height,
                 },
             );
+            let pane_right_px = state.code_pane_left() as f32
+                - blind::BLIND_MARGIN_PT * state.scale_factor;
             let areas = collect_blind_text_areas(
                 &self.blind_buffers,
                 layout,
-                state.scale_factor,
+                pane_right_px,
                 line_height,
                 self.surface_config.height as f32,
             );
@@ -1038,6 +1206,12 @@ impl Renderer {
 
 /// Collect the TextArea metadata for visible cards. Free function so the
 /// renderer can split its borrow. Coordinates are **plate-local**.
+///
+/// When `state.wrap_mode == Off`, the text areas are horizontally
+/// offset by `-state.scroll_x`, shifting long un-wrapped content left
+/// so a scrub of the trackpad reveals what would otherwise be clipped
+/// past the card's right edge. Glyphon's bounds still clip to the
+/// card, so text that scrolls off either edge disappears cleanly.
 fn collect_text_areas<'a>(
     card_buffers: &'a HashMap<CardId, Buffer>,
     state: &AppState,
@@ -1049,6 +1223,11 @@ fn collect_text_areas<'a>(
     let plate_h = plate_size[1] as f32;
     let mut out = Vec::with_capacity(state.cards.len());
     let text_inset = CARD_TEXT_INSET_PT * sf;
+    let scroll_x = if state.wrap_mode == WrapMode::Off {
+        state.scroll_x
+    } else {
+        0.0
+    };
     // Vertical text inset — text sits this far below the card's top edge
     // (and the card's layout also reserves this much padding at the bottom)
     // so first/last lines don't touch the frame.
@@ -1097,7 +1276,7 @@ fn collect_text_areas<'a>(
 
         out.push(AreaSpec {
             buffer,
-            left,
+            left: left - scroll_x,
             top: text_top,
             bounds,
             default_color: GlyphonColor::rgb(r, g, b),
@@ -1131,43 +1310,55 @@ impl<'a> AreaSpec<'a> {
 }
 
 /// Collect text areas for the blind's slat filenames. Coordinates are
-/// **window-space** (the blind text pass renders directly to the swap
-/// chain). Bounds clip each filename to its slat so long names don't
-/// bleed into adjacent slats or off the blind's right edge.
+/// window-space (the blind text pass renders directly to the swap chain).
+/// Text position and color are driven by the slat's `design`: Closed
+/// centers ink inside the plaque; Open places standing text above the
+/// shelf, inside the slot's upper portion.
 fn collect_blind_text_areas<'a>(
     blind_buffers: &'a HashMap<PathBuf, Buffer>,
     layout: &blind::BlindLayout,
-    scale_factor: f32,
+    pane_right_px: f32,
     line_height: f32,
     window_h: f32,
 ) -> Vec<AreaSpec<'a>> {
     let mut out = Vec::with_capacity(layout.slats.len());
-    let inset_x = blind::text_inset_x(scale_factor);
-    let (r, g, b) = blind::FILENAME_RGB;
-    let color = GlyphonColor::rgb(r, g, b);
     for slat in &layout.slats {
-        if slat.y + slat.height < 0.0 || slat.y > window_h {
+        if slat.slot_y + slat.slot_height < 0.0 || slat.slot_y > window_h {
             continue;
         }
         let Some(buffer) = blind_buffers.get(&slat.entry.path) else {
             continue;
         };
-        let left = slat.x + inset_x;
-        let right = slat.x + slat.width - inset_x * 0.5;
-        if right <= left {
+        let text_right = pane_right_px - 2.0;
+        if text_right <= slat.text_left {
             continue;
         }
-        // Vertically center the line in the slat.
-        let top = slat.y + (slat.height - line_height) * 0.5;
-        let bounds = TextBounds {
-            left: left as i32,
-            top: slat.y.max(0.0) as i32,
-            right: right as i32,
-            bottom: (slat.y + slat.height).min(window_h) as i32,
+        let (top, clip_top, clip_bottom) = match slat.design {
+            blind::SlatDesign::Closed => {
+                // Centered inside the plaque.
+                let t = slat.slat_y + (slat.slat_height - line_height) * 0.5;
+                (t, slat.slat_y, slat.slat_y + slat.slat_height)
+            }
+            blind::SlatDesign::Open => {
+                // Standing text above the shelf, within the upper slot.
+                // Place baseline so its bottom sits just above the shelf
+                // with a 1-pixel visual gap.
+                let gap = 1.0;
+                let t = slat.slat_y - line_height - gap;
+                (t, slat.slot_y, slat.slat_y)
+            }
         };
+        let bounds = TextBounds {
+            left: slat.text_left as i32,
+            top: clip_top.max(0.0) as i32,
+            right: text_right as i32,
+            bottom: clip_bottom.min(window_h) as i32,
+        };
+        let (r, g, b) = slat.text_rgb;
+        let color = GlyphonColor::rgb(r, g, b);
         out.push(AreaSpec {
             buffer,
-            left,
+            left: slat.text_left,
             top,
             bounds,
             default_color: color,
@@ -1862,29 +2053,17 @@ impl<'a> Iterator for RunSpans<'a> {
 // Egui overlay (unchanged from M2)
 // ----------------------------------------------------------------------------
 
-fn draw_egui(ctx: &egui::Context) {
-    let frame = egui::Frame::none()
-        .fill(egui::Color32::TRANSPARENT)
-        .inner_margin(egui::Margin::symmetric(12.0, 12.0));
-    egui::SidePanel::left("file_tree_pane")
-        .resizable(false)
-        .show_separator_line(false)
-        .exact_width(ctx.screen_rect().width() * crate::state::LEFT_PANE_FRACTION)
-        .frame(frame)
-        .show(ctx, |ui| {
-            let label = egui::RichText::new("file tree")
-                .color(egui::Color32::from_rgb(140, 140, 160))
-                .monospace()
-                .size(13.0);
-            ui.label(label);
-        });
+fn draw_egui(_ctx: &egui::Context) {
+    // The blind (Zone 1, rendered via our wgpu pipeline) replaces the
+    // former egui placeholder. Egui pass stays wired for future HUD
+    // overlays (timeline scrubber, modal dialogs) but is empty today.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::SourceFile;
-    use crate::cards::{extract_cards, CardKind, MethodModifier, Visibility};
+    use crate::cards::{extract_cards, layout_cards, CardKind, MethodModifier, Visibility};
     use crate::state::compute_line_offsets;
 
     fn test_state(src: &str) -> (AppState, Vec<Card>) {
@@ -2017,6 +2196,15 @@ mod tests {
         let (mut state, _) = test_state("def f():\n    pass\n");
         state.window_size = WindowSize { width: 1200, height: 900 };
         state.scale_factor = 1.0;
+        // Attach a tree so `code_pane_left()` reserves space for the blind
+        // (YGG-54: single-file mode makes code_pane_left = 0, which would
+        // trivially make this assertion hold. A tree-mode state is the
+        // interesting case to lock down.)
+        use crate::filetree::{DirectoryListing, TreeState};
+        state.tree = Some(TreeState::new(DirectoryListing {
+            root: std::path::PathBuf::from("/"),
+            entries: vec![],
+        }));
         let (_, plate_size) = plate_rect(&state);
         let width = plate_size[0] as f32 - (CODE_PAD_LEFT_PT + CODE_PAD_RIGHT_PT);
         assert!((width - (plate_size[0] as f32 - 40.0)).abs() < 1e-3);

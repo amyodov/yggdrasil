@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::analyzer::SourceFile;
 use crate::cards::{Card, CardId};
+use crate::cli::{SlatMode, WrapMode};
 use crate::filetree::TreeState;
 use crate::sky::{SkyLight, DEFAULT_DAY_CYCLE_SECS};
 use crate::syntax::TokenKind;
@@ -231,6 +232,16 @@ pub struct AppState {
     /// carries the root listing, lazily-walked subfolders, expansion
     /// set, selected file, scroll, and animation progress.
     pub tree: Option<TreeState>,
+    /// Debug: which slat pitch the blind renders. `Open` in production.
+    /// `Closed` or `Alternating` via `--debug-slat-mode` for visual
+    /// comparison before per-slat pitch animation lands.
+    pub slat_mode: SlatMode,
+    /// Word-wrap toggle for the code pane. `On` wraps at card width;
+    /// `Off` lets long lines overflow and be scrolled horizontally.
+    pub wrap_mode: WrapMode,
+    /// Horizontal scroll offset for the code pane in physical pixels.
+    /// Used only when `wrap_mode == Off`. Clamped to `[0, max]`.
+    pub scroll_x: f32,
 }
 
 impl AppState {
@@ -248,6 +259,9 @@ impl AppState {
             elapsed_secs: 0.0,
             day_cycle_secs: DEFAULT_DAY_CYCLE_SECS,
             tree: None,
+            slat_mode: SlatMode::Open,
+            wrap_mode: WrapMode::On,
+            scroll_x: 0.0,
         }
     }
 
@@ -344,15 +358,25 @@ impl AppState {
         (t / cycle) * 24.0
     }
 
-    /// Width of the code pane in physical pixels.
+    /// Width of the code pane in physical pixels. Derived from
+    /// `code_pane_left` so the code pane grows to full width when
+    /// there's no blind (single-file mode).
     pub fn code_pane_width(&self) -> u32 {
-        let left = (self.window_size.width as f32 * LEFT_PANE_FRACTION).round() as u32;
-        self.window_size.width.saturating_sub(left)
+        self.window_size
+            .width
+            .saturating_sub(self.code_pane_left())
     }
 
-    /// Left edge of the code pane in physical pixels.
+    /// Left edge of the code pane in physical pixels. When a tree is
+    /// loaded, reserves `LEFT_PANE_FRACTION` of the window for the
+    /// blind. Single-file launches have no tree, so the code pane
+    /// starts at x=0 and spans the full window.
     pub fn code_pane_left(&self) -> u32 {
-        (self.window_size.width as f32 * LEFT_PANE_FRACTION).round() as u32
+        if self.tree.is_some() {
+            (self.window_size.width as f32 * LEFT_PANE_FRACTION).round() as u32
+        } else {
+            0
+        }
     }
 
     /// Font size in physical pixels, scaled for the current display DPI.
