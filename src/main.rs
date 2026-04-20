@@ -69,7 +69,9 @@ fn run() -> Result<()> {
                     )
                 },
             )?;
-            let state = open_file(&file, Some(listing), day_cycle_override)?;
+            let mut tree = filetree::TreeState::new(listing);
+            tree.selected = Some(file.clone());
+            let state = open_file(&file, Some(tree), day_cycle_override)?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }
@@ -82,7 +84,7 @@ fn run() -> Result<()> {
 /// directory walker has already picked which file to open first).
 fn open_file(
     path: &std::path::Path,
-    directory: Option<filetree::DirectoryListing>,
+    tree_state: Option<filetree::TreeState>,
     day_cycle_override: Option<f32>,
 ) -> Result<AppState> {
     let source = SourceFile::read(path)
@@ -93,16 +95,16 @@ fn open_file(
     let mut highlighter = Highlighter::new_for_language(module)
         .with_context(|| format!("load {} grammar", module.name()))?;
     let line_offsets = compute_line_offsets(&source.contents);
-    let tree = highlighter
+    let ast = highlighter
         .parse(&source.contents)
         .context("tree-sitter failed to parse source")?;
-    let kinds = highlighter.highlight_tree(&tree, &source.contents);
-    let cards = module.extract_cards(&tree, &source.contents, &line_offsets);
-    drop(tree);
+    let kinds = highlighter.highlight_tree(&ast, &source.contents);
+    let cards = module.extract_cards(&ast, &source.contents, &line_offsets);
+    drop(ast);
 
     let highlighted = HighlightedSource::from_parts(source, kinds, line_offsets);
     let mut state = AppState::new(highlighted, cards);
-    state.directory = directory;
+    state.tree = tree_state;
     if let Some(secs) = day_cycle_override {
         state.day_cycle_secs = secs.max(crate::sky::MIN_DAY_CYCLE_SECS);
     }
