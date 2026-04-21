@@ -64,9 +64,10 @@ fn run() -> Result<()> {
         .debug_slat_angle
         .map(|deg| deg.to_radians())
         .unwrap_or(0.0);
-    let slat_arc_depth = cli
-        .debug_slat_arc
-        .unwrap_or(crate::slat3d::DEFAULT_ARC_DEPTH);
+    let slat_arc_angle_rad = cli
+        .debug_slat_arc_angle
+        .unwrap_or(crate::slat3d::DEFAULT_ARC_ANGLE_DEG)
+        .to_radians();
     let mode = cli.resolve(&RealFs).context("invalid command-line arguments")?;
 
     match mode {
@@ -79,7 +80,7 @@ fn run() -> Result<()> {
                 wrap_mode,
                 perspective_compass,
                 slat_angle_rad,
-                slat_arc_depth,
+                slat_arc_angle_rad,
             )?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
@@ -112,7 +113,7 @@ fn run() -> Result<()> {
                 wrap_mode,
                 perspective_compass,
                 slat_angle_rad,
-                slat_arc_depth,
+                slat_arc_angle_rad,
             )?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
@@ -135,7 +136,7 @@ fn open_file(
     wrap_mode: cli::WrapMode,
     perspective_compass: bool,
     slat_angle_rad: f32,
-    slat_arc_depth: f32,
+    slat_arc_angle_rad: f32,
 ) -> Result<AppState> {
     let source = SourceFile::read(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -159,7 +160,7 @@ fn open_file(
     state.wrap_mode = wrap_mode;
     state.debug_perspective_compass = perspective_compass;
     state.slat_angle_rad = slat_angle_rad;
-    state.slat_arc_depth = slat_arc_depth;
+    state.slat_arc_angle_rad = slat_arc_angle_rad;
     if let Some(secs) = day_cycle_override {
         state.day_cycle_secs = secs.max(crate::sky::MIN_DAY_CYCLE_SECS);
     }

@@ -1050,7 +1050,13 @@ impl Renderer {
                         color: slat.bg,
                         size_px: [sw, sh],
                         corner_radius: slat.corner,
-                        arc_depth: state.slat_arc_depth,
+                        // Convert arc angle → sagitta in pixels:
+                        // arc_d = (h/2) · tan(angle/4). Using the
+                        // per-slat height makes the curvature a
+                        // consistent angular shape independent of
+                        // pixel size / DPI.
+                        arc_depth: (sh * 0.5)
+                            * (state.slat_arc_angle_rad * 0.25).tan(),
                         hole: hole_xy,
                         text_rect_px,
                         atlas_sub,
@@ -1326,6 +1332,9 @@ impl Renderer {
                     &slat3d_instances,
                     proj,
                     (self.surface_config.width, self.surface_config.height),
+                    [sky.direction.x, sky.direction.y, sky.direction.z],
+                    [sky.color.x, sky.color.y, sky.color.z],
+                    sky.intensity,
                 );
                 let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                     label: Some("ygg-slat3d-pass"),

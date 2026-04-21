@@ -91,7 +91,16 @@ pub struct SlatInstance {
 struct Uniforms {
     projection: [[f32; 4]; 4],
     viewport_size: [f32; 2],
-    _pad: [f32; 2],
+    _pad0: [f32; 2],
+    /// Unit vector pointing toward the unseen dominant star, in the
+    /// same world-space convention as `model` (y DOWN, z INTO screen).
+    /// `w` is unused padding.
+    sky_direction: [f32; 4],
+    /// `xyz` = linear-space sky colour, `w` = intensity 0..1. Slat
+    /// shading multiplies diffuse Lambert by intensity and mixes a
+    /// fraction of the colour into the slat tint so slats warm at
+    /// dawn / cool at noon / dim at night alongside everything else.
+    sky_color_intensity: [f32; 4],
 }
 
 pub struct Slat3DRenderer {
@@ -337,6 +346,7 @@ impl Slat3DRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -344,6 +354,9 @@ impl Slat3DRenderer {
         instances: &[SlatInstance],
         projection: [[f32; 4]; 4],
         viewport_size: (u32, u32),
+        sky_direction: [f32; 3],
+        sky_color: [f32; 3],
+        sky_intensity: f32,
     ) {
         if instances.len() > self.instance_capacity {
             let new_cap = instances.len().next_power_of_two().max(256);
@@ -363,7 +376,9 @@ impl Slat3DRenderer {
         let u = Uniforms {
             projection,
             viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32],
-            _pad: [0.0; 2],
+            _pad0: [0.0; 2],
+            sky_direction: [sky_direction[0], sky_direction[1], sky_direction[2], 0.0],
+            sky_color_intensity: [sky_color[0], sky_color[1], sky_color[2], sky_intensity],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
     }
@@ -497,34 +512,42 @@ pub fn build_slat_model(x: f32, y: f32, w: f32, h: f32, angle_rad: f32) -> [[f32
     ]
 }
 
-/// Default arc depth in physical pixels — a tiny concave bulge at
-/// the slat's horizontal mid-axis, sitting ON TOP of whatever tilt
-/// angle is applied. 5 px is barely perceptible at monitor-scale
-/// focals (~0.5% mid-width narrowing), enough to add a whisper of
-/// 3D curvature without the "sail under the wind" over-bulge we had
-/// at 30 px. Override per-session with `--debug-slat-arc`.
+/// Default arc angle in degrees — how much of a full 360° the
+/// slat's short cross-section subtends on its circle of curvature.
+/// DPI- and slat-size-independent: a 90° arc reads as a 90° arc
+/// whether the slat is 16 px or 60 px tall.
 ///
-/// Note: any nonzero arc pushes the slat's mid-row into +z, which —
-/// with the vanishing point above the window — drifts the projected
-/// hole center upward relative to the rope (drawn as a 2D bar at
-/// the slat's unshifted mid-y), making the pill read slightly more
-/// "above the rope" than "below" as angle + arc grow. Use
-/// `--debug-slat-arc 0` to verify.
+/// Physical model: the slat is a rigid partial cylinder (like a
+/// short section of a rain gutter), long edges touching a flat
+/// table, convex side facing the viewer. Its short-side cross-
+/// section is a chord of a circle; this angle is what that chord
+/// subtends.
 ///
-/// Rough tuning reference at `focal = monitor_width / 2 ≈ 960`:
-///   - 0  — perfectly flat slat; rope splits hole symmetrically.
-///   - 5  — "tiniest arc" (current default), ~0.5% narrowing.
-///   - 10 — gentle, readable curvature.
-///   - 30 — obvious bulge; fine for fold animations, too strong at
-///          rest.
-///   - 60+ — sail-like, not recommended as a rest state.
-pub const DEFAULT_ARC_DEPTH: f32 = 5.0;
+/// Rough tuning reference at slat_height ≈ 23 px (cf. sagitta
+/// mapping `arc_d_px = (h / 2) · tan(angle / 4)`):
+///   - 0°   — perfectly flat slat. Rope splits hole symmetrically.
+///   - 10°  — rigid rib (real aluminum blind). ~0.5 px sagitta.
+///   - 30°  — clearly curved, still rigid-looking. ~1.5 px.
+///   - 30°  — current default. Rigid rib, still clearly curved.
+///            ~1.5 px sagitta at h = 23.
+///   - 90°  — ~5 px sagitta; reads as a mild deliberate vault.
+///   - 180° — half-pipe / U-channel.
+///
+/// Override per-session with `--debug-slat-arc-angle`.
+///
+/// Note: any nonzero arc pushes the slat's mid-row toward the
+/// viewer. In combination with rotation, that drifts the projected
+/// hole center slightly relative to the rope. Pass `0` to verify
+/// symmetry.
+pub const DEFAULT_ARC_ANGLE_DEG: f32 = 30.0;
 
 const SHADER: &str = r#"
 struct Uniforms {
     projection: mat4x4<f32>,
     viewport_size: vec2<f32>,
-    _pad: vec2<f32>,
+    _pad0: vec2<f32>,
+    sky_direction: vec4<f32>,
+    sky_color_intensity: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -555,6 +578,7 @@ struct VsOut {
     @location(4) text_rect_px: vec4<f32>,
     @location(5) atlas_sub: vec4<f32>,
     @location(6) ink_color: vec4<f32>,
+    @location(7) normal: vec3<f32>,
 };
 
 @vertex
@@ -563,9 +587,28 @@ fn vs_main(in: VsIn) -> VsOut {
     let flat_world = model * vec4<f32>(in.pos, 1.0);
     let v_param = in.uv.y;
     let arc_d = in.size_and_corner.w;
-    let arc_z = arc_d * 4.0 * v_param * (1.0 - v_param);
+    // Arc bulges the middle of the slat TOWARD the viewer (-z) —
+    // a convex face, like a vaulted card lying on its side. Positive
+    // `arc_d` therefore produces a negative z offset at v=0.5. (An
+    // earlier convention had the mid recede in +z, which read as a
+    // sail filling with wind pulled toward the vanishing point, not
+    // as a piece of paper bowing toward the reader.)
+    let arc_z = -arc_d * 4.0 * v_param * (1.0 - v_param);
     let world = vec4<f32>(flat_world.x, flat_world.y, flat_world.z + arc_z, 1.0);
     let clip = u.projection * world;
+
+    // Surface normal at this vertex. u-tangent is model col 0
+    // (pure +x for slats); v-tangent is model col 1 (rotation's y/z
+    // components) PLUS the arc's world-z derivative. `arc_z` is
+    // `-arc_d * 4 * v * (1-v)` (bulge toward viewer), so its
+    // derivative in v is `-arc_d * 4 * (1 - 2*v)`. Normal =
+    // v_tangent x u_tangent, which points toward the camera (-z)
+    // when the slat is flat and rolls with rotation + arc otherwise.
+    let dv_arc = -arc_d * 4.0 * (1.0 - 2.0 * v_param);
+    let tan_v = normalize(vec3<f32>(in.model_1.x, in.model_1.y, in.model_1.z + dv_arc));
+    let tan_u = normalize(in.model_0.xyz);
+    let normal = normalize(cross(tan_v, tan_u));
+
     var out: VsOut;
     out.pos = clip;
     out.uv = in.uv;
@@ -575,6 +618,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.text_rect_px = in.text_rect_px;
     out.atlas_sub = in.atlas_sub;
     out.ink_color = in.ink_color;
+    out.normal = normal;
     return out;
 }
 
@@ -624,6 +668,42 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(final_color.rgb * final_color.a, final_color.a);
+    // Stellar shading. Two parts:
+    //   (a) Lambert diffuse across the slat face — tilt moves face
+    //       brightness. Ambient floor is kept modest (0.55) so tilt
+    //       actually shows; diffuse gain 0.45 lets a 60° tilt brighten
+    //       the face meaningfully.
+    //   (b) Per-fragment top-edge rim + contact shadow — the
+    //       canonical Zone-3 on-scroll moves. Rim is a thin bright
+    //       line inside v=0 ("lit from above"); shadow is a short
+    //       dark dart below the rim (cast shadow of the slat above).
+    //       These don't depend on tilt, so they always separate
+    //       stacked slats even when every slat shares one global tilt.
+    // A fraction of the sky's colour mixes into the slat tint so
+    // slats warm at dawn/dusk, cool at noon, desaturate at night.
+    let n = normalize(in.normal);
+    let lambert = max(dot(n, u.sky_direction.xyz), 0.0);
+    let sky_intensity = u.sky_color_intensity.w;
+    let sky_color = u.sky_color_intensity.xyz;
+    let ambient = 0.55;
+    let diffuse_gain = 0.45;
+    let base_shade = ambient + diffuse_gain * lambert * sky_intensity;
+
+    // Edge lights, in slat-local pixel space.
+    let rim_thickness_px = 1.5;
+    let rim_t = clamp(1.0 - px.y / rim_thickness_px, 0.0, 1.0);
+    let rim = 0.28 * rim_t * sky_intensity;
+
+    let shadow_depth_px = max(size.y * 0.28, 4.0);
+    let shadow_t_raw = clamp((px.y - rim_thickness_px) / (shadow_depth_px - rim_thickness_px), 0.0, 1.0);
+    let shadow_t = 1.0 - shadow_t_raw;
+    let shadow = 0.22 * shadow_t * (0.4 + 0.6 * sky_intensity);
+
+    let shade = clamp(base_shade + rim - shadow, 0.0, 1.2);
+    let tint_mix = 0.12 * sky_intensity;
+    let tinted = mix(final_color.rgb, sky_color, tint_mix);
+    let lit = tinted * shade;
+
+    return vec4<f32>(lit * final_color.a, final_color.a);
 }
 "#;

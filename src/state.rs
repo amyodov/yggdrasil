@@ -265,10 +265,11 @@ pub struct AppState {
     /// to every slat in the 3D pipeline. Replaced by per-slat
     /// animated pitch when fold / open-close animations land.
     pub slat_angle_rad: f32,
-    /// Debug: slat arc depth in physical pixels. 0 = flat; a small
-    /// non-zero value adds a concave bulge at the slat's mid axis.
-    /// See `slat3d::DEFAULT_ARC_DEPTH` for tuning notes.
-    pub slat_arc_depth: f32,
+    /// Debug: slat arc angle in radians — how much of a full circle
+    /// the slat's short cross-section subtends. 0 = flat. The render
+    /// step converts this + slat_height into a pixel sagitta for the
+    /// shader. See `slat3d::DEFAULT_ARC_ANGLE_DEG` for tuning notes.
+    pub slat_arc_angle_rad: f32,
 }
 
 /// Monitor rect in virtual-desktop physical pixels.
@@ -302,7 +303,7 @@ impl AppState {
             window_monitor: None,
             debug_perspective_compass: false,
             slat_angle_rad: 0.0,
-            slat_arc_depth: crate::slat3d::DEFAULT_ARC_DEPTH,
+            slat_arc_angle_rad: crate::slat3d::DEFAULT_ARC_ANGLE_DEG.to_radians(),
         }
     }
 

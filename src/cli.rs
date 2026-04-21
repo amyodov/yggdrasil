@@ -105,13 +105,17 @@ pub struct Cli {
     #[arg(long, value_name = "DEGREES")]
     pub debug_slat_angle: Option<f32>,
 
-    /// Debug: slat arc depth in physical pixels — how far the
-    /// slat's horizontal mid-axis bulges toward `+z` (away from
-    /// viewer) on top of any `--debug-slat-angle` tilt. 0 = flat,
-    /// 5 = tiny default, 10 = gentle, 30+ = sail-like. See
-    /// `slat3d::DEFAULT_ARC_DEPTH` for full tuning notes.
-    #[arg(long, value_name = "PIXELS")]
-    pub debug_slat_arc: Option<f32>,
+    /// Debug: slat arc angle in degrees — the angle the slat's short
+    /// cross-section subtends on its circle of curvature. Physical
+    /// intuition: the slat is a rigid partial cylinder, long edges
+    /// touching a table, curved (convex) side facing the viewer; this
+    /// flag sets how much of the full circle that cross-section is.
+    /// 0° = perfectly flat, 10°–30° = real-blind-like rigid rib,
+    /// 60°+ = clearly curved, 180° = half-pipe. DPI- and
+    /// slat-size-independent. See `slat3d::DEFAULT_ARC_ANGLE_DEG`
+    /// for tuning notes.
+    #[arg(long, value_name = "DEGREES")]
+    pub debug_slat_arc_angle: Option<f32>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
