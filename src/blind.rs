@@ -64,12 +64,12 @@ pub const SLAT_LEFT_OVERHANG_PT: f32 = 7.0;
 /// rope inside the hole.
 pub const HOLE_WIDTH_PT: f32 = 5.0;
 /// Hole height as a fraction of the slat height. Centered
-/// vertically; leaves ~20% of slat material above the hole and ~20%
+/// vertically; leaves ~30% of slat material above the hole and ~30%
 /// below. The strips above/below give the rope z-order its
 /// foothold: rope-above-hole is drawn IN FRONT of the slat (visible
 /// over the slat's top strip), rope-below-hole sits BEHIND the slat
 /// (hidden by the bottom strip).
-pub const HOLE_HEIGHT_FRACTION: f32 = 0.6;
+pub const HOLE_HEIGHT_FRACTION: f32 = 0.4;
 /// Vertical position of the hole's CENTER as a fraction of the
 /// slat's height. 0.5 = centered.
 pub const HOLE_CENTER_Y_FRACTION: f32 = 0.5;
@@ -631,10 +631,10 @@ mod tests {
         // Hole is vertically centered in the slat.
         let slat_mid = s.slat_y + s.slat_height * 0.5;
         assert!((hole.center_y - slat_mid).abs() < 1e-3);
-        // Hole spans ~60% of the slat's height, leaving top/bottom
+        // Hole spans ~40% of the slat's height, leaving top/bottom
         // strips for the 3-z-level rope-threading visual.
-        assert!(hole.height > s.slat_height * 0.5);
-        assert!(hole.height < s.slat_height * 0.75);
+        assert!(hole.height > s.slat_height * 0.3);
+        assert!(hole.height < s.slat_height * 0.55);
         assert!(hole.width < hole.height);
 
         let l_open = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open, &HashMap::new());

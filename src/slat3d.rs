@@ -504,8 +504,15 @@ pub fn build_slat_model(x: f32, y: f32, w: f32, h: f32, angle_rad: f32) -> [[f32
 /// 3D curvature without the "sail under the wind" over-bulge we had
 /// at 30 px. Override per-session with `--debug-slat-arc`.
 ///
+/// Note: any nonzero arc pushes the slat's mid-row into +z, which —
+/// with the vanishing point above the window — drifts the projected
+/// hole center upward relative to the rope (drawn as a 2D bar at
+/// the slat's unshifted mid-y), making the pill read slightly more
+/// "above the rope" than "below" as angle + arc grow. Use
+/// `--debug-slat-arc 0` to verify.
+///
 /// Rough tuning reference at `focal = monitor_width / 2 ≈ 960`:
-///   - 0  — perfectly flat slat.
+///   - 0  — perfectly flat slat; rope splits hole symmetrically.
 ///   - 5  — "tiniest arc" (current default), ~0.5% narrowing.
 ///   - 10 — gentle, readable curvature.
 ///   - 30 — obvious bulge; fine for fold animations, too strong at
