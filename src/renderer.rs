@@ -359,14 +359,25 @@ pub struct Renderer {
     /// regardless of whether the body is drawn in 2D or 3D.
     blind_decor_shapes: ShapeRenderer,
     blind_text_renderer: TextRenderer,
-    blind_viewport: Viewport,
     blind_buffers: HashMap<PathBuf, Buffer>,
     /// 3D slat pipeline (YGG-62 Phase 2). Renders slat bodies as
-    /// real 3D quads projected through a one-point perspective
-    /// anchored at the physical-screen target. When the anchor
-    /// isn't known yet (first frame) or `state.debug_slat_2d` is
-    /// set, the 2D slat body in `blind_shapes` is drawn instead.
+    /// real 3D quads projected through a one-point perspective.
     slat3d: Slat3DRenderer,
+    /// Text atlas — one RGBA texture holding every slat's filename
+    /// rendered into its own sub-rect. `slat3d` samples from this
+    /// per-instance (`atlas_sub`) so text paints onto the 3D slat
+    /// face and warps with rotation / arc / perspective. The texture
+    /// and sampler are held to keep the GPU resource alive; only the
+    /// view is bound into `slat3d`.
+    #[allow(dead_code)]
+    text_atlas_tex: wgpu::Texture,
+    text_atlas_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    text_atlas_sampler: wgpu::Sampler,
+    text_atlas_size_px: (u32, u32),
+    /// Viewport sized to the atlas — used with `blind_text_renderer`
+    /// when rendering filenames into the atlas texture.
+    text_atlas_viewport: Viewport,
 
     // glyphon
     font_system: FontSystem,
@@ -458,7 +469,6 @@ impl Renderer {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
-        let blind_viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
@@ -472,11 +482,44 @@ impl Renderer {
             card_buffers.insert(card.id, buf);
         }
 
+        // Text atlas for slat filenames (YGG-64). RGBA, matches the
+        // surface format so glyphon's TextRenderer (configured with
+        // `format`) can render into it directly. 2048 × 512 holds
+        // roughly 100 filenames of typical length at reasonable DPI.
+        let text_atlas_size_px = (2048u32, 512u32);
+        let text_atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ygg-slat-text-atlas"),
+            size: wgpu::Extent3d {
+                width: text_atlas_size_px.0,
+                height: text_atlas_size_px.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let text_atlas_view = text_atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let text_atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ygg-slat-text-atlas-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let text_atlas_viewport = Viewport::new(&device, &cache);
+
         // Shape + background + composite + icon pipelines.
         let shape_renderer = ShapeRenderer::new(&device, format);
         let blind_shapes = ShapeRenderer::new(&device, format);
         let blind_decor_shapes = ShapeRenderer::new(&device, format);
-        let slat3d = Slat3DRenderer::new(&device, format);
+        let slat3d = Slat3DRenderer::new(&device, format, &text_atlas_view, &text_atlas_sampler);
         let background_renderer = BackgroundRenderer::new(&device, format);
         let composite = CompositeRenderer::new(&device, format);
         let icon_renderer = IconRenderer::new(&device, &queue, format);
@@ -537,9 +580,13 @@ impl Renderer {
             blind_shapes,
             blind_decor_shapes,
             blind_text_renderer,
-            blind_viewport,
             blind_buffers: HashMap::new(),
             slat3d,
+            text_atlas_tex,
+            text_atlas_view,
+            text_atlas_sampler,
+            text_atlas_size_px,
+            text_atlas_viewport,
             font_system,
             swash_cache,
             viewport,
@@ -899,6 +946,13 @@ impl Renderer {
                 ));
             }
             let win_h = state.window_size.height as f32;
+            // Text-atlas packing state.
+            let atlas_w_px = self.text_atlas_size_px.0 as f32;
+            let atlas_h_px = self.text_atlas_size_px.1 as f32;
+            let atlas_row_h = line_height.ceil() + 2.0;
+            let mut atlas_cursor_x = 1.0_f32;
+            let mut atlas_cursor_y = 1.0_f32;
+            let mut atlas_areas: Vec<AreaSpec> = Vec::new();
             for slat in &layout.slats {
                 if slat.slot_y + slat.slot_height < -32.0
                     || slat.slot_y > win_h + 32.0
@@ -914,9 +968,6 @@ impl Renderer {
                 if slat3d_active {
                     let sw = slat.slat_width.max(1.0);
                     let sh = slat.slat_height.max(1.0);
-                    // Hole in slat-local pixel space. The 2D blind
-                    // layout computed the hole in window-space; we
-                    // subtract the slat's top-left to get slat-local.
                     let hole_xy = slat
                         .hole
                         .map(|h| {
@@ -928,6 +979,66 @@ impl Renderer {
                             ]
                         })
                         .unwrap_or([0.0; 4]);
+
+                    // Atlas packing for this slat's filename. If the
+                    // text fits in the current row, place it there;
+                    // otherwise wrap to the next row. If the atlas
+                    // overflows vertically, skip text for this slat.
+                    let text_w = self
+                        .blind_buffers
+                        .get(&slat.entry.path)
+                        .map(|buf| {
+                            buf.layout_runs()
+                                .map(|r| r.line_w)
+                                .fold(0.0_f32, f32::max)
+                                .ceil()
+                        })
+                        .unwrap_or(0.0);
+                    let (text_rect_px, atlas_sub) = if text_w > 0.5 {
+                        if atlas_cursor_x + text_w > atlas_w_px - 2.0 {
+                            atlas_cursor_x = 1.0;
+                            atlas_cursor_y += atlas_row_h;
+                        }
+                        if atlas_cursor_y + atlas_row_h > atlas_h_px {
+                            ([0.0; 4], [0.0; 4])
+                        } else {
+                            let text_left_local = slat.text_left - slat.slat_x;
+                            let text_top_local = (sh - line_height).max(0.0) * 0.5;
+                            let rect = [
+                                text_left_local,
+                                text_top_local,
+                                text_w,
+                                line_height,
+                            ];
+                            let sub = [
+                                atlas_cursor_x / atlas_w_px,
+                                atlas_cursor_y / atlas_h_px,
+                                (atlas_cursor_x + text_w) / atlas_w_px,
+                                (atlas_cursor_y + line_height) / atlas_h_px,
+                            ];
+                            if let Some(buf) = self.blind_buffers.get(&slat.entry.path)
+                            {
+                                atlas_areas.push(AreaSpec {
+                                    buffer: buf,
+                                    left: atlas_cursor_x,
+                                    top: atlas_cursor_y,
+                                    bounds: TextBounds {
+                                        left: atlas_cursor_x as i32,
+                                        top: atlas_cursor_y as i32,
+                                        right: (atlas_cursor_x + text_w) as i32,
+                                        bottom: (atlas_cursor_y + line_height) as i32,
+                                    },
+                                    default_color: GlyphonColor::rgb(255, 255, 255),
+                                });
+                            }
+                            atlas_cursor_x += text_w + 2.0;
+                            (rect, sub)
+                        }
+                    } else {
+                        ([0.0; 4], [0.0; 4])
+                    };
+
+                    let (ir, ig, ib) = slat.text_rgb;
                     slat3d_instances.push(SlatInstance {
                         model: build_slat_model(
                             slat.slat_x,
@@ -941,6 +1052,14 @@ impl Renderer {
                         corner_radius: slat.corner,
                         arc_depth: state.slat_arc_depth,
                         hole: hole_xy,
+                        text_rect_px,
+                        atlas_sub,
+                        ink_color: [
+                            ir as f32 / 255.0,
+                            ig as f32 / 255.0,
+                            ib as f32 / 255.0,
+                            1.0,
+                        ],
                     });
                 }
                 // Hole is now a REAL cutout in the slat3d fragment
@@ -948,16 +1067,11 @@ impl Renderer {
                 // half-extents. The 2D rope drawn in the earlier
                 // pass shows through the cutout, so the rope visually
                 // threads through the slat like real material.
-                if !self.blind_buffers.contains_key(&slat.entry.path) {
-                    let buf = blind::build_filename_buffer(
-                        &mut self.font_system,
-                        &slat.entry.name,
-                        slat.entry.kind,
-                        font_size,
-                        line_height,
-                    );
-                    self.blind_buffers.insert(slat.entry.path.clone(), buf);
-                }
+                // Buffers for every flattened entry were already built
+                // in the `blind_filename_widths` pass above, so there
+                // is no per-slat insert here — keeping it would hold
+                // a mutable borrow that conflicts with `atlas_areas`
+                // referencing the same map.
             }
             self.blind_shapes.prepare(
                 &self.device,
@@ -972,40 +1086,38 @@ impl Renderer {
                 (self.surface_config.width, self.surface_config.height),
             );
 
-            self.blind_viewport.update(
+            // Update the atlas-sized viewport and prepare glyphon to
+            // render every slat's filename at its packed atlas slot.
+            // Using the shared `blind_text_renderer` — its output
+            // goes into `text_atlas_tex` via the atlas render pass
+            // below (see Pass 4ca). Text atlas is re-rendered every
+            // frame for now; when slat set / DPI are stable, this
+            // is wasted work and will be moved behind a dirty flag.
+            self.text_atlas_viewport.update(
                 &self.queue,
                 Resolution {
-                    width: self.surface_config.width,
-                    height: self.surface_config.height,
+                    width: self.text_atlas_size_px.0,
+                    height: self.text_atlas_size_px.1,
                 },
-            );
-            let pane_right_px = state.code_pane_left() as f32
-                - blind::BLIND_MARGIN_PT * state.scale_factor;
-            let areas = collect_blind_text_areas(
-                &self.blind_buffers,
-                layout,
-                pane_right_px,
-                line_height,
-                self.surface_config.height as f32,
             );
             if let Err(e) = self.blind_text_renderer.prepare(
                 &self.device,
                 &self.queue,
                 &mut self.font_system,
                 &mut self.atlas,
-                &self.blind_viewport,
-                areas.iter().map(|a| a.to_text_area()),
+                &self.text_atlas_viewport,
+                atlas_areas.iter().map(|a| a.to_text_area()),
                 &mut self.swash_cache,
             ) {
-                log::warn!("blind text prepare failed: {e:?}");
+                log::warn!("slat text atlas prepare failed: {e:?}");
             }
-            areas
+            atlas_areas
         } else {
             Vec::new()
         };
         // `blind_text_areas` is owned for the rest of the frame so the
         // text-area buffer references in the prepared draw stay valid until
-        // the blind text pass runs.
+        // the atlas render pass runs.
         let _ = &blind_text_areas;
 
         // ---- Composite uniforms (plate → swap chain) ----
@@ -1230,10 +1342,38 @@ impl Renderer {
             }
         }
 
-        // Pass 4c'': blind DECOR shapes — tilt strip, top highlight,
-        // bottom shadow, hole rim/void/rope-in-hole/rope-above-hole.
-        // Rendered AFTER the slat body pass (2D or 3D) so decorations
-        // stack on top of whatever body got drawn.
+        // Pass 4ca: render the text atlas. Runs BEFORE slat3d so the
+        // atlas is populated when slat3d samples it. The atlas is
+        // cleared to fully-transparent each frame; glyphon writes
+        // white (rgb=1) alpha-masked glyphs into each slat's packed
+        // sub-rect.
+        if blind_layout.is_some() {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-slat-text-atlas-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.text_atlas_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if let Err(e) =
+                self.blind_text_renderer
+                    .render(&self.atlas, &self.text_atlas_viewport, &mut pass)
+            {
+                log::warn!("slat text atlas render failed: {e:?}");
+            }
+        }
+
+        // Pass 4c'': blind DECOR shapes — currently always empty
+        // (all decorations are now handled by the slat3d fragment
+        // shader: hole cutout, text sampling). Kept wired for future
+        // per-mode extras.
         if blind_layout.is_some() {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ygg-blind-decor-pass"),
@@ -1249,26 +1389,10 @@ impl Renderer {
             self.blind_decor_shapes.render(&mut pass);
         }
 
-        // Pass 4d: blind filenames → swap chain.
-        if blind_layout.is_some() {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("ygg-blind-text-pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if let Err(e) =
-                self.blind_text_renderer
-                    .render(&self.atlas, &self.blind_viewport, &mut pass)
-            {
-                log::warn!("blind text render failed: {e:?}");
-            }
-        }
+        // Pass 4d (blind text → swap chain) is gone — slat3d samples
+        // the text atlas directly in its fragment shader, so there's
+        // no separate 2D text pass for filenames anymore. The atlas
+        // was rendered above (Pass 4ca) and consumed by Pass 4c'.
 
         // Pass 5: egui HUD → swap chain.
         {
@@ -1404,65 +1528,6 @@ impl<'a> AreaSpec<'a> {
             custom_glyphs: &[],
         }
     }
-}
-
-/// Collect text areas for the blind's slat filenames. Coordinates are
-/// window-space (the blind text pass renders directly to the swap chain).
-/// Text position and color are driven by the slat's `design`: Closed
-/// centers ink inside the plaque; Open places standing text above the
-/// shelf, inside the slot's upper portion.
-fn collect_blind_text_areas<'a>(
-    blind_buffers: &'a HashMap<PathBuf, Buffer>,
-    layout: &blind::BlindLayout,
-    pane_right_px: f32,
-    line_height: f32,
-    window_h: f32,
-) -> Vec<AreaSpec<'a>> {
-    let mut out = Vec::with_capacity(layout.slats.len());
-    for slat in &layout.slats {
-        if slat.slot_y + slat.slot_height < 0.0 || slat.slot_y > window_h {
-            continue;
-        }
-        let Some(buffer) = blind_buffers.get(&slat.entry.path) else {
-            continue;
-        };
-        let text_right = pane_right_px - 2.0;
-        if text_right <= slat.text_left {
-            continue;
-        }
-        let (top, clip_top, clip_bottom) = match slat.design {
-            blind::SlatDesign::Closed => {
-                // Ink on slat: text vertically centered on the slat face.
-                let t = slat.slat_y + (slat.slat_height - line_height) * 0.5;
-                (t, slat.slat_y, slat.slat_y + slat.slat_height)
-            }
-            blind::SlatDesign::Open => {
-                // Standing text: bottom of text rests at the slat's
-                // middle y, extending upward — "standing on the
-                // shelf at the middle". Upright in screen space,
-                // color pale to read against the void above the slat.
-                let slat_mid = slat.slat_y + slat.slat_height * 0.5;
-                let t = slat_mid - line_height;
-                (t, slat.slot_y, slat.slat_y + slat.slat_height)
-            }
-        };
-        let bounds = TextBounds {
-            left: slat.text_left as i32,
-            top: clip_top.max(0.0) as i32,
-            right: text_right as i32,
-            bottom: clip_bottom.min(window_h) as i32,
-        };
-        let (r, g, b) = slat.text_rgb;
-        let color = GlyphonColor::rgb(r, g, b);
-        out.push(AreaSpec {
-            buffer,
-            left: slat.text_left,
-            top,
-            bounds,
-            default_color: color,
-        });
-    }
-    out
 }
 
 /// Append the shape instances for one card. Order matters — each instance

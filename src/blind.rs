@@ -96,24 +96,17 @@ pub const CLOSED_INK_RGB: (u8, u8, u8) = (48, 44, 40);
 /// Ink-text inset from the right edge of the rope-hole.
 const CLOSED_TEXT_GAP_PT: f32 = 8.0;
 
-// ---- Open design (shelf with standing text) -------------------------
+// ---- Open design — now visually a plaque too, different colors ---
 
-/// Shelf (Open) strip — a thinner board tone. Reads as wood/cardboard
-/// at a distance; the text stands on top of it, not inside it.
+/// Open-mode plaque — a warmer cardboard tone vs Closed's pale
+/// paper, to read as a different material under the same slat
+/// shape.
 const OPEN_SHELF_BG: [f32; 4] = [0.60, 0.54, 0.46, 0.92];
-/// Folder shelves sit slightly darker. The distinction is subtle;
-/// the visual identity of a folder in Open mode comes more from the
-/// trailing slash in the filename.
+/// Folder variant of the Open plaque.
 const OPEN_FOLDER_SHELF_BG: [f32; 4] = [0.52, 0.47, 0.40, 0.92];
-/// Shelf thickness in logical points.
-const OPEN_SHELF_THICKNESS_PT: f32 = 4.0;
-/// Shelf corner radius — slightly softened.
-const OPEN_CORNER_RADIUS_PT: f32 = 1.5;
-/// Standing-text color for Open mode — pale warm ivory, readable on
-/// the dark void behind the shelf.
+/// Standing-text ink color for Open mode — pale warm ivory.
+/// Painted on the slat via the text atlas (slat3d samples it).
 pub const OPEN_STANDING_RGB: (u8, u8, u8) = (238, 230, 216);
-/// Standing-text horizontal inset measured from the rope's x.
-const OPEN_TEXT_GAP_PT: f32 = 6.0;
 
 // ---- Slat halo (both designs) ---------------------------------------
 
@@ -148,6 +141,10 @@ pub enum SlatDesign {
 #[derive(Debug, Clone)]
 pub struct LaidSlat {
     pub entry: SlatEntry,
+    /// Recorded for tests and future design differentiation; runtime
+    /// rendering distinguishes Open from Closed by colour (`bg` +
+    /// `text_rgb`), since both now use identical plaque geometry.
+    #[allow(dead_code)]
     pub design: SlatDesign,
     /// Slat body rectangle (x, y, width, height) in window-space pixels.
     pub slat_x: f32,
@@ -372,20 +369,25 @@ fn slat_geometry(
             }
         }
         SlatDesign::Open => {
-            let shelf_h = OPEN_SHELF_THICKNESS_PT * sf;
+            // Geometry unified with Closed (plaque-sized) 2026-04-21
+            // so text atlas sampling has a full-height slat face to
+            // paint into. Only the BG and INK colors distinguish
+            // modes now; slat shape + placement is the same.
+            let pad = CLOSED_VERTICAL_PAD_PT * sf;
+            let slat_h = (slot_h - 2.0 * pad).max(2.0);
             let bg = match kind {
                 EntryKind::Folder => OPEN_FOLDER_SHELF_BG,
                 EntryKind::File => OPEN_SHELF_BG,
             };
-            let text_left = rope_x + ROPE_WIDTH_PT * 0.5 * sf + OPEN_TEXT_GAP_PT * sf;
+            let text_left = rope_x + HOLE_WIDTH_PT * 0.5 * sf + CLOSED_TEXT_GAP_PT * sf;
             let slat_w = (text_left - slat_x) + text_w + right_margin;
             SlatGeom {
                 slat_x,
-                slat_y: slot_y + slot_h - shelf_h,
+                slat_y: slot_y + pad,
                 slat_w,
-                slat_h: shelf_h,
+                slat_h,
                 bg,
-                corner: OPEN_CORNER_RADIUS_PT * sf,
+                corner: CLOSED_CORNER_RADIUS_PT * sf,
                 text_left,
                 text_rgb: OPEN_STANDING_RGB,
             }
@@ -576,16 +578,17 @@ mod tests {
     }
 
     #[test]
-    fn open_is_shelf_with_standing_text_color() {
+    fn open_uses_plaque_geometry_with_standing_colors() {
         let tree = mock_tree_flat(&[("a.py", EntryKind::File)]);
         let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open, &HashMap::new());
         let s = &l.slats[0];
         assert_eq!(s.design, SlatDesign::Open);
-        // Shelf is a thin strip at the bottom of the slot.
-        assert!(s.slat_height < SLAT_HEIGHT_PT * 0.3);
-        let slot_bottom = s.slot_y + s.slot_height;
-        assert!((s.slat_y + s.slat_height - slot_bottom).abs() < 1e-3);
+        // Open and Closed now share plaque dimensions — the
+        // difference is purely colour (background + ink), not
+        // geometry. What used to be a thin shelf is gone.
+        assert!(s.slat_height > SLAT_HEIGHT_PT * 0.8);
         assert_eq!(s.text_rgb, OPEN_STANDING_RGB);
+        assert_eq!(s.bg, OPEN_SHELF_BG);
     }
 
     #[test]

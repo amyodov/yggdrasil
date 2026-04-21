@@ -71,6 +71,19 @@ pub struct SlatInstance {
     /// giving a real cut-through that the rope (drawn behind) shows
     /// through. Set all-zero to disable (slats without holes).
     pub hole: [f32; 4],
+    /// Text region in SLAT-LOCAL pixel space — `xy` = top-left,
+    /// `zw` = width/height. Fragment shader samples the text atlas
+    /// only inside this region, leaving the rest of the slat bare.
+    /// Set all-zero to disable text on this slat.
+    pub text_rect_px: [f32; 4],
+    /// Text region in ATLAS uv space — `xy` = (u_min, v_min),
+    /// `zw` = (u_max, v_max). Slat-local text_rect_px maps into
+    /// this atlas sub-rect, so the text keeps its rendered pixel
+    /// size (no stretching).
+    pub atlas_sub: [f32; 4],
+    /// Ink color (straight rgba). Fragment mixes this over the slat
+    /// color using the atlas alpha as opacity.
+    pub ink_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -90,11 +103,20 @@ pub struct Slat3DRenderer {
     instance_capacity: usize,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Bind group 1: text atlas texture + sampler. Populated externally
+    /// with glyphon-rendered filenames; sampled per-fragment and
+    /// composited over the slat face.
+    atlas_bg: wgpu::BindGroup,
     instance_count: u32,
 }
 
 impl Slat3DRenderer {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        atlas_view: &wgpu::TextureView,
+        atlas_sampler: &wgpu::Sampler,
+    ) -> Self {
         let (verts, indices) = build_mesh(N_STRIPS);
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -146,6 +168,43 @@ impl Slat3DRenderer {
             }],
         });
 
+        // Atlas bind group (group 1): sampled 2D texture + sampler.
+        let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ygg-slat3d-atlas-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ygg-slat3d-atlas-bg"),
+            layout: &atlas_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(atlas_sampler),
+                },
+            ],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ygg-slat3d-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -154,7 +213,7 @@ impl Slat3DRenderer {
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ygg-slat3d-pipeline-layout"),
-                bind_group_layouts: &[&bgl],
+                bind_group_layouts: &[&bgl, &atlas_bgl],
                 push_constant_ranges: &[],
             });
 
@@ -175,8 +234,8 @@ impl Slat3DRenderer {
             ],
         };
         // Instance layout: model (4 vec4) + color (vec4) +
-        // size_and_corner_and_arc (vec4 packed: xy size, z corner, w arc) +
-        // hole (vec4 packed: xy center, zw half-extents).
+        // size_and_corner_and_arc (vec4) + hole (vec4) +
+        // text_rect_px (vec4) + atlas_sub (vec4) + ink_color (vec4).
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<SlatInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -214,6 +273,21 @@ impl Slat3DRenderer {
                 wgpu::VertexAttribute {
                     offset: 96,
                     shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 112,
+                    shader_location: 9,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 128,
+                    shader_location: 10,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 144,
+                    shader_location: 11,
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],
@@ -258,6 +332,7 @@ impl Slat3DRenderer {
             instance_capacity: initial_capacity,
             uniform_buffer,
             bind_group,
+            atlas_bg,
             instance_count: 0,
         }
     }
@@ -299,6 +374,7 @@ impl Slat3DRenderer {
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, &self.atlas_bg, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -445,6 +521,8 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(1) var atlas_sampler: sampler;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -454,10 +532,11 @@ struct VsIn {
     @location(4) model_2: vec4<f32>,
     @location(5) model_3: vec4<f32>,
     @location(6) color: vec4<f32>,
-    // .xy = natural slat size (px), .z = corner radius, .w = arc_depth
     @location(7) size_and_corner: vec4<f32>,
-    // .xy = hole center (slat-local px), .zw = hole half-extents (px)
     @location(8) hole: vec4<f32>,
+    @location(9) text_rect_px: vec4<f32>,
+    @location(10) atlas_sub: vec4<f32>,
+    @location(11) ink_color: vec4<f32>,
 };
 
 struct VsOut {
@@ -466,15 +545,15 @@ struct VsOut {
     @location(1) color: vec4<f32>,
     @location(2) size_and_corner: vec4<f32>,
     @location(3) hole: vec4<f32>,
+    @location(4) text_rect_px: vec4<f32>,
+    @location(5) atlas_sub: vec4<f32>,
+    @location(6) ink_color: vec4<f32>,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
-    // Scale + translate gives world (x, y, 0).
     let flat_world = model * vec4<f32>(in.pos, 1.0);
-    // Parabolic concave arc across the slat's short axis. z peaks
-    // at v = 0.5 (middle of slat), zero at v = 0 and v = 1.
     let v_param = in.uv.y;
     let arc_d = in.size_and_corner.w;
     let arc_z = arc_d * 4.0 * v_param * (1.0 - v_param);
@@ -486,6 +565,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = in.color;
     out.size_and_corner = in.size_and_corner;
     out.hole = in.hole;
+    out.text_rect_px = in.text_rect_px;
+    out.atlas_sub = in.atlas_sub;
+    out.ink_color = in.ink_color;
     return out;
 }
 
@@ -495,7 +577,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r = max(in.size_and_corner.z, 0.0);
     let px = in.uv * size;
 
-    // Rounded-rect SDF: discard outer rounded corners.
+    // Rounded-rect SDF.
     let d = min(px, size - px);
     if (d.x < r && d.y < r) {
         let from_corner = vec2<f32>(r - d.x, r - d.y);
@@ -504,11 +586,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Real elliptical hole: discard fragments inside the hole. The
-    // rope (drawn in the 2D pass BEFORE this pipeline) is visible
-    // through the cutout, so the rope visually threads through the
-    // slat as real material. `hole.zw` = half-extents; an all-zero
-    // hole means "no hole" (e.g. the Open-design shelf slats).
+    // Elliptical hole cut.
     let hole_half = in.hole.zw;
     if (hole_half.x > 0.0 && hole_half.y > 0.0) {
         let delta = (px - in.hole.xy) / hole_half;
@@ -517,7 +595,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    let c = in.color;
-    return vec4<f32>(c.rgb * c.a, c.a);
+    var final_color = in.color;
+
+    // Paint text from the atlas, if a text rect is set. The slat's
+    // local pixel position within the text rect maps to the atlas
+    // sub-rect — text keeps its rendered pixel size regardless of
+    // the slat's angle or arc (perspective already handled by the
+    // vertex projection).
+    let text_rect = in.text_rect_px;
+    if (text_rect.z > 0.0 && text_rect.w > 0.0) {
+        let rel = (px - text_rect.xy) / text_rect.zw;
+        if (rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0) {
+            let atlas_uv = mix(in.atlas_sub.xy, in.atlas_sub.zw, rel);
+            let sampled = textureSample(atlas_tex, atlas_sampler, atlas_uv);
+            let ink = in.ink_color;
+            // Use atlas alpha as ink opacity; ink color replaces slat color.
+            final_color = vec4<f32>(
+                mix(final_color.rgb, ink.rgb, sampled.a * ink.a),
+                final_color.a
+            );
+        }
+    }
+
+    return vec4<f32>(final_color.rgb * final_color.a, final_color.a);
 }
 "#;
