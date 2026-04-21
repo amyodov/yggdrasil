@@ -35,6 +35,16 @@ struct Uniforms {
     viewport_size: [f32; 2],
     time_seconds: f32,
     sky_intensity: f32,
+    /// xy = window's inner-client-area top-left on the virtual
+    /// desktop (physical pixels). zw unused — this field is padded
+    /// to vec4 so the following vec4 members stay 16-aligned per
+    /// WGSL's std140-ish layout rules.
+    ///
+    /// The shader adds `xy` to each fragment's pixel coord before
+    /// sampling cloud noise, so clouds stay pinned to the PHYSICAL
+    /// SCREEN rather than to the window. Zero when the anchor
+    /// isn't known yet.
+    window_origin: [f32; 4],
     /// Unit vector toward the unseen dominant star; xyz. `w` is padding.
     sky_direction: [f32; 4],
     /// Sky color temperature (linear RGB); rgb. `a` is padding.
@@ -127,6 +137,7 @@ impl BackgroundRenderer {
         &self,
         queue: &wgpu::Queue,
         viewport_size: (u32, u32),
+        window_origin: (f32, f32),
         time_seconds: f32,
         sky: SkyLight,
     ) {
@@ -134,6 +145,7 @@ impl BackgroundRenderer {
             viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32],
             time_seconds,
             sky_intensity: sky.intensity,
+            window_origin: [window_origin.0, window_origin.1, 0.0, 0.0],
             sky_direction: [sky.direction.x, sky.direction.y, sky.direction.z, 0.0],
             sky_color: [sky.color.x, sky.color.y, sky.color.z, 0.0],
         };
@@ -152,6 +164,7 @@ struct Uniforms {
     viewport_size: vec2<f32>,
     time_seconds: f32,
     sky_intensity: f32,
+    window_origin: vec4<f32>,
     sky_direction: vec4<f32>,
     sky_color: vec4<f32>,
 };
@@ -323,9 +336,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let px = in.uv * u.viewport_size;
     let t = u.time_seconds;
 
-    // Aspect-correct coords so features are circular on wide/tall windows.
+    // Aspect ratio — still used by the vignette and lightning
+    // calculations, which stay WINDOW-LOCAL (the vignette is a
+    // "your attention is here" cue centered on the window, not on
+    // the physical screen).
     let aspect = u.viewport_size.x / max(u.viewport_size.y, 1.0);
-    let auv    = vec2<f32>(in.uv.x * aspect, in.uv.y);
+
+    // Global pixel = this fragment's screen pixel + where the window's
+    // client area sits on the virtual desktop. Clouds are a function of
+    // the global position, NOT of the window-local position. Drag the
+    // window across monitors and the clouds stay still relative to the
+    // physical screen.
+    let px_global = px + u.window_origin.xy;
+
+    // Noise basis: divide by a FIXED reference (NOT viewport height)
+    // so resizing the window doesn't rescale the noise sample region
+    // along any axis. Using vh here would make auv.x shift whenever
+    // viewport.y changes — reads as clouds sliding horizontally on a
+    // vertical resize, which is physically wrong.
+    //
+    // 1080 = "standard monitor height" gives a cloud scale that lines
+    // up with how we originally tuned the noise on a 1080-tall window.
+    let noise_scale = 1080.0;
+    let auv = px_global / noise_scale;
 
     // ---- Near-black base so nebula layers rise above it visibly. ----
     let base = vec3<f32>(0.010, 0.010, 0.018);

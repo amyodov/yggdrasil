@@ -725,7 +725,7 @@ fn layout_subtree(
             }
             total
         }
-        CardKind::Function | CardKind::Method => leaf_body_height(card, m),
+        CardKind::Function | CardKind::Method => leaf_body_height(card, m, override_lines),
         // Snippets have no collapsible body — all their text is in the
         // "preamble" (full_lines), which `header_height` already reserves.
         CardKind::Snippet => 0.0,
@@ -819,9 +819,14 @@ fn scale_subtree(
 ///   first/last line don't touch the frame.
 fn header_height(card: &Card, m: &LayoutMetrics, override_lines: Option<usize>) -> f32 {
     let preamble_lines: usize = match (&card.kind, &card.body_lines) {
-        (CardKind::Class, _) => (card.header_lines.end - card.header_lines.start).max(1),
-        // For functions/methods, preamble = everything in full_range before
-        // the body starts: decorator lines + signature lines.
+        // Class cards render only their header; wrap-aware override
+        // (if any) reflects the wrapped header text.
+        (CardKind::Class, _) => override_lines
+            .unwrap_or_else(|| (card.header_lines.end - card.header_lines.start).max(1)),
+        // Functions/methods: preamble = decorators + signature in RAW
+        // source lines. Wrap-aware overrides don't apply to the
+        // preamble (it's usually a single signature line that rarely
+        // wraps); they apply to the BODY via `leaf_body_height`.
         (_, Some(body_lines)) => {
             body_lines.start.saturating_sub(card.full_lines.start).max(1)
         }
@@ -849,13 +854,30 @@ fn smoothstep(t: f32) -> f32 {
 /// exactly where body text starts. `body_h` only adds the collapsible body
 /// lines themselves, which matches what the text cursor actually advances
 /// through.
-fn leaf_body_height(card: &Card, m: &LayoutMetrics) -> f32 {
-    let lines = card
-        .body_lines
-        .as_ref()
-        .map(|r| (r.end.saturating_sub(r.start)) as f32)
-        .unwrap_or(0.0);
-    lines * m.line_height
+fn leaf_body_height(
+    card: &Card,
+    m: &LayoutMetrics,
+    override_lines: Option<usize>,
+) -> f32 {
+    let body_lines = if let Some(ov) = override_lines {
+        // `ov` is the total wrapped-visual line count for the whole
+        // buffer (preamble + body). The preamble is rendered at its
+        // raw source line count (it rarely wraps). Body gets the
+        // remainder — this keeps multi-paragraph Markdown sections
+        // tall enough to fit their prose.
+        let preamble_source = card
+            .body_lines
+            .as_ref()
+            .map(|b| b.start.saturating_sub(card.full_lines.start))
+            .unwrap_or(0);
+        ov.saturating_sub(preamble_source) as f32
+    } else {
+        card.body_lines
+            .as_ref()
+            .map(|r| (r.end.saturating_sub(r.start)) as f32)
+            .unwrap_or(0.0)
+    };
+    body_lines * m.line_height
 }
 
 // ---------------------------------------------------------------------------

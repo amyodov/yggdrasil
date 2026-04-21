@@ -65,6 +65,9 @@ use crate::icon_pipeline::{IconInstance, IconRenderer};
 use crate::icons::IconId;
 use crate::substrate::Substrate;
 use crate::shapes::{RectInstance, ShapeRenderer};
+use crate::slat3d::{
+    build_projection_matrix, build_slat_model, Slat3DRenderer, SlatInstance,
+};
 use crate::state::{
     card_fold_states, card_well_position, AppState, FoldState, HighlightedSource, WindowSize,
 };
@@ -346,10 +349,24 @@ pub struct Renderer {
     // chain. Container-tree formalization (YGG-51) will let one renderer
     // serve both with per-caller buffers; for Phase B duplicate is the
     // smaller commit.
+    /// "Pre-slat" 2D shapes: ropes, and in 2D-slat mode, the slat
+    /// bodies. Rendered BEFORE slat3d so the slat body (2D or 3D)
+    /// covers the rope behind it.
     blind_shapes: ShapeRenderer,
+    /// "Post-slat" 2D shapes: tilt strip, top highlight, bottom
+    /// shadow, hole rim/void/rope-in-hole/rope-above-hole. Rendered
+    /// AFTER slat3d so these decorations sit on top of the slat body
+    /// regardless of whether the body is drawn in 2D or 3D.
+    blind_decor_shapes: ShapeRenderer,
     blind_text_renderer: TextRenderer,
     blind_viewport: Viewport,
     blind_buffers: HashMap<PathBuf, Buffer>,
+    /// 3D slat pipeline (YGG-62 Phase 2). Renders slat bodies as
+    /// real 3D quads projected through a one-point perspective
+    /// anchored at the physical-screen target. When the anchor
+    /// isn't known yet (first frame) or `state.debug_slat_2d` is
+    /// set, the 2D slat body in `blind_shapes` is drawn instead.
+    slat3d: Slat3DRenderer,
 
     // glyphon
     font_system: FontSystem,
@@ -458,6 +475,8 @@ impl Renderer {
         // Shape + background + composite + icon pipelines.
         let shape_renderer = ShapeRenderer::new(&device, format);
         let blind_shapes = ShapeRenderer::new(&device, format);
+        let blind_decor_shapes = ShapeRenderer::new(&device, format);
+        let slat3d = Slat3DRenderer::new(&device, format);
         let background_renderer = BackgroundRenderer::new(&device, format);
         let composite = CompositeRenderer::new(&device, format);
         let icon_renderer = IconRenderer::new(&device, &queue, format);
@@ -516,9 +535,11 @@ impl Renderer {
             composite,
             code_scroll,
             blind_shapes,
+            blind_decor_shapes,
             blind_text_renderer,
             blind_viewport,
             blind_buffers: HashMap::new(),
+            slat3d,
             font_system,
             swash_cache,
             viewport,
@@ -643,15 +664,17 @@ impl Renderer {
             self.applied_wrap_config = Some(cur_wrap_cfg);
         }
 
-        // Wrap-aware line-count overrides for Snippet cards: their
-        // height must grow to fit the wrapped visual lines. Computed
-        // only when wrap is on; otherwise the raw source line count
-        // is correct.
+        // Wrap-aware visual-line-count overrides. For Snippet and
+        // Class cards the count is the whole card's height. For
+        // Function/Method cards the buffer holds preamble + body; we
+        // use the total wrapped count and `leaf_body_height` subtracts
+        // the raw preamble to get the body height. Applies to all
+        // card kinds — Markdown cards come through as `Function`, not
+        // `Snippet`, so the Snippet-only filter used to miss them.
         let wrapped_overrides: HashMap<CardId, usize> = if state.wrap_mode == WrapMode::On {
             state
                 .cards
                 .iter()
-                .filter(|c| matches!(c.kind, CardKind::Snippet))
                 .filter_map(|c| {
                     self.card_buffers.get(&c.id).map(|buf| {
                         let n = buf.layout_runs().count().max(1);
@@ -733,10 +756,30 @@ impl Renderer {
 
         // Background uniforms stay window-sized (it draws to the swap chain).
         // Passes SkyLight so the nebula's tint + brightness track the sky
-        // cycle in sync with lens glints and spine highlights.
+        // cycle in sync with lens glints and spine highlights. Also passes
+        // the window's inner-client-area position on the virtual desktop
+        // so cloud noise is sampled in physical-screen coordinates — drag
+        // the window and the clouds stay pinned to the monitor.
+        //
+        // Sampled LIVE from the window (not from `state.window_inner_pos`)
+        // so there's zero event-loop latency during drags. winit's
+        // `Moved` event has a one-frame delay on some platforms; querying
+        // directly eliminates the visible lag.
+        let window_origin = self
+            .window
+            .inner_position()
+            .ok()
+            .map(|p| (p.x as f32, p.y as f32))
+            .or_else(|| {
+                state
+                    .window_inner_pos
+                    .map(|(x, y)| (x as f32, y as f32))
+            })
+            .unwrap_or((0.0, 0.0));
         self.background_renderer.prepare(
             &self.queue,
             (state.window_size.width, state.window_size.height),
+            window_origin,
             self.start_time.elapsed().as_secs_f32(),
             state.sky_light(),
         );
@@ -778,6 +821,38 @@ impl Renderer {
         // swap chain after composite + lens so the blind sits on top of the
         // void with no occlusion concerns. Skipped entirely when no tree
         // is present (single-file launch).
+        // Pre-build any missing slat filename buffers so layout has
+        // measured widths to size each slat (content-sized, not
+        // pane-full-width). Entries with no measured buffer fall back
+        // to a generous default in layout.
+        let blind_filename_widths: HashMap<PathBuf, f32> =
+            if let Some(tree) = state.tree.as_ref() {
+                let entries = crate::filetree::flatten(tree);
+                let mut widths = HashMap::with_capacity(entries.len());
+                for entry in &entries {
+                    if !self.blind_buffers.contains_key(&entry.path) {
+                        let buf = blind::build_filename_buffer(
+                            &mut self.font_system,
+                            &entry.name,
+                            entry.kind,
+                            font_size,
+                            line_height,
+                        );
+                        self.blind_buffers.insert(entry.path.clone(), buf);
+                    }
+                    if let Some(buf) = self.blind_buffers.get(&entry.path) {
+                        let w = buf
+                            .layout_runs()
+                            .map(|r| r.line_w)
+                            .fold(0.0_f32, f32::max);
+                        widths.insert(entry.path.clone(), w);
+                    }
+                }
+                widths
+            } else {
+                HashMap::new()
+            };
+
         let blind_layout = state.tree.as_ref().map(|tree| {
             let pane_left = 0.0;
             let pane_width = state.code_pane_left() as f32;
@@ -789,16 +864,28 @@ impl Renderer {
                 pane_height,
                 state.scale_factor,
                 state.slat_mode,
+                &blind_filename_widths,
             )
         });
+        // 3D slat rendering (YGG-62 Phase 2). The 2D slat body and
+        // its 2D decorations (tilt strip, highlights) were removed —
+        // the slat3d pipeline owns slat rendering unconditionally.
+        // When no projection anchor is known yet (first frame before
+        // the monitor is observed), we skip pushing instances; the
+        // next frame renders them. Ropes, hole, and text stay 2D for
+        // now; 3D hole lands in follow-on work.
+        let mut slat3d_instances: Vec<SlatInstance> = Vec::new();
+        let slat3d_active = state.projection_anchor().is_some();
+
+        // Two separate 2D instance lists so we can sandwich the
+        // slat3d pass between them:
+        //   blind_instances      — ropes + (2D mode only) slat bodies
+        //   blind_decor_instances — tilt, highlights, hole decorations
+        // Render order: ropes → slats (2D or 3D) → decorations.
         let blind_text_areas = if let Some(layout) = blind_layout.as_ref() {
-            // Slats emit: body rect + hole-shadow + hole-rope disc = 3
-            // rects per slat. Plus one per rope segment.
             let mut blind_instances: Vec<RectInstance> =
-                Vec::with_capacity(layout.slats.len() * 3 + layout.ropes.len());
-            // Ropes first so slats render on top of them — each rope
-            // is hidden behind slat bodies except inside each slat's
-            // hole, where a brass disc reveals it.
+                Vec::with_capacity(layout.slats.len() + layout.ropes.len());
+            let blind_decor_instances: Vec<RectInstance> = Vec::new();
             for rope in &layout.ropes {
                 blind_instances.push(RectInstance::glowing(
                     rope.x,
@@ -812,110 +899,55 @@ impl Renderer {
                 ));
             }
             let win_h = state.window_size.height as f32;
-            let blind_right = state.code_pane_left() as f32
-                - blind::BLIND_MARGIN_PT * state.scale_factor;
-            let tilt_thickness = blind::TILT_STRIP_PT * state.scale_factor;
-            let rope_w_px = blind::ROPE_WIDTH_PT * state.scale_factor;
             for slat in &layout.slats {
                 if slat.slot_y + slat.slot_height < -32.0
                     || slat.slot_y > win_h + 32.0
                 {
                     continue;
                 }
-                // Clamp the placeholder-wide slat to the blind's right
-                // edge (layout() returned a wide sentinel width so it
-                // didn't need to know the pane's bounds).
-                let slat_w = (blind_right - slat.slat_x).min(slat.slat_width).max(0.0);
-                if slat_w > 0.0 {
-                    // (1) Slat body.
-                    blind_instances.push(RectInstance::glowing(
-                        slat.slat_x,
-                        slat.slat_y,
-                        slat_w,
-                        slat.slat_height,
-                        slat.bg,
-                        slat.corner,
-                        slat.glow_color,
-                        slat.glow_radius,
-                    ));
-                    // (2) Tilt cue — a thin strip just ABOVE the slat.
-                    //     Closed: the slat's back TOP EDGE peeks up
-                    //     (darker cardboard). Open: a sliver of FACE
-                    //     hints above the shelf edge (lighter).
-                    let tilt_color = match slat.design {
-                        blind::SlatDesign::Closed => blind::CLOSED_BACK_EDGE,
-                        blind::SlatDesign::Open => blind::OPEN_FACE_HINT,
-                    };
-                    blind_instances.push(RectInstance::solid(
-                        slat.slat_x,
-                        slat.slat_y - tilt_thickness,
-                        slat_w,
-                        tilt_thickness,
-                        tilt_color,
-                        slat.corner,
-                    ));
-                    // (3) Top highlight — a hair-thin bright strip at
-                    //     the slat's very top edge, sells "lit from
-                    //     above" so the body reads as a material face.
-                    let rim = (1.0 * state.scale_factor).max(1.0);
-                    blind_instances.push(RectInstance::solid(
-                        slat.slat_x,
-                        slat.slat_y,
-                        slat_w,
-                        rim,
-                        blind::SLAT_TOP_HIGHLIGHT,
-                        slat.corner * 0.5,
-                    ));
-                    // (4) Bottom shadow strip — far edge in shadow.
-                    blind_instances.push(RectInstance::solid(
-                        slat.slat_x,
-                        slat.slat_y + slat.slat_height - rim,
-                        slat_w,
-                        rim,
-                        blind::SLAT_BOTTOM_SHADOW,
-                        slat.corner * 0.5,
-                    ));
+                // Slat body rendered via the 3D pipeline. The 2D
+                // rect path and its decorations (tilt strip, top
+                // highlight, bottom shadow) were removed — real 3D
+                // rotation places the edges where projection says,
+                // and 2D decorations at the slat's natural y-range
+                // would visibly detach from the tilted body.
+                if slat3d_active {
+                    let sw = slat.slat_width.max(1.0);
+                    let sh = slat.slat_height.max(1.0);
+                    // Hole in slat-local pixel space. The 2D blind
+                    // layout computed the hole in window-space; we
+                    // subtract the slat's top-left to get slat-local.
+                    let hole_xy = slat
+                        .hole
+                        .map(|h| {
+                            [
+                                h.center_x - slat.slat_x,
+                                h.center_y - slat.slat_y,
+                                h.width * 0.5,
+                                h.height * 0.5,
+                            ]
+                        })
+                        .unwrap_or([0.0; 4]);
+                    slat3d_instances.push(SlatInstance {
+                        model: build_slat_model(
+                            slat.slat_x,
+                            slat.slat_y,
+                            sw,
+                            sh,
+                            state.slat_angle_rad,
+                        ),
+                        color: slat.bg,
+                        size_px: [sw, sh],
+                        corner_radius: slat.corner,
+                        arc_depth: state.slat_arc_depth,
+                        hole: hole_xy,
+                    });
                 }
-                // Rope-hole — only present in Closed (plaque) design.
-                // Open's shelf is thin enough that the rope naturally
-                // appears to "enter above, exit below" just by being
-                // hidden behind the shelf body with no decoration.
-                if let Some(hole) = slat.hole {
-                    // Hole rim: a slightly larger dark pill so the
-                    // hole's edge reads as a rim of slat thickness.
-                    let rim_pad = 1.0 * state.scale_factor;
-                    let rim_w = hole.width + rim_pad;
-                    let rim_h = hole.height + rim_pad;
-                    blind_instances.push(RectInstance::solid(
-                        hole.center_x - rim_w * 0.5,
-                        hole.center_y - rim_h * 0.5,
-                        rim_w,
-                        rim_h,
-                        blind::HOLE_RIM_COLOR,
-                        rim_w * 0.5,
-                    ));
-                    // Hole interior: the "void" seen through the cut.
-                    blind_instances.push(RectInstance::solid(
-                        hole.center_x - hole.width * 0.5,
-                        hole.center_y - hole.height * 0.5,
-                        hole.width,
-                        hole.height,
-                        blind::HOLE_VOID_COLOR,
-                        hole.width * 0.5,
-                    ));
-                    // Rope visible through the hole: a thin brass
-                    // vertical strip matching the hole's height,
-                    // rope-wide — leaving dark "void" on either side
-                    // of the rope INSIDE the hole.
-                    blind_instances.push(RectInstance::solid(
-                        hole.center_x - rope_w_px * 0.5,
-                        hole.center_y - hole.height * 0.5,
-                        rope_w_px,
-                        hole.height,
-                        blind::hole_rope_color(),
-                        rope_w_px * 0.5,
-                    ));
-                }
+                // Hole is now a REAL cutout in the slat3d fragment
+                // shader — `SlatInstance.hole` carries the ellipse
+                // half-extents. The 2D rope drawn in the earlier
+                // pass shows through the cutout, so the rope visually
+                // threads through the slat like real material.
                 if !self.blind_buffers.contains_key(&slat.entry.path) {
                     let buf = blind::build_filename_buffer(
                         &mut self.font_system,
@@ -931,6 +963,12 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 &blind_instances,
+                (self.surface_config.width, self.surface_config.height),
+            );
+            self.blind_decor_shapes.prepare(
+                &self.device,
+                &self.queue,
+                &blind_decor_instances,
                 (self.surface_config.width, self.surface_config.height),
             );
 
@@ -998,7 +1036,7 @@ impl Renderer {
 
         // ---- Egui ----
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, draw_egui);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| draw_egui(ctx, state));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let paint_jobs = self
@@ -1135,8 +1173,9 @@ impl Renderer {
             self.lens_renderer.render(&mut pass);
         }
 
-        // Pass 4c: blind shapes (slats + brass wire) → swap chain. Drawn
-        // after composite + lens so the blind sits on top of the void.
+        // Pass 4c: blind shapes (ropes + optionally-2D slat bodies) → swap
+        // chain. Drawn after composite + lens so the blind sits on top of
+        // the void.
         if blind_layout.is_some() {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ygg-blind-shapes-pass"),
@@ -1150,6 +1189,64 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             self.blind_shapes.render(&mut pass);
+        }
+
+        // Pass 4c': 3D slats (YGG-62 Phase 2). Real tessellated
+        // curved strips under a real one-point perspective. Anchor
+        // computed from LIVE window + monitor geometry (no event-
+        // loop latency during drag).
+        if slat3d_active && !slat3d_instances.is_empty() {
+            let anchor = state.window_monitor.map(|mon| {
+                let ax = (mon.x as f32 + mon.width as f32 * 0.5) - window_origin.0;
+                let ay = mon.y as f32 - window_origin.1;
+                let az = mon.width as f32 * 0.5;
+                [ax, ay, az]
+            });
+            if let Some(anchor) = anchor {
+                let proj = build_projection_matrix(
+                    (self.surface_config.width, self.surface_config.height),
+                    (anchor[0], anchor[1]),
+                    anchor[2],
+                );
+                self.slat3d.prepare(
+                    &self.device,
+                    &self.queue,
+                    &slat3d_instances,
+                    proj,
+                    (self.surface_config.width, self.surface_config.height),
+                );
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("ygg-slat3d-pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.slat3d.render(&mut pass);
+            }
+        }
+
+        // Pass 4c'': blind DECOR shapes — tilt strip, top highlight,
+        // bottom shadow, hole rim/void/rope-in-hole/rope-above-hole.
+        // Rendered AFTER the slat body pass (2D or 3D) so decorations
+        // stack on top of whatever body got drawn.
+        if blind_layout.is_some() {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ygg-blind-decor-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.blind_decor_shapes.render(&mut pass);
         }
 
         // Pass 4d: blind filenames → swap chain.
@@ -1335,17 +1432,18 @@ fn collect_blind_text_areas<'a>(
         }
         let (top, clip_top, clip_bottom) = match slat.design {
             blind::SlatDesign::Closed => {
-                // Centered inside the plaque.
+                // Ink on slat: text vertically centered on the slat face.
                 let t = slat.slat_y + (slat.slat_height - line_height) * 0.5;
                 (t, slat.slat_y, slat.slat_y + slat.slat_height)
             }
             blind::SlatDesign::Open => {
-                // Standing text above the shelf, within the upper slot.
-                // Place baseline so its bottom sits just above the shelf
-                // with a 1-pixel visual gap.
-                let gap = 1.0;
-                let t = slat.slat_y - line_height - gap;
-                (t, slat.slot_y, slat.slat_y)
+                // Standing text: bottom of text rests at the slat's
+                // middle y, extending upward — "standing on the
+                // shelf at the middle". Upright in screen space,
+                // color pale to read against the void above the slat.
+                let slat_mid = slat.slat_y + slat.slat_height * 0.5;
+                let t = slat_mid - line_height;
+                (t, slat.slot_y, slat.slat_y + slat.slat_height)
             }
         };
         let bounds = TextBounds {
@@ -1950,7 +2048,18 @@ fn build_card_buffer(
     let default_attrs = Attrs::new().family(Family::Monospace);
     let spans = RunSpans { text: &text, kinds: &kinds, i: 0, attrs_by_kind };
     buffer.set_rich_text(font_system, spans, default_attrs, Shaping::Advanced);
-    buffer.shape_until_scroll(font_system, false);
+    // Shape ALL lines (not just up to the buffer's scroll position).
+    // `shape_until_scroll` leaves later lines unshaped, which makes
+    // `layout_runs().count()` under-report the wrapped visual line
+    // count for tall content — that under-count was clipping the
+    // tail of multi-paragraph Markdown cards. Target the last
+    // source line as the shape cursor so every line gets shaped.
+    // `shape_until_cursor` panics on cursors past `buffer.lines.len()`,
+    // so clamp.
+    if !buffer.lines.is_empty() {
+        let last = buffer.lines.len() - 1;
+        buffer.shape_until_cursor(font_system, glyphon::Cursor::new(last, 0), false);
+    }
     buffer
 }
 
@@ -2053,10 +2162,85 @@ impl<'a> Iterator for RunSpans<'a> {
 // Egui overlay (unchanged from M2)
 // ----------------------------------------------------------------------------
 
-fn draw_egui(_ctx: &egui::Context) {
+fn draw_egui(ctx: &egui::Context, state: &AppState) {
     // The blind (Zone 1, rendered via our wgpu pipeline) replaces the
-    // former egui placeholder. Egui pass stays wired for future HUD
-    // overlays (timeline scrubber, modal dialogs) but is empty today.
+    // former egui placeholder. Egui pass is otherwise empty; the only
+    // active overlay today is the optional debug-perspective-compass
+    // (YGG-62).
+    if state.debug_perspective_compass {
+        draw_perspective_compass(ctx, state);
+    }
+}
+
+/// Debug overlay for YGG-62: a semi-transparent line from the window
+/// center toward the projection anchor, with CPU-side one-point
+/// perspective so the line's 2D length correctly foreshortens with
+/// the anchor's Z depth.
+///
+/// Only the FIXED end (window center) is marked with a small dot —
+/// the free end is unmarked so the viewer can immediately read which
+/// end is fixed.
+///
+/// Until the 3D slat pipeline lands (YGG-62 Phase 2), this is the
+/// one place real 3D perspective math runs. When the pipeline lands,
+/// this gizmo graduates to a real 3D primitive.
+fn draw_perspective_compass(ctx: &egui::Context, state: &AppState) {
+    let Some(anchor) = state.projection_anchor() else {
+        return;
+    };
+    let scale = state.scale_factor.max(0.001);
+    // Work in physical pixels (window-local), convert at draw time.
+    let cx = state.window_size.width as f32 * 0.5;
+    let cy = state.window_size.height as f32 * 0.5;
+    let ax = anchor[0];
+    let ay = anchor[1];
+    let az = anchor[2];
+    // Direction in 3D from the window center to the anchor.
+    let dx3 = ax - cx;
+    let dy3 = ay - cy;
+    let dz3 = az;
+    let dist3 = (dx3 * dx3 + dy3 * dy3 + dz3 * dz3).sqrt();
+    if dist3 < 1e-3 {
+        return;
+    }
+    // Fixed 3D length — quarter of the window height in virtual
+    // world units.
+    let line_len = state.window_size.height as f32 * 0.25;
+    let nx = dx3 / dist3;
+    let ny = dy3 / dist3;
+    let nz = dz3 / dist3;
+    // 3D endpoint of the compass.
+    let end3_x = cx + nx * line_len;
+    let end3_y = cy + ny * line_len;
+    let end3_z = nz * line_len; // start's z = 0, so end's z = depth.
+    // One-point perspective projection with vanishing point at the
+    // anchor (vx, vy in screen space). Focal length = anchor.z —
+    // at z=anchor.z, points are halfway to the vanishing point.
+    // Start is at z=0 so it projects to itself; end has z=end3_z
+    // and is foreshortened toward (ax, ay) proportionally.
+    let focal = az.max(1.0);
+    let t = focal / (focal + end3_z);
+    let end2_x = ax + (end3_x - ax) * t;
+    let end2_y = ay + (end3_y - ay) * t;
+    // Convert to egui logical points.
+    let cx_l = cx / scale;
+    let cy_l = cy / scale;
+    let ex_l = end2_x / scale;
+    let ey_l = end2_y / scale;
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("ygg-debug-compass"),
+    ));
+    let stroke =
+        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(120, 220, 255, 170));
+    painter.line_segment([egui::pos2(cx_l, cy_l), egui::pos2(ex_l, ey_l)], stroke);
+    // Only the FIXED end (center) gets a dot — makes the free end
+    // unambiguous at a glance.
+    painter.circle_filled(
+        egui::pos2(cx_l, cy_l),
+        2.5,
+        egui::Color32::from_rgba_unmultiplied(200, 240, 255, 220),
+    );
 }
 
 #[cfg(test)]

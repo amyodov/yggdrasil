@@ -63,14 +63,20 @@ pub const SLAT_LEFT_OVERHANG_PT: f32 = 7.0;
 /// wider than the rope itself so there's visible void around the
 /// rope inside the hole.
 pub const HOLE_WIDTH_PT: f32 = 5.0;
-/// Hole height as a fraction of the slat height. The hole runs from
-/// almost the bottom to almost the top of the slat, centered
-/// vertically — leaving a small strip of slat material above and
-/// below.
-pub const HOLE_HEIGHT_FRACTION: f32 = 0.82;
+/// Hole height as a fraction of the slat height. Centered
+/// vertically; leaves ~20% of slat material above the hole and ~20%
+/// below. The strips above/below give the rope z-order its
+/// foothold: rope-above-hole is drawn IN FRONT of the slat (visible
+/// over the slat's top strip), rope-below-hole sits BEHIND the slat
+/// (hidden by the bottom strip).
+pub const HOLE_HEIGHT_FRACTION: f32 = 0.6;
 /// Vertical position of the hole's CENTER as a fraction of the
 /// slat's height. 0.5 = centered.
 pub const HOLE_CENTER_Y_FRACTION: f32 = 0.5;
+/// Extra slat material to the right of the filename text. Picked to
+/// roughly match the space on the LEFT of the pill hole (the
+/// material between the slat's left edge and the hole's left edge).
+const SLAT_RIGHT_MARGIN_PT: f32 = 5.0;
 /// Left-edge x of the root rope, relative to the pane's left edge.
 const ROOT_ROPE_OFFSET_PT: f32 = BLIND_MARGIN_PT + SLAT_LEFT_OVERHANG_PT;
 
@@ -111,9 +117,6 @@ const OPEN_TEXT_GAP_PT: f32 = 6.0;
 
 // ---- Slat halo (both designs) ---------------------------------------
 
-const SLAT_GLOW: [f32; 4] = [0.55, 0.45, 0.30, 0.12];
-const SLAT_GLOW_RADIUS_PT: f32 = 6.0;
-
 // ---- Rope -----------------------------------------------------------
 
 /// Brass cable — slats mount on this. Same brass family as the class
@@ -126,29 +129,6 @@ const ROPE_GLOW_RADIUS_PT: f32 = 4.0;
 /// rope reads as threading through the slats rather than being tied
 /// off flush with them.
 const ROPE_OVERSHOOT_PT: f32 = 3.0;
-/// Dark "void" color seen inside a real hole cut through the slat.
-/// Darker than the slat body but not pitch-black, so the rope visible
-/// through the hole reads against an implied "behind the slat" depth.
-pub const HOLE_VOID_COLOR: [f32; 4] = [0.06, 0.05, 0.05, 1.0];
-/// Rim shadow just inside the hole, sells material thickness. Drawn
-/// INSIDE the hole at its edges via a slightly-larger dark pill that
-/// the hole-void then sits inside.
-pub const HOLE_RIM_COLOR: [f32; 4] = [0.02, 0.02, 0.03, 1.0];
-/// Thin white highlight along each slat's top edge — the "lit from
-/// above" cue. Keeps the slat from reading as a flat decal.
-pub const SLAT_TOP_HIGHLIGHT: [f32; 4] = [1.00, 0.97, 0.92, 0.35];
-/// Thin dark strip along the slat's bottom edge — shadowed far edge.
-pub const SLAT_BOTTOM_SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.30];
-/// Tiny back-edge strip drawn ABOVE the slat's top. Reads as "the
-/// slat is tilted a few degrees so its far edge pokes up past the
-/// near face." The color depends on design:
-///   - Closed (mostly face-on): back edge is in shadow, darker than slat.
-///   - Open (mostly edge-on): the tiny strip is actually a HINT OF FACE
-///     peeking above the edge, so lighter than the shelf body.
-pub const CLOSED_BACK_EDGE: [f32; 4] = [0.28, 0.22, 0.15, 0.95];
-pub const OPEN_FACE_HINT: [f32; 4] = [0.82, 0.78, 0.72, 0.95];
-/// Thickness in logical points of the back-edge / face-hint strip.
-pub const TILT_STRIP_PT: f32 = 1.4;
 
 // ---------------------------------------------------------------------
 // Output types
@@ -191,8 +171,6 @@ pub struct LaidSlat {
     /// and below).
     pub hole: Option<Hole>,
     pub bg: [f32; 4],
-    pub glow_color: [f32; 4],
-    pub glow_radius: f32,
     pub corner: f32,
     /// Left x (window-space px) of the filename text. Vertical
     /// position is derived by the renderer from `design`, `slot_y`,
@@ -251,6 +229,12 @@ pub struct BlindLayout {
 // ---------------------------------------------------------------------
 
 /// Compute the blind's layout for the current frame.
+///
+/// `filename_widths` maps each entry's path to the measured pixel
+/// width of its filename text (glyphon `LayoutRun::line_w`). Slats
+/// are content-sized: right edge = text-left + filename_width +
+/// right margin. Missing entries fall back to a generous default so
+/// layout still works before buffers are measured in the first frame.
 pub fn layout(
     tree: &TreeState,
     pane_left_px: f32,
@@ -258,6 +242,7 @@ pub fn layout(
     _pane_height_px: f32,
     scale_factor: f32,
     slat_mode: SlatMode,
+    filename_widths: &std::collections::HashMap<std::path::PathBuf, f32>,
 ) -> BlindLayout {
     let sf = scale_factor;
     let slot_h = SLAT_HEIGHT_PT * sf;
@@ -285,8 +270,21 @@ pub fn layout(
 
         let slot_y = blind_top - tree.scroll_y + index as f32 * (slot_h + gap);
 
+        let text_w = filename_widths
+            .get(&entry.path)
+            .copied()
+            .unwrap_or(120.0 * sf);
+        let right_margin = SLAT_RIGHT_MARGIN_PT * sf;
         let geom = slat_geometry(
-            design, entry.kind, rope_x, left_overhang, slot_y, slot_h, sf,
+            design,
+            entry.kind,
+            rope_x,
+            left_overhang,
+            slot_y,
+            slot_h,
+            sf,
+            text_w,
+            right_margin,
         );
 
         // Hole is present only for Closed. Open's shelf is thin enough
@@ -315,8 +313,6 @@ pub fn layout(
             rope_x,
             hole,
             bg: geom.bg,
-            glow_color: SLAT_GLOW,
-            glow_radius: SLAT_GLOW_RADIUS_PT * sf,
             corner: geom.corner,
             text_left: geom.text_left,
             text_rgb: geom.text_rgb,
@@ -341,6 +337,7 @@ struct SlatGeom {
     text_rgb: (u8, u8, u8),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slat_geometry(
     design: SlatDesign,
     kind: EntryKind,
@@ -349,10 +346,10 @@ fn slat_geometry(
     slot_y: f32,
     slot_h: f32,
     sf: f32,
+    text_w: f32,
+    right_margin: f32,
 ) -> SlatGeom {
     let slat_x = rope_x - left_overhang;
-    // Wide sentinel width — renderer clamps to the blind's right edge.
-    let slat_w = 10_000.0;
     match design {
         SlatDesign::Closed => {
             let pad = CLOSED_VERTICAL_PAD_PT * sf;
@@ -361,6 +358,8 @@ fn slat_geometry(
                 EntryKind::Folder => CLOSED_FOLDER_BG,
                 EntryKind::File => CLOSED_FILE_BG,
             };
+            let text_left = rope_x + HOLE_WIDTH_PT * 0.5 * sf + CLOSED_TEXT_GAP_PT * sf;
+            let slat_w = (text_left - slat_x) + text_w + right_margin;
             SlatGeom {
                 slat_x,
                 slat_y: slot_y + pad,
@@ -368,7 +367,7 @@ fn slat_geometry(
                 slat_h,
                 bg,
                 corner: CLOSED_CORNER_RADIUS_PT * sf,
-                text_left: rope_x + HOLE_WIDTH_PT * 0.5 * sf + CLOSED_TEXT_GAP_PT * sf,
+                text_left,
                 text_rgb: CLOSED_INK_RGB,
             }
         }
@@ -378,6 +377,8 @@ fn slat_geometry(
                 EntryKind::Folder => OPEN_FOLDER_SHELF_BG,
                 EntryKind::File => OPEN_SHELF_BG,
             };
+            let text_left = rope_x + ROPE_WIDTH_PT * 0.5 * sf + OPEN_TEXT_GAP_PT * sf;
+            let slat_w = (text_left - slat_x) + text_w + right_margin;
             SlatGeom {
                 slat_x,
                 slat_y: slot_y + slot_h - shelf_h,
@@ -385,7 +386,7 @@ fn slat_geometry(
                 slat_h: shelf_h,
                 bg,
                 corner: OPEN_CORNER_RADIUS_PT * sf,
-                text_left: rope_x + ROPE_WIDTH_PT * 0.5 * sf + OPEN_TEXT_GAP_PT * sf,
+                text_left,
                 text_rgb: OPEN_STANDING_RGB,
             }
         }
@@ -476,12 +477,6 @@ fn compute_rope_segments(
     out
 }
 
-/// Color of the rope-disc drawn inside each slat's hole (= the rope's
-/// brass color, so the disc reads as "rope visible through hole").
-pub fn hole_rope_color() -> [f32; 4] {
-    ROPE_COLOR
-}
-
 /// True if `(cursor_x, cursor_y)` falls over any slat's slot.
 pub fn hit_test_slat(layout: &BlindLayout, cursor_x: f32, cursor_y: f32) -> bool {
     layout
@@ -510,7 +505,10 @@ pub fn build_filename_buffer(
         Attrs::new().family(Family::Monospace),
         Shaping::Advanced,
     );
-    buffer.shape_until_scroll(font_system, false);
+    if !buffer.lines.is_empty() {
+        let last = buffer.lines.len() - 1;
+        buffer.shape_until_cursor(font_system, glyphon::Cursor::new(last, 0), false);
+    }
     buffer
 }
 
@@ -569,7 +567,7 @@ mod tests {
     #[test]
     fn closed_is_plaque_with_ink_color() {
         let tree = mock_tree_flat(&[("a.py", EntryKind::File)]);
-        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed);
+        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed, &HashMap::new());
         let s = &l.slats[0];
         assert_eq!(s.design, SlatDesign::Closed);
         // Plaque is tall — close to full slot height (minus padding).
@@ -580,7 +578,7 @@ mod tests {
     #[test]
     fn open_is_shelf_with_standing_text_color() {
         let tree = mock_tree_flat(&[("a.py", EntryKind::File)]);
-        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open);
+        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open, &HashMap::new());
         let s = &l.slats[0];
         assert_eq!(s.design, SlatDesign::Open);
         // Shelf is a thin strip at the bottom of the slot.
@@ -597,7 +595,7 @@ mod tests {
             ("b.py", EntryKind::File),
             ("c.py", EntryKind::File),
         ]);
-        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Alternating);
+        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Alternating, &HashMap::new());
         assert_eq!(l.slats[0].design, SlatDesign::Closed);
         assert_eq!(l.slats[1].design, SlatDesign::Open);
         assert_eq!(l.slats[2].design, SlatDesign::Closed);
@@ -614,7 +612,7 @@ mod tests {
         tree.children.insert(PathBuf::from("/r/a"), a_children);
         tree.expanded.insert(PathBuf::from("/r/a"));
 
-        let l = layout(&tree, 0.0, 400.0, 800.0, 1.0, SlatMode::Closed);
+        let l = layout(&tree, 0.0, 400.0, 800.0, 1.0, SlatMode::Closed, &HashMap::new());
         assert_eq!(l.slats.len(), 3);
         // slats[0] = a (depth 0), slats[1] = inner.py (depth 1), slats[2] = tail.py (depth 0).
         assert!((l.slats[0].rope_x - l.slats[2].rope_x).abs() < 1e-3);
@@ -624,17 +622,19 @@ mod tests {
     #[test]
     fn closed_has_tall_centered_hole_open_has_none() {
         let tree = mock_tree_flat(&[("a.py", EntryKind::File)]);
-        let l_closed = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed);
+        let l_closed = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed, &HashMap::new());
         let s = &l_closed.slats[0];
         let hole = s.hole.expect("Closed must carry a hole");
         // Hole is vertically centered in the slat.
         let slat_mid = s.slat_y + s.slat_height * 0.5;
         assert!((hole.center_y - slat_mid).abs() < 1e-3);
-        // Hole spans most of the slat's height (narrow vertical pill).
-        assert!(hole.height > s.slat_height * 0.7);
+        // Hole spans ~60% of the slat's height, leaving top/bottom
+        // strips for the 3-z-level rope-threading visual.
+        assert!(hole.height > s.slat_height * 0.5);
+        assert!(hole.height < s.slat_height * 0.75);
         assert!(hole.width < hole.height);
 
-        let l_open = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open);
+        let l_open = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Open, &HashMap::new());
         assert!(l_open.slats[0].hole.is_none());
     }
 
@@ -685,7 +685,7 @@ mod tests {
             ("a.py", EntryKind::File),
             ("b.py", EntryKind::File),
         ]);
-        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed);
+        let l = layout(&tree, 0.0, 300.0, 800.0, 1.0, SlatMode::Closed, &HashMap::new());
         assert_eq!(l.ropes.len(), 1);
         let r = &l.ropes[0];
         // Rope y_top is above the first slot (overshoot); y_bottom past the last.

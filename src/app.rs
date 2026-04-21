@@ -14,7 +14,7 @@ use crate::cards::{layout_cards, CardId};
 use crate::cli::WrapMode;
 use crate::renderer::{fold_buttons_scene, plate_rect, Renderer, SCENE_TOP_PAD_PT};
 use crate::sky::DEFAULT_DAY_CYCLE_SECS;
-use crate::state::{AppState, FoldState, WindowSize, LINES_PER_WHEEL_NOTCH};
+use crate::state::{AppState, FoldState, MonitorRect, WindowSize, LINES_PER_WHEEL_NOTCH};
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
@@ -93,6 +93,12 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        // Seed projection-anchor plumbing (YGG-62). `inner_position`
+        // is the top-left of the drawn client area on the virtual
+        // desktop; `current_monitor()` is the display the window
+        // currently lives on. Both are updated later on `Moved` and
+        // any time `current_monitor()` changes.
+        sample_window_geometry(&window, &mut self.state);
         self.renderer = Some(renderer);
         self.last_frame = Some(Instant::now());
     }
@@ -117,6 +123,20 @@ impl ApplicationHandler for App {
                 let s = WindowSize { width: size.width.max(1), height: size.height.max(1) };
                 self.state.window_size = s;
                 renderer.resize(s);
+                // A resize can change which monitor the window is
+                // mostly on — re-sample geometry so the projection
+                // anchor stays honest.
+                sample_window_geometry(&renderer.window().clone(), &mut self.state);
+                renderer.window().request_redraw();
+            }
+
+            WindowEvent::Moved(position) => {
+                // Track window position + current monitor for the
+                // projection anchor (YGG-62). `position` here is the
+                // OUTER top-left; we also grab inner_position for
+                // our anchor math.
+                let _ = position;
+                sample_window_geometry(&renderer.window().clone(), &mut self.state);
                 renderer.window().request_redraw();
             }
 
@@ -279,6 +299,28 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Sample the window's inner-client-area position + current monitor
+/// from winit, and store both on AppState for the projection-anchor
+/// computation (YGG-62 Phase 1). Errors are silently ignored —
+/// winit returns errors on platforms that can't answer, at which
+/// point we just don't have an anchor and the renderer falls back
+/// to the flat-projection path.
+fn sample_window_geometry(window: &Window, state: &mut AppState) {
+    if let Ok(pos) = window.inner_position() {
+        state.window_inner_pos = Some((pos.x, pos.y));
+    }
+    if let Some(monitor) = window.current_monitor() {
+        let pos = monitor.position();
+        let size = monitor.size();
+        state.window_monitor = Some(MonitorRect {
+            x: pos.x,
+            y: pos.y,
+            width: size.width,
+            height: size.height,
+        });
+    }
+}
+
 /// True if `(cursor_x, cursor_y)` (window-space physical pixels) falls
 /// over any slat's clickable slot. Recomputes the blind layout on
 /// demand — cheap, flatten + a handful of rect computations. Returns
@@ -289,6 +331,12 @@ fn cursor_over_slat(state: &AppState, cursor_x: f32, cursor_y: f32) -> bool {
     };
     let pane_width = state.code_pane_left() as f32;
     let pane_height = state.window_size.height as f32;
+    // Hit-test uses the default (unmeasured) slat widths. For the
+    // 99% of filenames that fit the 120pt default this is correct.
+    // Long filenames may get slightly over-generous hit-area on the
+    // right — acceptable trade-off; the renderer has the accurate
+    // widths from glyphon measurements.
+    let widths = std::collections::HashMap::new();
     let layout = blind::layout(
         tree,
         0.0,
@@ -296,6 +344,7 @@ fn cursor_over_slat(state: &AppState, cursor_x: f32, cursor_y: f32) -> bool {
         pane_height,
         state.scale_factor,
         state.slat_mode,
+        &widths,
     );
     blind::hit_test_slat(&layout, cursor_x, cursor_y)
 }

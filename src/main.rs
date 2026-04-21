@@ -17,6 +17,7 @@ mod substrate;
 mod renderer;
 mod shapes;
 mod sky;
+mod slat3d;
 mod state;
 mod syntax;
 
@@ -33,7 +34,15 @@ use crate::syntax::Highlighter;
 
 fn main() -> ExitCode {
     // RUST_LOG=info ygg ... surfaces wgpu/winit/egui diagnostics.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // `cosmic_text::font::system` is silenced at warn-level because it
+    // chokes on macOS's GB18030 bitmap font (and any other non-TTF
+    // system font) — harmless noise, every run would otherwise print
+    // the same warnings.
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("warn,cosmic_text::font::system=error"),
+    )
+    .init();
 
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -50,11 +59,28 @@ fn run() -> Result<()> {
     let expand_all = cli.debug_expand_all;
     let slat_mode = cli.debug_slat_mode.unwrap_or_default();
     let wrap_mode = cli.debug_wrap.unwrap_or_default();
+    let perspective_compass = cli.debug_perspective_compass;
+    let slat_angle_rad = cli
+        .debug_slat_angle
+        .map(|deg| deg.to_radians())
+        .unwrap_or(0.0);
+    let slat_arc_depth = cli
+        .debug_slat_arc
+        .unwrap_or(crate::slat3d::DEFAULT_ARC_DEPTH);
     let mode = cli.resolve(&RealFs).context("invalid command-line arguments")?;
 
     match mode {
         Mode::File { path } => {
-            let state = open_file(&path, None, day_cycle_override, slat_mode, wrap_mode)?;
+            let state = open_file(
+                &path,
+                None,
+                day_cycle_override,
+                slat_mode,
+                wrap_mode,
+                perspective_compass,
+                slat_angle_rad,
+                slat_arc_depth,
+            )?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }
@@ -78,7 +104,16 @@ fn run() -> Result<()> {
             if expand_all {
                 crate::blind::expand_all(&mut tree);
             }
-            let state = open_file(&file, Some(tree), day_cycle_override, slat_mode, wrap_mode)?;
+            let state = open_file(
+                &file,
+                Some(tree),
+                day_cycle_override,
+                slat_mode,
+                wrap_mode,
+                perspective_compass,
+                slat_angle_rad,
+                slat_arc_depth,
+            )?;
             App::new(state).run().context("event loop exited with error")?;
             Ok(())
         }
@@ -89,12 +124,18 @@ fn run() -> Result<()> {
 /// Load a source file and build an AppState ready to hand to the event
 /// loop. Shared between single-file mode and directory mode (where the
 /// directory walker has already picked which file to open first).
+#[allow(clippy::too_many_arguments)] // Many debug flags; regrouping
+// into a struct would front-load work for a signature that changes
+// each time we add a debug knob.
 fn open_file(
     path: &std::path::Path,
     tree_state: Option<filetree::TreeState>,
     day_cycle_override: Option<f32>,
     slat_mode: cli::SlatMode,
     wrap_mode: cli::WrapMode,
+    perspective_compass: bool,
+    slat_angle_rad: f32,
+    slat_arc_depth: f32,
 ) -> Result<AppState> {
     let source = SourceFile::read(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -116,6 +157,9 @@ fn open_file(
     state.tree = tree_state;
     state.slat_mode = slat_mode;
     state.wrap_mode = wrap_mode;
+    state.debug_perspective_compass = perspective_compass;
+    state.slat_angle_rad = slat_angle_rad;
+    state.slat_arc_depth = slat_arc_depth;
     if let Some(secs) = day_cycle_override {
         state.day_cycle_secs = secs.max(crate::sky::MIN_DAY_CYCLE_SECS);
     }

@@ -242,6 +242,42 @@ pub struct AppState {
     /// Horizontal scroll offset for the code pane in physical pixels.
     /// Used only when `wrap_mode == Off`. Clamped to `[0, max]`.
     pub scroll_x: f32,
+    /// Current viewport geometry of the window's CLIENT AREA on the
+    /// virtual desktop, in physical pixels. Top-left = first drawn
+    /// pixel of the window (excludes title bar / window chrome).
+    /// None until the window is created and its position has been
+    /// observed. Updated on every `WindowEvent::Moved` plus once on
+    /// `resumed`.
+    pub window_inner_pos: Option<(i32, i32)>,
+    /// Current monitor geometry — position of its top-left on the
+    /// virtual desktop and its physical size in pixels. None until
+    /// the window has chosen a monitor. Re-sampled on every move
+    /// since dragging between monitors changes which monitor is
+    /// "current." Feeds the projection-anchor computation
+    /// (YGG-62): anchor = monitor center-top at depth
+    /// `monitor_width / 2`.
+    pub window_monitor: Option<MonitorRect>,
+    /// Debug: draw a semi-transparent line from the window center
+    /// toward the projection anchor (YGG-62). Opt-in via
+    /// `--debug-perspective-compass`.
+    pub debug_perspective_compass: bool,
+    /// Debug: slat tilt in radians. 0 = face-on. Applied uniformly
+    /// to every slat in the 3D pipeline. Replaced by per-slat
+    /// animated pitch when fold / open-close animations land.
+    pub slat_angle_rad: f32,
+    /// Debug: slat arc depth in physical pixels. 0 = flat; a small
+    /// non-zero value adds a concave bulge at the slat's mid axis.
+    /// See `slat3d::DEFAULT_ARC_DEPTH` for tuning notes.
+    pub slat_arc_depth: f32,
+}
+
+/// Monitor rect in virtual-desktop physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl AppState {
@@ -262,6 +298,11 @@ impl AppState {
             slat_mode: SlatMode::Open,
             wrap_mode: WrapMode::On,
             scroll_x: 0.0,
+            window_inner_pos: None,
+            window_monitor: None,
+            debug_perspective_compass: false,
+            slat_angle_rad: 0.0,
+            slat_arc_depth: crate::slat3d::DEFAULT_ARC_DEPTH,
         }
     }
 
@@ -377,6 +418,38 @@ impl AppState {
         } else {
             0
         }
+    }
+
+    /// Projection anchor in WINDOW-LOCAL physical pixels (x, y, z) —
+    /// the target point toward which the blind's slats project (YGG-62).
+    ///
+    /// ## Z component — focal-depth tuning
+    ///
+    /// Z is what the perspective matrix uses as its focal length.
+    /// Smaller Z = stronger perspective falloff. Current default is
+    /// `monitor_width / 2` (~960 on a 1920-wide monitor — a gentle
+    /// perspective that needs 30–60° slat tilt to read obviously 3D).
+    /// For stronger perspective, consider `monitor_width / 4` (~480)
+    /// or a fixed pixel value like 500. See
+    /// `slat3d::build_projection_matrix` for a fuller guide.
+    ///
+    /// Derived from:
+    /// * the current monitor's rect,
+    /// * the window's inner (client-area) position on the virtual desktop.
+    ///
+    /// Returns None until both pieces are known (first frame, typically).
+    /// The anchor stays pinned to the current monitor's center-top at a
+    /// finite depth of `monitor_width / 2` — close enough for perspective
+    /// to fall off, far enough that the effect reads as physical rather
+    /// than funhouse.
+    pub fn projection_anchor(&self) -> Option<[f32; 3]> {
+        let (win_x, win_y) = self.window_inner_pos?;
+        let mon = self.window_monitor?;
+        let anchor_x = (mon.x as f32 + mon.width as f32 * 0.5) - win_x as f32;
+        // Y is DOWN in virtual-desktop coords. Monitor TOP edge = mon.y.
+        let anchor_y = mon.y as f32 - win_y as f32;
+        let anchor_z = mon.width as f32 * 0.5;
+        Some([anchor_x, anchor_y, anchor_z])
     }
 
     /// Font size in physical pixels, scaled for the current display DPI.

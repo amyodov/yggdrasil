@@ -92,6 +92,27 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     pub debug_wrap: Option<WrapMode>,
 
+    /// Debug: overlay a semi-transparent line from the window's
+    /// center toward the projection anchor (YGG-62).
+    #[arg(long)]
+    pub debug_perspective_compass: bool,
+
+    /// Debug: slat tilt angle in degrees (rotation around the
+    /// slat's horizontal mid-axis). 0 = face-on (default), 90 =
+    /// edge-on. Independent of `--debug-slat-mode`, which only
+    /// affects text placement. Applied to every slat uniformly in
+    /// the 3D pipeline. Later replaced by per-slat animation.
+    #[arg(long, value_name = "DEGREES")]
+    pub debug_slat_angle: Option<f32>,
+
+    /// Debug: slat arc depth in physical pixels — how far the
+    /// slat's horizontal mid-axis bulges toward `+z` (away from
+    /// viewer) on top of any `--debug-slat-angle` tilt. 0 = flat,
+    /// 5 = tiny default, 10 = gentle, 30+ = sail-like. See
+    /// `slat3d::DEFAULT_ARC_DEPTH` for full tuning notes.
+    #[arg(long, value_name = "PIXELS")]
+    pub debug_slat_arc: Option<f32>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
